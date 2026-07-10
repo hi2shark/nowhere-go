@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: go test (${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Align with go.mod (1.20) plus common newer toolchains
+        go: ["1.20", "1.22", "1.24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Local/CI self-check helper only — not a release artifact
+      - name: Build nowhere-check
+        run: go build -o /tmp/nowhere-check ./cmd/nowhere-check
+
+      - name: Run nowhere-check
+        run: /tmp/nowhere-check
