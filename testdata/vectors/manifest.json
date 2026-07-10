@@ -1,0 +1,23 @@
+{
+  "protocol": "nowhere-v1",
+  "exported_at": "2026-07-09",
+  "sources": {
+    "protocol_md": "Nowhere/docs/protocol.md",
+    "rust_auth": "Nowhere/src/tests/protocol/crypto.rs::auth_frame_fixed_nonce_vectors",
+    "rust_tcp": "Nowhere/src/tests/protocol/request.rs::tcp_request_fixed_vectors",
+    "rust_compact_udp": "Nowhere/src/tests/protocol/datagram.rs::compact_udp_open_data_and_data_round_trip",
+    "rust_target": "Nowhere/src/tests/protocol/util.rs::validates_host_port_forms",
+    "go": "wire/frame_test.go"
+  },
+  "files": [
+    "auth.json",
+    "tcp_request.json",
+    "udp_compact.json",
+    "target_addr.json"
+  ],
+  "notes": [
+    "auth.auto is 94 bytes; auth.edge-a is longer due to derived padding layout",
+    "Implementations must not hand-write a second divergent hex set",
+    "flow_envelope.json may be added when H1/H2 needs fixed envelope vectors"
+  ]
+}

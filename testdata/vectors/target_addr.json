@@ -1,0 +1,48 @@
+{
+  "protocol": "nowhere-v1",
+  "source": {
+    "rust": "Nowhere/src/tests/protocol/util.rs::validates_host_port_forms",
+    "go": "wire/frame_test.go::TestTCPRequestRejects"
+  },
+  "accept": [
+    {
+      "id": "target.host.ok",
+      "target": "example.com:443"
+    },
+    {
+      "id": "target.ipv4.ok",
+      "target": "1.2.3.4:80"
+    },
+    {
+      "id": "target.ipv6.ok",
+      "target": "[2001:db8::1]:443"
+    },
+    {
+      "id": "target.ipv6.loopback.ok",
+      "target": "[::1]:53"
+    }
+  ],
+  "reject": [
+    {
+      "id": "target.empty",
+      "target": ""
+    },
+    {
+      "id": "target.no_port",
+      "target": "no-port"
+    },
+    {
+      "id": "target.ipv6.bad",
+      "target": "2001:db8::1:443",
+      "reason": "unbracketed IPv6 literal"
+    },
+    {
+      "id": "target.ipv6.missing_bracket",
+      "target": "[2001:db8::1"
+    },
+    {
+      "id": "target.ipv6.missing_colon_before_port",
+      "target": "[2001:db8::1]443"
+    }
+  ]
+}

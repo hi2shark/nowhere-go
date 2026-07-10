@@ -1,0 +1,25 @@
+{
+  "protocol": "nowhere-v1",
+  "source": {
+    "rust": "Nowhere/src/tests/protocol/request.rs::tcp_request_fixed_vectors",
+    "go": "wire/frame_test.go::TestProtocolVectorsTCPRequest"
+  },
+  "cases": [
+    {
+      "id": "tcp.example",
+      "key": "secret",
+      "spec": "auto",
+      "alpn": "now/1",
+      "target": "example.com:443",
+      "frame_hex": "000f6578616d706c652e636f6d3a343433013c1526b9b947228779cfc539fe4681bcb5d1e20efa2bcb9f89eda5b473625c3c6b7fb12499fd33edfefb1934c9ae0bfc0e849f4c94814f4f2f9ae782e8"
+    },
+    {
+      "id": "tcp.example.edge-a",
+      "key": "secret",
+      "spec": "edge-a",
+      "alpn": "now/1",
+      "target": "example.com:443",
+      "frame_hex": "321e7800dfe8345ac8f3c1897d243ec10cea6218a101531221c227da14f0242f079004bf8575f00e6a2ff9c48a932410fe434601000f6578616d706c652e636f6d3a343433"
+    }
+  ]
+}
