@@ -91,15 +91,6 @@ func (m *flowPairManager) SubmitUDP(ctx context.Context, sessionID wire.SessionI
 	return nil, m.wait(ctx, key, pending)
 }
 
-func closeUDPHalf(half udpHalf) {
-	if half.Uplink != nil {
-		_ = half.Uplink.Close()
-	}
-	if half.Downlink != nil {
-		_ = half.Downlink.Close()
-	}
-}
-
 func closeUDPHalfWithError(half udpHalf, err error) {
 	if half.Uplink != nil {
 		if value, ok := half.Uplink.(*tcpUDPUplink); ok {

@@ -121,14 +121,13 @@ func (p *TCPPool) acquire(ctx context.Context, dest string, mode TCPRelayMode) (
 		return nil, errors.New("nowhere: tcp pool closed")
 	}
 	var selected *warmConn
-	for len(p.idle) > 0 {
+	if len(p.idle) > 0 {
 		wc := p.idle[len(p.idle)-1]
 		p.idle = p.idle[:len(p.idle)-1]
 		if wc.expiry != nil {
 			wc.expiry.Stop()
 		}
 		selected = wc
-		break
 	}
 	replenish := p.replenishBudgetLocked(selected)
 	snapshot := p.snapshotLocked()

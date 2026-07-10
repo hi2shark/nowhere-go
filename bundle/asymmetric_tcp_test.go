@@ -52,18 +52,6 @@ func TestAsymmetricOpenTCPCancelsOtherHalfOnFailure(t *testing.T) {
 	}
 }
 
-func testBundleTCPConfig(t *testing.T) *tcptls.Config {
-	t.Helper()
-	config, err := tcptls.NewConfig(tcptls.TCPOptions{
-		Address: "127.0.0.1:1", Spec: mustNowhereSpec(t), Key: "k",
-		Dialer: newBlockingTCPDialer(), TLSDialer: passthroughTLSDialer{},
-	})
-	if err != nil {
-		t.Fatalf("NewConfig: %v", err)
-	}
-	return config
-}
-
 func TestSplicedConnForwardsDirectionalDeadlines(t *testing.T) {
 	reader := &deadlineRecorderConn{}
 	writer := &deadlineRecorderConn{}
@@ -205,27 +193,6 @@ type dummyAddr string
 
 func (a dummyAddr) Network() string { return string(a) }
 func (a dummyAddr) String() string  { return string(a) }
-
-// stubQuicBackend is a no-op backend for config-only tests.
-type stubQuicBackend struct {
-	id wire.SessionID
-}
-
-func (s *stubQuicBackend) SetSessionID(id wire.SessionID) { s.id = id }
-func (s *stubQuicBackend) OpenTCP(context.Context, string) (net.Conn, error) {
-	return nil, errors.New("stub: OpenTCP")
-}
-func (s *stubQuicBackend) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
-	return nil, errors.New("stub: OpenFlowStream")
-}
-func (s *stubQuicBackend) OpenUDP(context.Context, string) (net.PacketConn, error) {
-	return nil, errors.New("stub: OpenUDP")
-}
-func (s *stubQuicBackend) AcquireSession(context.Context) (carrier.QuicSession, error) {
-	return nil, errors.New("stub: AcquireSession")
-}
-func (s *stubQuicBackend) InvalidateSession(carrier.QuicSession) {}
-func (s *stubQuicBackend) Close()                                {}
 
 // failAfterWaitQuic fails OpenFlowStream after wait is signaled (TCP half started).
 type failAfterWaitQuic struct {

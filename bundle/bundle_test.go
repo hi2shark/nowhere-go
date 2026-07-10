@@ -3,11 +3,15 @@
 package bundle
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"io"
+	"net"
 	"testing"
 
+	"github.com/hi2shark/go-nowhere/carrier"
+	"github.com/hi2shark/go-nowhere/carrier/tcptls"
 	"github.com/hi2shark/go-nowhere/wire"
 )
 
@@ -42,3 +46,36 @@ func (r errReader) Read(p []byte) (int, error) {
 }
 
 var _ io.Reader = errReader{}
+
+func testBundleTCPConfig(t *testing.T) *tcptls.Config {
+	t.Helper()
+	config, err := tcptls.NewConfig(tcptls.TCPOptions{
+		Address: "127.0.0.1:1", Spec: mustNowhereSpec(t), Key: "k",
+		Dialer: newBlockingTCPDialer(), TLSDialer: passthroughTLSDialer{},
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	return config
+}
+
+// stubQuicBackend is a no-op backend for config-only tests.
+type stubQuicBackend struct {
+	id wire.SessionID
+}
+
+func (s *stubQuicBackend) SetSessionID(id wire.SessionID) { s.id = id }
+func (s *stubQuicBackend) OpenTCP(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("stub: OpenTCP")
+}
+func (s *stubQuicBackend) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
+	return nil, errors.New("stub: OpenFlowStream")
+}
+func (s *stubQuicBackend) OpenUDP(context.Context, string) (net.PacketConn, error) {
+	return nil, errors.New("stub: OpenUDP")
+}
+func (s *stubQuicBackend) AcquireSession(context.Context) (carrier.QuicSession, error) {
+	return nil, errors.New("stub: AcquireSession")
+}
+func (s *stubQuicBackend) InvalidateSession(carrier.QuicSession) {}
+func (s *stubQuicBackend) Close()                                {}
