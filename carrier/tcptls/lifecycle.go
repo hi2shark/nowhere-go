@@ -1,0 +1,176 @@
+package tcptls
+
+import (
+	"github.com/hi2shark/go-nowhere/carrier"
+	"net"
+	"sync/atomic"
+	"time"
+
+)
+
+// carrierState tracks TLS/TCP carrier lifecycle for diagnostics only.
+// After the first request frame a carrier is consumed and must not return to idle.
+type carrierState uint8
+
+const (
+	stateNew               carrierState = iota
+	stateAuthenticatedIdle              // warm pool; no request sent
+	stateBorrowed                       // popped; about to send request
+	stateRequestSent                    // request written; consumed
+	stateConsumed
+	stateActiveRelay
+	stateClosing
+	stateClosed
+)
+
+func (s carrierState) String() string {
+	switch s {
+	case stateNew:
+		return "new"
+	case stateAuthenticatedIdle:
+		return "authenticated_idle"
+	case stateBorrowed:
+		return "borrowed"
+	case stateRequestSent:
+		return "request_sent"
+	case stateConsumed:
+		return "consumed"
+	case stateActiveRelay:
+		return "active_relay"
+	case stateClosing:
+		return "closing"
+	case stateClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
+// Local log-correlation ids only; not sent on the wire (symmetric matrix).
+var nextCarrierID atomic.Uint64
+var nextFlowID atomic.Uint64
+
+func allocFlowID() uint64 {
+	for {
+		id := nextFlowID.Add(1)
+		if id != 0 {
+			return id
+		}
+	}
+}
+
+type carrierInfo struct {
+	id        uint64
+	state     atomic.Uint64 // carrierState
+	createdAt time.Time
+	log       carrier.Logger
+}
+
+func newCarrierInfo(log carrier.Logger) *carrierInfo {
+	if log == nil {
+		log = carrier.NopLogger{}
+	}
+	ci := &carrierInfo{
+		id:        nextCarrierID.Add(1),
+		createdAt: time.Now(),
+		log:       log,
+	}
+	ci.state.Store(uint64(stateNew))
+	return ci
+}
+
+func (c *carrierInfo) logger() carrier.Logger {
+	if c != nil && c.log != nil {
+		return c.log
+	}
+	return carrier.NopLogger{}
+}
+
+func (c *carrierInfo) stateOf() carrierState {
+	return carrierState(c.state.Load())
+}
+
+// transition logs illegal edges but never panics (data path stays open).
+func (c *carrierInfo) transition(next carrierState) {
+	prev := c.stateOf()
+	if !legalTransition(prev, next) {
+		c.logger().Warnf("[Nowhere] [carrier] illegal transition carrier_id=%d %s -> %s (consumed-carrier reuse or double-borrow suspected)", c.id, prev, next)
+	}
+	c.state.Store(uint64(next))
+}
+
+func legalTransition(prev, next carrierState) bool {
+	if next == stateClosing || next == stateClosed {
+		return true
+	}
+	switch prev {
+	case stateNew:
+		return next == stateAuthenticatedIdle || next == stateBorrowed
+	case stateAuthenticatedIdle:
+		return next == stateBorrowed || next == stateAuthenticatedIdle
+	case stateBorrowed:
+		return next == stateRequestSent
+	case stateRequestSent:
+		return next == stateConsumed || next == stateActiveRelay
+	case stateConsumed:
+		// Never idle/borrowed again (pool-reuse bug).
+		return next == stateActiveRelay
+	case stateActiveRelay:
+		return next == stateConsumed
+	default:
+		return false
+	}
+}
+
+type trackedConn struct {
+	net.Conn
+	carrier *carrierInfo
+	flowID  uint64 // local log id (symmetric)
+	network string // "tcp" or "udp" (UoT)
+	target  string
+	rxBytes atomic.Uint64
+	txBytes atomic.Uint64
+	closed  atomic.Bool
+}
+
+func newTrackedConn(conn net.Conn, ci *carrierInfo, flowID uint64, network, target string) *trackedConn {
+	return &trackedConn{
+		Conn:    conn,
+		carrier: ci,
+		flowID:  flowID,
+		network: network,
+		target:  target,
+	}
+}
+
+func (t *trackedConn) Read(p []byte) (int, error) {
+	n, err := t.Conn.Read(p)
+	if n > 0 {
+		t.rxBytes.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (t *trackedConn) Write(p []byte) (int, error) {
+	n, err := t.Conn.Write(p)
+	if n > 0 {
+		t.txBytes.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (t *trackedConn) Close() error {
+	if t.closed.Swap(true) {
+		return nil
+	}
+	reason := "ok"
+	t.carrier.transition(stateClosing)
+	err := t.Conn.Close()
+	if err != nil {
+		reason = err.Error()
+	}
+	t.carrier.transition(stateClosed)
+	t.carrier.logger().Debugf("[Nowhere] [carrier] relay_end flow_id=%d carrier_id=%d network=%s target=%s rx_bytes=%d tx_bytes=%d close_reason=%s",
+		t.flowID, t.carrier.id, t.network, t.target, t.rxBytes.Load(), t.txBytes.Load(), reason)
+	return err
+}
