@@ -4,7 +4,7 @@
 *.exe
 *.test
 *.out
-nowhere-check
+/nowhere-check
 
 # Coverage / profiling
 coverage.out
