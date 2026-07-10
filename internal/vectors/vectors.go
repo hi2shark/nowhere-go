@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // Dir resolves the vectors directory. Prefer GO_NOWHERE_VECTORS, then
@@ -33,7 +33,7 @@ func Dir() (string, error) {
 		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
 			return candidate, nil
 		}
-		// Monorepo layout: <root>/go-nowhere + <root>/harness/vectors
+		// Monorepo layout: <root>/nowhere-go + <root>/harness/vectors
 		harness := filepath.Join(dir, "harness", "vectors")
 		if st, err := os.Stat(harness); err == nil && st.IsDir() {
 			return harness, nil

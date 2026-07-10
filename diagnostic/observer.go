@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // Level is the severity of an Event.

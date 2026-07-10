@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // uotPacketConn adapts a Nowhere length-prefixed UoT stream to net.PacketConn.

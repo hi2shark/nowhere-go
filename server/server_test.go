@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/server"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/server"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func TestServerTCPEchoDialUpstream(t *testing.T) {

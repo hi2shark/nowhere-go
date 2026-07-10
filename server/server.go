@@ -8,7 +8,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com/hi2shark/go-nowhere/diagnostic"
+	"github.com/hi2shark/nowhere-go/diagnostic"
 )
 
 // ServerOptions configures the standalone Portal-like listener orchestrator.

@@ -1,7 +1,7 @@
 package tcptls
 
 import (
-	"github.com/hi2shark/go-nowhere/carrier"
+	"github.com/hi2shark/nowhere-go/carrier"
 	"net"
 	"sync/atomic"
 	"time"

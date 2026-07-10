@@ -7,8 +7,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/carrier"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 var (

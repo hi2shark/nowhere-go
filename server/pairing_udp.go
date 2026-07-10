@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // udpHalf is one side of an asymmetric UDP flow.

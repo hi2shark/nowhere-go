@@ -3,7 +3,7 @@ package tests_test
 import (
 	"testing"
 
-	"github.com/hi2shark/go-nowhere/internal/vectors"
+	"github.com/hi2shark/nowhere-go/internal/vectors"
 )
 
 func TestHarnessVectors(t *testing.T) {

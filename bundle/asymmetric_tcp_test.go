@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/carrier"
-	"github.com/hi2shark/go-nowhere/carrier/tcptls"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/tcptls"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func TestAsymmetricOpenTCPCancelsOtherHalfOnFailure(t *testing.T) {

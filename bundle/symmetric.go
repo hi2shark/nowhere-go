@@ -5,8 +5,8 @@ import (
 	"errors"
 	"net"
 
-	"github.com/hi2shark/go-nowhere/carrier/tcptls"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/carrier/tcptls"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func (b *CarrierBundle) SymmetricOpenTCP(ctx context.Context, dest string) (net.Conn, error) {

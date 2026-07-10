@@ -8,7 +8,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net.Conn, error) {

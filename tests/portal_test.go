@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/bundle"
-	"github.com/hi2shark/go-nowhere/carrier"
-	"github.com/hi2shark/go-nowhere/carrier/tcptls"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/bundle"
+	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/tcptls"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // In-memory fake portal: auth + TCP request + echo (no network).

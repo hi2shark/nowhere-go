@@ -11,8 +11,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/diagnostic"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/diagnostic"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // TLSHandshaker lets a host retain ownership of its TLS policy and implementation.

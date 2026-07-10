@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func TestFlowPairManagerPairsTCP(t *testing.T) {

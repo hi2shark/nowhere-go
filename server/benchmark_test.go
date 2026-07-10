@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func BenchmarkFlowPairTCP(b *testing.B) {

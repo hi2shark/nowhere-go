@@ -1,6 +1,6 @@
 package nowhere
 
-import "github.com/hi2shark/go-nowhere/wire"
+import "github.com/hi2shark/nowhere-go/wire"
 
 // Convenience re-exports; prefer importing wire directly in new code.
 

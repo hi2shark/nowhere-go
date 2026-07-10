@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func TestSessionManagerLimitAndReplacement(t *testing.T) {

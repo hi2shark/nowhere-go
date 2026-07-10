@@ -6,8 +6,8 @@ import (
 	"io"
 	"net"
 
-	"github.com/hi2shark/go-nowhere/carrier"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func (b *CarrierBundle) AsymmetricOpenUDP(ctx context.Context, dest string) (net.PacketConn, error) {

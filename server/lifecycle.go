@@ -6,7 +6,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com/hi2shark/go-nowhere/diagnostic"
+	"github.com/hi2shark/nowhere-go/diagnostic"
 )
 
 // CloseHandler is invoked exactly once for each physical carrier.

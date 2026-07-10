@@ -9,8 +9,8 @@ import (
 	"runtime"
 	"runtime/debug"
 
-	"github.com/hi2shark/go-nowhere/internal/vectors"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/internal/vectors"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // Version is overridden at link time: -ldflags "-X main.Version=v1.2.3"
@@ -59,7 +59,7 @@ func main() {
 func printVersion() {
 	fmt.Printf("nowhere-check %s\n", resolveVersion())
 	fmt.Printf("go %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("module github.com/hi2shark/go-nowhere\n")
+	fmt.Printf("module github.com/hi2shark/nowhere-go\n")
 	fmt.Printf("upstream nowhere %s %s\n", UpstreamVersion, UpstreamCommit)
 }
 

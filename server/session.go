@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hi2shark/go-nowhere/diagnostic"
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/diagnostic"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 const (

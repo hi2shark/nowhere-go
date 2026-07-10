@@ -5,7 +5,7 @@ import (
 	"context"
 	"net"
 
-	"github.com/hi2shark/go-nowhere/wire"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // Backend is injected via bundle.BundleOptions.QUIC.

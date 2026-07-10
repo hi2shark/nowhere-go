@@ -1,4 +1,4 @@
-# Go-Nowhere
+# Nowhere-Go
 
 Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). The v0.3 line targets upstream **v1.3.3** (`962408bd`) and remains an integration preview.
 
@@ -10,7 +10,7 @@ Protocol behavior follows the official Rust project:
 - Integration notes: [integrations.md](https://github.com/NodePassProject/Nowhere/blob/main/docs/integrations.md)
 
 ```text
-module github.com/hi2shark/go-nowhere
+module github.com/hi2shark/nowhere-go
 go 1.20
 ```
 
@@ -37,7 +37,7 @@ Hosts keep:
 ## Package map
 
 ```text
-go-nowhere/
+nowhere-go/
 ├── wire/              # codec + EffectiveSpec
 ├── carrier/
 │   ├── tcptls/        # TLS/TCP pool (TCPDialer / TlsDialer injected)
@@ -64,9 +64,9 @@ Typical path used by mihomo / sing-box outbound adapters:
 
 ```go
 import (
-    "github.com/hi2shark/go-nowhere/bundle"
-    "github.com/hi2shark/go-nowhere/carrier/tcptls"
-    "github.com/hi2shark/go-nowhere/wire"
+    "github.com/hi2shark/nowhere-go/bundle"
+    "github.com/hi2shark/nowhere-go/carrier/tcptls"
+    "github.com/hi2shark/nowhere-go/wire"
 )
 
 spec, err := wire.BuildEffectiveSpec(password, userSpec, wire.DefaultALPN)
@@ -120,7 +120,7 @@ Two integration styles:
 import (
     "crypto/tls"
 
-    "github.com/hi2shark/go-nowhere/server"
+    "github.com/hi2shark/nowhere-go/server"
 )
 
 cfg, err := server.NewConfig(server.ConfigOptions{
@@ -189,7 +189,7 @@ On success the Upstream owns the wrapped connection lifecycle. Closing the wrapp
 
 ## Design boundaries
 
-| In go-nowhere | In the host |
+| In nowhere-go | In the host |
 |---|---|
 | Wire codecs and session/flow state machines | Listen addresses, certs, ALPN product policy |
 | TLS/TCP pool logic (dialers injected) | Actual `net.Dial` / TLS stacks |
@@ -199,7 +199,7 @@ On success the Upstream owns the wrapped connection lifecycle. Closing the wrapp
 Local development against a monorepo checkout:
 
 ```go
-replace github.com/hi2shark/go-nowhere => ../go-nowhere
+replace github.com/hi2shark/nowhere-go => ../nowhere-go
 ```
 
 ---
@@ -218,5 +218,5 @@ go run ./cmd/nowhere-check -version
 GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) validates Go **1.20.x / 1.24.x / stable** for push, PR, and `workflow_dispatch`. No release binaries are published — consume the module with `go get`.
 
 ```bash
-go get github.com/hi2shark/go-nowhere@latest
+go get github.com/hi2shark/nowhere-go@latest
 ```

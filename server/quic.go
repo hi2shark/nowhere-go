@@ -18,7 +18,7 @@ type QuicStream interface {
 }
 
 // QuicConn is one authenticated (or pre-auth) QUIC connection.
-// Hosts adapt quic-go / sing-quic to this interface; go-nowhere never imports quic-go.
+// Hosts adapt quic-go / sing-quic to this interface; nowhere-go never imports quic-go.
 type QuicConn interface {
 	AcceptStream(ctx context.Context) (QuicStream, error)
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
