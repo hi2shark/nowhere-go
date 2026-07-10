@@ -37,18 +37,18 @@ func TestPortalSymmetricTCPEcho(t *testing.T) {
 		portalErr = serveFakePortalOnce(ln, "secret", spec, []byte("pong"))
 	}()
 
-	cfg := &tcptls.TCPConnConfig{
-		Addr:   ln.Addr().String(),
-		Spec:   spec,
-		Key:    "secret",
-		Dialer: &netDialer{},
-		TLSDialer: &plainTLS{},
+	cfg, err := tcptls.NewConfig(tcptls.TCPOptions{
+		Address: ln.Addr().String(), Spec: spec, Key: "secret",
+		Dialer: &netDialer{}, TLSDialer: &plainTLS{},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	b, err := bundle.NewCarrierBundle(&bundle.BundleConfig{
+	b, err := bundle.NewCarrierBundle(bundle.BundleOptions{
 		TCP:      cfg,
 		PoolSize: 0,
-		Up:       "tcp",
-		Down:     "tcp",
+		Up:       wire.CarrierTCP,
+		Down:     wire.CarrierTCP,
 	})
 	if err != nil {
 		t.Fatal(err)

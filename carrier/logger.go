@@ -1,7 +1,7 @@
 package carrier
 
-// Logger is an optional diagnostic sink injected by host adapters.
-// Implementations may no-op; core never imports host log packages.
+// Logger is internal printf-style plumbing retained inside the carrier package.
+// Public configurations accept diagnostic.Observer instead.
 type Logger interface {
 	Debugf(format string, args ...any)
 	Warnf(format string, args ...any)

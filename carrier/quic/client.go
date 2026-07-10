@@ -8,7 +8,7 @@ import (
 	"github.com/hi2shark/go-nowhere/wire"
 )
 
-// Backend is injected via bundle.BundleConfig.Quic.
+// Backend is injected via bundle.BundleOptions.QUIC.
 type Backend interface {
 	SetSessionID(id wire.SessionID)
 	OpenTCP(ctx context.Context, dest string) (net.Conn, error)

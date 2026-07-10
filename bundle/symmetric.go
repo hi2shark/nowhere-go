@@ -6,11 +6,12 @@ import (
 	"net"
 
 	"github.com/hi2shark/go-nowhere/carrier/tcptls"
+	"github.com/hi2shark/go-nowhere/wire"
 )
 
 func (b *CarrierBundle) SymmetricOpenTCP(ctx context.Context, dest string) (net.Conn, error) {
-	switch b.cfg.Up {
-	case "tcp":
+	switch b.cfg.up {
+	case wire.CarrierTCP:
 		pool, err := b.tcpPool()
 		if err != nil {
 			return nil, err
@@ -32,8 +33,8 @@ func (b *CarrierBundle) SymmetricOpenTCP(ctx context.Context, dest string) (net.
 }
 
 func (b *CarrierBundle) SymmetricOpenUDP(ctx context.Context, dest string) (net.PacketConn, net.Conn, error) {
-	switch b.cfg.Up {
-	case "tcp":
+	switch b.cfg.up {
+	case wire.CarrierTCP:
 		pool, err := b.tcpPool()
 		if err != nil {
 			return nil, nil, err

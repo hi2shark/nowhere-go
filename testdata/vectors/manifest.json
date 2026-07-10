@@ -1,5 +1,7 @@
 {
   "protocol": "nowhere-v1",
+  "upstream_version": "v1.3.3",
+  "upstream_commit": "962408bd702591587ff5ed7e2f638d23b996834f",
   "exported_at": "2026-07-09",
   "sources": {
     "protocol_md": "Nowhere/docs/protocol.md",

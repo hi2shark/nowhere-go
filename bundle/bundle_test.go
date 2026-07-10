@@ -8,7 +8,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/hi2shark/go-nowhere/carrier/tcptls"
+	"github.com/hi2shark/go-nowhere/wire"
 )
 
 func TestCarrierBundleSessionIDRandomErrorPersists(t *testing.T) {
@@ -17,11 +17,11 @@ func TestCarrierBundleSessionIDRandomErrorPersists(t *testing.T) {
 	rand.Reader = errReader{fill: 0x7f, err: wantErr}
 	t.Cleanup(func() { rand.Reader = oldReader })
 
-	bundle, err := NewCarrierBundle(&BundleConfig{
-		Quic: &stubQuicBackend{},
-		TCP:  &tcptls.TCPConnConfig{},
-		Up:   "tcp",
-		Down: "udp",
+	bundle, err := NewCarrierBundle(BundleOptions{
+		QUIC: &stubQuicBackend{},
+		TCP:  testBundleTCPConfig(t),
+		Up:   wire.CarrierTCP,
+		Down: wire.CarrierUDP,
 	})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("NewCarrierBundle = %v, %v; want error %v", bundle, err, wantErr)

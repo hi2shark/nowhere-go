@@ -12,164 +12,108 @@ import (
 	"github.com/hi2shark/go-nowhere/wire"
 )
 
-// UDPHalf is one side of an asymmetric UDP flow.
-type UDPHalf struct {
+// udpHalf is one side of an asymmetric UDP flow.
+type udpHalf struct {
 	Role       wire.FlowRole
-	Uplink     UDPUplink
-	Downlink   UDPDownlink
-	CompactAck CompactAck
+	Uplink     udpUplink
+	Downlink   udpDownlink
+	compactAck compactAck
 }
 
-type UDPUplink interface {
+type udpUplink interface {
 	ReadPacket() ([]byte, error)
 	Close() error
 }
 
-type UDPDownlink interface {
+type udpDownlink interface {
 	WritePacket(p []byte) error
 	WriteAck(flowID uint64) error
 	WriteClose(flowID uint64) error
 	Close() error
 }
 
-// CompactAck sends OPEN_ACK on the QUIC uplink session when present.
-type CompactAck interface {
+// compactAck sends OPEN_ACK on the QUIC uplink session when present.
+type compactAck interface {
 	SendOpenAck(flowID uint64) error
 	MarkAcked()
 }
 
-type pendingUDPHalf struct {
-	role       wire.FlowRole
-	uplink     UDPUplink
-	downlink   UDPDownlink
-	compactAck CompactAck
-	timer      *time.Timer
-	done       chan struct{}
-	timedOut   bool
+// pairedUDP is a completed asymmetric UDP flow ready for routing.
+type pairedUDP struct {
+	FlowID      uint64
+	Target      string
+	Uplink      udpUplink
+	Downlink    udpDownlink
+	compactAck  compactAck
+	IdleTimeout time.Duration
 }
 
-// PairedUDP is a completed asymmetric UDP flow ready for routing.
-type PairedUDP struct {
-	FlowID     uint64
-	Target     string
-	Uplink     UDPUplink
-	Downlink   UDPDownlink
-	CompactAck CompactAck
-}
-
-// SubmitUDP caches or pairs a UDP half. Completing half returns *PairedUDP;
+// SubmitUDP caches or pairs a UDP half. Completing half returns *pairedUDP;
 // waiting half returns (nil, nil).
-func (m *FlowPairManager) SubmitUDP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half UDPHalf) (*PairedUDP, error) {
-	if header.Kind != wire.FlowKindUDP {
-		return nil, fmt.Errorf("nowhere: SubmitUDP requires FlowKindUDP")
+func (m *flowPairManager) SubmitUDP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) (*pairedUDP, error) {
+	if err := validatePairHeader(header, wire.FlowKindUDP); err != nil {
+		return nil, err
 	}
-	if header.Uplink == header.Downlink {
-		return nil, fmt.Errorf("nowhere: symmetric carriers must not use flow envelope")
+	pending := &pendingFlow{
+		meta: metadataFrom(header, target), role: half.Role, udp: half,
+		done: make(chan struct{}), state: pairWaiting,
 	}
-	key := flowKey{
-		session: sessionID,
-		flowID:  header.FlowID,
-		kind:    header.Kind,
-		target:  target,
-		up:      header.Uplink,
-		down:    header.Downlink,
+	key := pairKey{session: sessionID, flowID: header.FlowID}
+	existing, err := m.submit(key, pending)
+	if err != nil {
+		return nil, err
 	}
-
-	m.mu.Lock()
-	if existing, ok := m.pendingUDP[key]; ok {
-		if existing.role == half.Role {
-			m.mu.Unlock()
-			closeUDPHalf(half)
-			return nil, fmt.Errorf("nowhere: duplicate udp flow half role=%d", half.Role)
-		}
-		delete(m.pendingUDP, key)
-		if existing.timer != nil {
-			existing.timer.Stop()
-		}
-		var uplink UDPUplink
-		var downlink UDPDownlink
-		var ack CompactAck
+	if existing != nil {
+		var uplink udpUplink
+		var downlink udpDownlink
+		var ack compactAck
 		if half.Role == wire.FlowRoleOpen {
-			uplink, downlink = half.Uplink, existing.downlink
-			ack = half.CompactAck
+			uplink, downlink = half.Uplink, existing.udp.Downlink
+			ack = half.compactAck
 			if ack == nil {
-				ack = existing.compactAck
+				ack = existing.udp.compactAck
 			}
 		} else {
-			uplink, downlink = existing.uplink, half.Downlink
-			ack = existing.compactAck
+			uplink, downlink = existing.udp.Uplink, half.Downlink
+			ack = existing.udp.compactAck
 			if ack == nil {
-				ack = half.CompactAck
+				ack = half.compactAck
 			}
 		}
-		close(existing.done)
-		m.mu.Unlock()
-		return &PairedUDP{
+		return &pairedUDP{
 			FlowID:     header.FlowID,
 			Target:     target,
 			Uplink:     uplink,
 			Downlink:   downlink,
-			CompactAck: ack,
+			compactAck: ack,
 		}, nil
 	}
-
-	pending := &pendingUDPHalf{
-		role:       half.Role,
-		uplink:     half.Uplink,
-		downlink:   half.Downlink,
-		compactAck: half.CompactAck,
-		done:       make(chan struct{}),
-	}
-	pending.timer = time.AfterFunc(m.timeout, func() {
-		m.mu.Lock()
-		cur, ok := m.pendingUDP[key]
-		if !ok || cur != pending {
-			m.mu.Unlock()
-			return
-		}
-		delete(m.pendingUDP, key)
-		pending.timedOut = true
-		m.mu.Unlock()
-		closeUDPHalf(UDPHalf{Role: pending.role, Uplink: pending.uplink, Downlink: pending.downlink})
-		close(pending.done)
-	})
-	if m.pendingUDP == nil {
-		m.pendingUDP = make(map[flowKey]*pendingUDPHalf)
-	}
-	m.pendingUDP[key] = pending
-	m.mu.Unlock()
-
-	select {
-	case <-pending.done:
-		if pending.timedOut {
-			return nil, fmt.Errorf("nowhere: udp flow pair timeout")
-		}
-		return nil, nil
-	case <-ctx.Done():
-		owned := false
-		m.mu.Lock()
-		if cur, ok := m.pendingUDP[key]; ok && cur == pending {
-			delete(m.pendingUDP, key)
-			if pending.timer != nil {
-				pending.timer.Stop()
-			}
-			owned = true
-		}
-		m.mu.Unlock()
-		if owned {
-			close(pending.done)
-			closeUDPHalf(half)
-		}
-		return nil, ctx.Err()
-	}
+	return nil, m.wait(ctx, key, pending)
 }
 
-func closeUDPHalf(half UDPHalf) {
+func closeUDPHalf(half udpHalf) {
 	if half.Uplink != nil {
 		_ = half.Uplink.Close()
 	}
 	if half.Downlink != nil {
 		_ = half.Downlink.Close()
+	}
+}
+
+func closeUDPHalfWithError(half udpHalf, err error) {
+	if half.Uplink != nil {
+		if value, ok := half.Uplink.(*tcpUDPUplink); ok {
+			closeConnWithError(value.conn, err)
+		} else {
+			_ = half.Uplink.Close()
+		}
+	}
+	if half.Downlink != nil {
+		if value, ok := half.Downlink.(*tcpUDPDownlink); ok {
+			closeConnWithError(value.conn, err)
+		} else {
+			_ = half.Downlink.Close()
+		}
 	}
 }
 
@@ -180,7 +124,7 @@ type tcpUDPUplink struct {
 	mu   sync.Mutex
 }
 
-func NewTCPUDPUplink(conn net.Conn) UDPUplink { return &tcpUDPUplink{conn: conn} }
+func newTCPUDPUplink(conn net.Conn) udpUplink { return &tcpUDPUplink{conn: conn} }
 
 func (u *tcpUDPUplink) ReadPacket() ([]byte, error) {
 	u.mu.Lock()
@@ -207,7 +151,7 @@ type tcpUDPDownlink struct {
 	mu   sync.Mutex
 }
 
-func NewTCPUDPDownlink(conn net.Conn) UDPDownlink { return &tcpUDPDownlink{conn: conn} }
+func newTCPUDPDownlink(conn net.Conn) udpDownlink { return &tcpUDPDownlink{conn: conn} }
 
 func (d *tcpUDPDownlink) WritePacket(p []byte) error {
 	d.mu.Lock()
@@ -238,56 +182,89 @@ func (d *tcpUDPDownlink) Close() error { return d.conn.Close() }
 
 // --- QUIC DATAGRAM halves ---
 
-// QuicUDPUplink buffers DATAGRAM payloads for an asymmetric UDP OPEN half.
-type QuicUDPUplink struct {
-	ch     chan []byte
-	closed chan struct{}
-	once   sync.Once
+// quicUDPUplink buffers DATAGRAM payloads for an asymmetric UDP OPEN half.
+type quicUDPUplink struct {
+	ch      chan []byte
+	closed  chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	session *portalSession
+	onClose func()
+	readDL  deadlineSignal
 }
 
-func NewQUICUDPUplink() *QuicUDPUplink {
-	return &QuicUDPUplink{
-		ch:     make(chan []byte, 64),
-		closed: make(chan struct{}),
+func newQUICUDPUplink(session *portalSession) *quicUDPUplink {
+	queuePackets := DefaultQUICQueuePackets
+	if session != nil && session.Handler != nil {
+		queuePackets = session.Handler.config.limits.QUICQueuePackets
+	}
+	return &quicUDPUplink{
+		ch:      make(chan []byte, queuePackets),
+		closed:  make(chan struct{}),
+		session: session,
 	}
 }
 
-func (u *QuicUDPUplink) Deliver(p []byte) {
+func (u *quicUDPUplink) Deliver(p []byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	select {
 	case <-u.closed:
 		return
 	default:
+	}
+	if u.session != nil && !u.session.reserveQueueBytes(len(p)) {
+		return
 	}
 	cp := make([]byte, len(p))
 	copy(cp, p)
 	select {
 	case u.ch <- cp:
 	default:
-		select {
-		case <-u.ch:
-		default:
-		}
-		select {
-		case u.ch <- cp:
-		default:
+		if u.session != nil {
+			u.session.releaseQueueBytes(len(cp))
 		}
 	}
 }
 
-func (u *QuicUDPUplink) ReadPacket() ([]byte, error) {
+func (u *quicUDPUplink) ReadPacket() ([]byte, error) {
 	select {
-	case p, ok := <-u.ch:
-		if !ok {
-			return nil, io.EOF
+	case p := <-u.ch:
+		if u.session != nil {
+			u.session.releaseQueueBytes(len(p))
 		}
 		return p, nil
 	case <-u.closed:
 		return nil, io.EOF
+	case <-u.readDL.wait():
+		return nil, deadlineError()
 	}
 }
 
-func (u *QuicUDPUplink) Close() error {
-	u.once.Do(func() { close(u.closed) })
+func (u *quicUDPUplink) Close() error {
+	u.once.Do(func() {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		close(u.closed)
+		for {
+			select {
+			case payload := <-u.ch:
+				if u.session != nil {
+					u.session.releaseQueueBytes(len(payload))
+				}
+			default:
+				if u.onClose != nil {
+					u.onClose()
+				}
+				return
+			}
+		}
+	})
+	return nil
+}
+
+func (u *quicUDPUplink) SetReadDeadline(value time.Time) error {
+	u.readDL.set(value)
 	return nil
 }
 
@@ -295,7 +272,7 @@ type quicUDPDownlink struct {
 	send func([]byte) error
 }
 
-func NewQUICUDPDownlink(send func([]byte) error) UDPDownlink {
+func newQUICUDPDownlink(send func([]byte) error) udpDownlink {
 	return &quicUDPDownlink{send: send}
 }
 
@@ -359,7 +336,7 @@ type quicCompactAck struct {
 	acked bool
 }
 
-func NewQUICCompactAck(send func([]byte) error, mark func()) CompactAck {
+func newQUICCompactAck(send func([]byte) error, mark func()) compactAck {
 	return &quicCompactAck{send: send, mark: mark}
 }
 
@@ -387,31 +364,42 @@ func (a *quicCompactAck) MarkAcked() {
 	}
 }
 
-// pairedUDPConn exposes a PairedUDP as net.PacketConn.
+// pairedUDPConn exposes a pairedUDP as net.PacketConn.
 type pairedUDPConn struct {
-	flowID     uint64
-	dest       net.Addr
-	uplink     UDPUplink
-	downlink   UDPDownlink
-	compactAck CompactAck
-	ackOnce    sync.Once
-	closeOnce  sync.Once
+	flowID      uint64
+	dest        net.Addr
+	uplink      udpUplink
+	downlink    udpDownlink
+	compactAck  compactAck
+	ackOnce     sync.Once
+	closeOnce   sync.Once
+	readDL      deadlineSignal
+	writeDL     deadlineSignal
+	idle        *time.Timer
+	idleTimeout time.Duration
+	idleMu      sync.Mutex
 }
 
-// NewPairedUDPConn adapts a PairedUDP to net.PacketConn.
-func NewPairedUDPConn(paired *PairedUDP) net.PacketConn {
+// newPairedUDPConn adapts a pairedUDP to net.PacketConn.
+func newPairedUDPConn(paired *pairedUDP) net.PacketConn {
 	down := paired.Downlink
 	if q, ok := down.(*quicUDPDownlink); ok {
 		down = &quicUDPDownlinkBound{flowID: paired.FlowID, send: q.send}
 	}
 	dest := parseTargetAddr(paired.Target)
-	return &pairedUDPConn{
-		flowID:     paired.FlowID,
-		dest:       dest,
-		uplink:     paired.Uplink,
-		downlink:   down,
-		compactAck: paired.CompactAck,
+	conn := &pairedUDPConn{
+		flowID:      paired.FlowID,
+		dest:        dest,
+		uplink:      paired.Uplink,
+		downlink:    down,
+		compactAck:  paired.compactAck,
+		idleTimeout: paired.IdleTimeout,
 	}
+	if conn.idleTimeout <= 0 {
+		conn.idleTimeout = DefaultUDPIdleTimeout
+	}
+	conn.resetIdle()
+	return conn
 }
 
 type addrString struct{ s string }
@@ -429,6 +417,11 @@ func (c *pairedUDPConn) sendAck() {
 }
 
 func (c *pairedUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	select {
+	case <-c.readDL.wait():
+		return 0, nil, deadlineError()
+	default:
+	}
 	for {
 		payload, err := c.uplink.ReadPacket()
 		if err != nil {
@@ -438,30 +431,71 @@ func (c *pairedUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			continue
 		}
 		c.sendAck()
+		c.resetIdle()
 		n = copy(p, payload)
 		return n, c.dest, nil
 	}
 }
 
 func (c *pairedUDPConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
+	select {
+	case <-c.writeDL.wait():
+		return 0, deadlineError()
+	default:
+	}
 	if err := c.downlink.WritePacket(p); err != nil {
 		return 0, err
 	}
+	c.resetIdle()
 	return len(p), nil
 }
 
 func (c *pairedUDPConn) Close() error {
-	c.closeOnce.Do(func() {
-		_ = c.downlink.WriteClose(c.flowID)
-		_ = c.uplink.Close()
-		_ = c.downlink.Close()
-	})
+	c.closeWithError(nil)
 	return nil
 }
 
-func (c *pairedUDPConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
-func (c *pairedUDPConn) SetDeadline(time.Time) error      { return nil }
-func (c *pairedUDPConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *pairedUDPConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *pairedUDPConn) closeWithError(cause error) {
+	c.closeOnce.Do(func() {
+		c.idleMu.Lock()
+		if c.idle != nil {
+			c.idle.Stop()
+		}
+		c.idleMu.Unlock()
+		_ = c.downlink.WriteClose(c.flowID)
+		closeUDPHalfWithError(udpHalf{Uplink: c.uplink, Downlink: c.downlink}, cause)
+	})
+}
+
+func (c *pairedUDPConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
+func (c *pairedUDPConn) SetDeadline(value time.Time) error {
+	if err := c.SetReadDeadline(value); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(value)
+}
+func (c *pairedUDPConn) SetReadDeadline(value time.Time) error {
+	c.readDL.set(value)
+	if deadline, ok := c.uplink.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return deadline.SetReadDeadline(value)
+	}
+	return nil
+}
+func (c *pairedUDPConn) SetWriteDeadline(value time.Time) error {
+	c.writeDL.set(value)
+	if deadline, ok := c.downlink.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return deadline.SetWriteDeadline(value)
+	}
+	return nil
+}
+
+func (c *pairedUDPConn) resetIdle() {
+	c.idleMu.Lock()
+	defer c.idleMu.Unlock()
+	if c.idle != nil {
+		c.idle.Stop()
+	}
+	c.idle = time.AfterFunc(c.idleTimeout, func() { _ = c.Close() })
+}
 
 var _ net.PacketConn = (*pairedUDPConn)(nil)

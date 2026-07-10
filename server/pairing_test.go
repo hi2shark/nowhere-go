@@ -13,7 +13,7 @@ import (
 )
 
 func TestFlowPairManagerPairsTCP(t *testing.T) {
-	m := NewFlowPairManager(2 * time.Second)
+	m := newFlowPairManager(2 * time.Second)
 	defer m.Close()
 
 	c1, c2 := net.Pipe()
@@ -66,7 +66,7 @@ func TestFlowPairManagerPairsTCP(t *testing.T) {
 }
 
 func TestFlowPairManagerTimeout(t *testing.T) {
-	m := NewFlowPairManager(50 * time.Millisecond)
+	m := newFlowPairManager(50 * time.Millisecond)
 	defer m.Close()
 
 	c1, c2 := net.Pipe()
@@ -87,7 +87,7 @@ func TestFlowPairManagerTimeout(t *testing.T) {
 }
 
 func TestFlowPairManagerTCPCancelUnblocksPeer(t *testing.T) {
-	m := NewFlowPairManager(2 * time.Second)
+	m := newFlowPairManager(2 * time.Second)
 	defer m.Close()
 
 	c1, c2 := net.Pipe()

@@ -8,13 +8,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 const (
-	ProxyFrameVersion uint8 = 1
-	DefaultALPN             = "now/1"
-	DefaultSpec             = "auto"
-	UOTMagicTarget          = "uot.nowhere.invalid:0" // switches TLS/TCP lane into UoT mode
+	ProxyFrameVersion uint8  = 1
+	DefaultALPN              = "now/1"
+	DefaultSpec              = "auto"
+	UOTMagicTarget           = "uot.nowhere.invalid:0" // switches TLS/TCP lane into UoT mode
 	CloseErrCodeOK    uint64 = 0x100
 
 	maxInputLength  = 255
@@ -58,26 +59,48 @@ var (
 	proxyFrameLayoutLabel  = []byte("proxy frame layout")
 )
 
-
 // EffectiveSpec is protocol material from spec/ALPN (independent of key shape).
 type EffectiveSpec struct {
-	EffectiveSpec   string
-	EffectiveALPN   string
-	DefaultALPN     string
-	EffectiveSpecID string // base64url-no-pad diagnostic id, never transmitted
+	effectiveSpec   string
+	effectiveALPN   string
+	effectiveSpecID string // base64url-no-pad diagnostic id, never transmitted
 
-	AuthFrameOrder []AuthFrameElement
-	AuthMagic      []byte
-	AuthInfo       []byte
-	AuthContext    []byte
-	AuthPaddingLen uint8
-	AuthPaddingKey []byte
+	authFrameOrder []AuthFrameElement
+	authMagic      []byte
+	authInfo       []byte
+	authContext    []byte
+	authPaddingLen uint8
+	authPaddingKey []byte
 
-	TcpFrameOrder []TcpFrameElement
-	TcpPaddingLen uint8
-	TcpPaddingKey []byte
+	tcpFrameOrder []TcpFrameElement
+	tcpPaddingLen uint8
+	tcpPaddingKey []byte
 
-	UdpFrameOrder []UdpFrameElement
+	udpFrameOrder []UdpFrameElement
+}
+
+// Spec returns the normalized protocol spec string.
+func (s *EffectiveSpec) Spec() string {
+	if s == nil {
+		return ""
+	}
+	return s.effectiveSpec
+}
+
+// ALPN returns the normalized TLS / QUIC ALPN value.
+func (s *EffectiveSpec) ALPN() string {
+	if s == nil {
+		return ""
+	}
+	return s.effectiveALPN
+}
+
+// SpecID returns the base64url-no-pad diagnostic identifier. It is never sent on the wire.
+func (s *EffectiveSpec) SpecID() string {
+	if s == nil {
+		return ""
+	}
+	return s.effectiveSpecID
 }
 
 // BuildEffectiveSpec derives v1 protocol material. The key is validated but does not affect shape.
@@ -86,12 +109,18 @@ func BuildEffectiveSpec(key, spec, alpn string) (*EffectiveSpec, error) {
 	if len(keyBytes) == 0 {
 		return nil, errors.New("nowhere: missing shared key")
 	}
+	if !utf8.ValidString(key) {
+		return nil, fmt.Errorf("nowhere: shared key is not valid UTF-8")
+	}
 	if len(keyBytes) > maxInputLength {
 		return nil, fmt.Errorf("nowhere: shared key exceeds %d bytes", maxInputLength)
 	}
 
 	effectiveSpec := spec
 	if effectiveSpec != "" {
+		if !utf8.ValidString(effectiveSpec) {
+			return nil, fmt.Errorf("nowhere: spec is not valid UTF-8")
+		}
 		if len([]byte(effectiveSpec)) > maxInputLength {
 			return nil, fmt.Errorf("nowhere: spec exceeds %d bytes", maxInputLength)
 		}
@@ -101,6 +130,9 @@ func BuildEffectiveSpec(key, spec, alpn string) (*EffectiveSpec, error) {
 
 	effectiveALPN := alpn
 	if effectiveALPN != "" {
+		if !utf8.ValidString(effectiveALPN) {
+			return nil, fmt.Errorf("nowhere: alpn is not valid UTF-8")
+		}
 		if len([]byte(effectiveALPN)) > maxInputLength {
 			return nil, fmt.Errorf("nowhere: alpn exceeds %d bytes", maxInputLength)
 		}
@@ -130,23 +162,22 @@ func BuildEffectiveSpec(key, spec, alpn string) (*EffectiveSpec, error) {
 	specIDRaw := hkdfExpand(specPRK, specIDLabel, specIDLength)
 
 	return &EffectiveSpec{
-		EffectiveSpec:   effectiveSpec,
-		EffectiveALPN:   effectiveALPN,
-		DefaultALPN:     DefaultALPN,
-		EffectiveSpecID: base64.RawURLEncoding.EncodeToString(specIDRaw),
+		effectiveSpec:   effectiveSpec,
+		effectiveALPN:   effectiveALPN,
+		effectiveSpecID: base64.RawURLEncoding.EncodeToString(specIDRaw),
 
-		AuthFrameOrder: authFrameOrder,
-		AuthMagic:      authMagic,
-		AuthInfo:       authInfo,
-		AuthContext:    authContext,
-		AuthPaddingLen: authPaddingLen,
-		AuthPaddingKey: authPaddingKey,
+		authFrameOrder: authFrameOrder,
+		authMagic:      authMagic,
+		authInfo:       authInfo,
+		authContext:    authContext,
+		authPaddingLen: authPaddingLen,
+		authPaddingKey: authPaddingKey,
 
-		TcpFrameOrder: tcpFrameOrder,
-		TcpPaddingLen: tcpPaddingLen,
-		TcpPaddingKey: tcpPaddingKey,
+		tcpFrameOrder: tcpFrameOrder,
+		tcpPaddingLen: tcpPaddingLen,
+		tcpPaddingKey: tcpPaddingKey,
 
-		UdpFrameOrder: udpFrameOrder,
+		udpFrameOrder: udpFrameOrder,
 	}, nil
 }
 
@@ -171,7 +202,6 @@ func hkdfExpand(prk, info []byte, length int) []byte {
 	}
 	return out[:length]
 }
-
 
 func hmacSHA256(key, msg []byte) []byte {
 	mac := hmac.New(sha256.New, key)

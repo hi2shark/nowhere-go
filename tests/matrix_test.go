@@ -22,33 +22,28 @@ func TestMatrixBundleSelectors(t *testing.T) {
 
 	cases := []struct {
 		name    string
-		up      string
-		down    string
+		up      wire.Carrier
+		down    wire.Carrier
 		wantAsy bool
 		needQ   bool
 	}{
-		{"tcp/tcp", "tcp", "tcp", false, false},
-		{"tcp/udp", "tcp", "udp", true, true},
-		{"udp/tcp", "udp", "tcp", true, true},
-		{"udp/udp", "udp", "udp", false, true},
+		{"tcp/tcp", wire.CarrierTCP, wire.CarrierTCP, false, false},
+		{"tcp/udp", wire.CarrierTCP, wire.CarrierUDP, true, true},
+		{"udp/tcp", wire.CarrierUDP, wire.CarrierTCP, true, true},
+		{"udp/udp", wire.CarrierUDP, wire.CarrierUDP, false, true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := &bundle.BundleConfig{
-				TCP: &tcptls.TCPConnConfig{
-					Addr:      "127.0.0.1:9",
-					Spec:      spec,
-					Key:       "secret",
-					Dialer:    failingDialer{},
-					TLSDialer: plainTLS{},
-				},
+			tcpConfig := mustTCPConfig(t, spec)
+			cfg := bundle.BundleOptions{
+				TCP:      tcpConfig,
 				PoolSize: 0,
 				Up:       tc.up,
 				Down:     tc.down,
 			}
 			if tc.needQ {
-				cfg.Quic = &recordingQuic{}
+				cfg.QUIC = &recordingQuic{}
 			}
 			b, err := bundle.NewCarrierBundle(cfg)
 			if err != nil {
@@ -67,7 +62,7 @@ func TestMatrixBundleSelectors(t *testing.T) {
 				t.Fatal("zero session id")
 			}
 			if tc.needQ {
-				q := cfg.Quic.(*recordingQuic)
+				q := cfg.QUIC.(*recordingQuic)
 				if q.id != sid {
 					t.Fatalf("quic session id not pinned")
 				}
@@ -81,16 +76,25 @@ func TestMatrixRejectsUDPWithoutQuic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = bundle.NewCarrierBundle(&bundle.BundleConfig{
-		TCP: &tcptls.TCPConnConfig{
-			Addr: "127.0.0.1:9", Spec: spec, Key: "secret",
-			Dialer: failingDialer{}, TLSDialer: plainTLS{},
-		},
-		Up: "tcp", Down: "udp",
+	_, err = bundle.NewCarrierBundle(bundle.BundleOptions{
+		TCP: mustTCPConfig(t, spec),
+		Up:  wire.CarrierTCP, Down: wire.CarrierUDP,
 	})
 	if err == nil {
 		t.Fatal("expected error for udp without QuicBackend")
 	}
+}
+
+func mustTCPConfig(t *testing.T, spec *wire.EffectiveSpec) *tcptls.Config {
+	t.Helper()
+	config, err := tcptls.NewConfig(tcptls.TCPOptions{
+		Address: "127.0.0.1:9", Spec: spec, Key: "secret",
+		Dialer: failingDialer{}, TLSDialer: plainTLS{},
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	return config
 }
 
 func TestMatrixUoTFramingRoundTrip(t *testing.T) {

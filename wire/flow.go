@@ -103,6 +103,9 @@ func ReadFlowHeader(r io.Reader) (FlowHeader, error) {
 	if downlink != CarrierTCP && downlink != CarrierUDP {
 		return FlowHeader{}, ErrInvalidFlowHeader
 	}
+	if uplink == downlink {
+		return FlowHeader{}, ErrInvalidFlowHeader
+	}
 	return FlowHeader{
 		Role:     role,
 		FlowID:   flowID,

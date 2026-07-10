@@ -7,67 +7,84 @@ import (
 	"fmt"
 	"net"
 	"sync"
+
+	"github.com/hi2shark/go-nowhere/diagnostic"
 )
 
-// ErrQUICNotConfigured is returned when UDP/QUIC is enabled but no QuicListener is injected.
-var ErrQUICNotConfigured = errors.New("nowhere: QUIC enabled but no QuicListener injected")
+// ServerOptions configures the standalone Portal-like listener orchestrator.
+type ServerOptions struct {
+	Config       *Config
+	TLS          *tls.Config
+	TLSHandshake TLSHandshaker
+	Upstream     Upstream
+	Observer     diagnostic.Observer
+	QUICListener QuicListener
+}
 
-// Server is a Portal-like Nowhere listener orchestrator.
+// Server owns listener and Handler lifecycle.
 type Server struct {
-	Config   *Config
-	TLS      *tls.Config
-	Upstream Upstream
-	Handler  *Handler
-	Logger   Logger
-
-	// QuicListener is optional; required when Config.EnableUDP is true.
-	QuicListener QuicListener
+	config       *Config
+	handler      *Handler
+	tlsHandshake TLSHandshaker
+	quicListener QuicListener
+	observer     diagnostic.Observer
 
 	mu       sync.Mutex
 	listener net.Listener
 	closed   bool
 }
 
-// NewServer builds a Server. Pairing / Sessions are created if nil on Handler.
-// upstream must be non-nil.
-func NewServer(cfg *Config, tlsCfg *tls.Config, upstream Upstream) *Server {
-	if upstream == nil {
-		panic("nowhere: NewServer requires non-nil Upstream")
+// NewServer validates all required standalone dependencies.
+func NewServer(options ServerOptions) (*Server, error) {
+	if options.Config == nil {
+		return nil, fmt.Errorf("%w: nil config", ErrInvalidConfig)
 	}
-	pairing := NewFlowPairManager(cfg.FlowPairTimeout)
-	sessions := NewSessionManager()
-	h := &Handler{
-		Config:   cfg,
-		Upstream: upstream,
-		Pairing:  pairing,
-		Sessions: sessions,
+	if options.Config.TCPEnabled() && options.TLSHandshake == nil && options.TLS == nil {
+		return nil, ErrTLSNotConfigured
+	}
+	if options.Config.UDPEnabled() && options.QUICListener == nil {
+		return nil, ErrQUICNotConfigured
+	}
+	handler, err := NewHandler(HandlerOptions{
+		Config: options.Config, Upstream: options.Upstream, Observer: options.Observer,
+	})
+	if err != nil {
+		return nil, err
+	}
+	handshake := options.TLSHandshake
+	if handshake == nil && options.TLS != nil {
+		tlsConfig := options.TLS.Clone()
+		handshake = func(ctx context.Context, raw net.Conn) (net.Conn, error) {
+			conn := tls.Server(raw, tlsConfig.Clone())
+			if err := conn.HandshakeContext(ctx); err != nil {
+				return nil, err
+			}
+			return conn, nil
+		}
 	}
 	return &Server{
-		Config:   cfg,
-		TLS:      tlsCfg,
-		Upstream: upstream,
-		Handler:  h,
-	}
+		config: options.Config, handler: handler, tlsHandshake: handshake,
+		quicListener: options.QUICListener, observer: options.Observer,
+	}, nil
 }
 
-// ListenAndServe listens on tcpAddr and serves until ctx is cancelled or Close.
+// ListenAndServe listens on tcpAddr and serves configured carriers until cancellation.
 func (s *Server) ListenAndServe(ctx context.Context, tcpAddr string) error {
-	if s.Config.EnableTCP {
-		ln, err := net.Listen("tcp", tcpAddr)
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if s.config.TCPEnabled() {
+		listener, err := net.Listen("tcp", tcpAddr)
 		if err != nil {
 			return err
 		}
 		s.mu.Lock()
-		s.listener = ln
+		s.listener = listener
 		s.mu.Unlock()
 		errCh := make(chan error, 2)
-		go func() {
-			errCh <- s.Serve(ctx, ln)
-		}()
-		if s.Config.EnableUDP {
-			go func() {
-				errCh <- s.ServeQUIC(ctx)
-			}()
+		go func() { errCh <- s.Serve(ctx, listener) }()
+		if s.config.UDPEnabled() {
+			go func() { errCh <- s.ServeQUIC(ctx) }()
 		}
 		select {
 		case <-ctx.Done():
@@ -78,24 +95,22 @@ func (s *Server) ListenAndServe(ctx context.Context, tcpAddr string) error {
 			return err
 		}
 	}
-	if s.Config.EnableUDP {
-		return s.ServeQUIC(ctx)
-	}
-	return fmt.Errorf("nowhere: no networks enabled")
+	return s.ServeQUIC(ctx)
 }
 
-// Serve accepts TCP connections, performs TLS handshake, then HandleConn.
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	s.mu.Lock()
-	s.listener = ln
-	s.mu.Unlock()
-	s.Handler.Logger = resolveLogger(s.Logger)
-	if s.Handler.Upstream == nil {
-		s.Handler.Upstream = s.Upstream
+// Serve accepts raw TCP connections and delegates TLS plus protocol handling.
+func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
+	if err := s.validate(); err != nil {
+		return err
 	}
-
+	if listener == nil {
+		return fmt.Errorf("%w: nil listener", ErrInvalidConfig)
+	}
+	s.mu.Lock()
+	s.listener = listener
+	s.mu.Unlock()
 	for {
-		conn, err := ln.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			s.mu.Lock()
 			closed := s.closed
@@ -110,38 +125,22 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 				return err
 			}
 		}
-		go s.handleTCP(ctx, conn)
+		go func(raw net.Conn) {
+			_ = s.handler.ServeTCP(ctx, raw, raw.RemoteAddr(), s.tlsHandshake, nil)
+		}(conn)
 	}
 }
 
-func (s *Server) handleTCP(ctx context.Context, conn net.Conn) {
-	log := resolveLogger(s.Logger)
-	tlsCfg := s.TLS
-	if tlsCfg == nil {
-		_ = conn.Close()
-		log.Errorf("nowhere: missing tls.Config")
-		return
-	}
-	tlsConn := tls.Server(conn, tlsCfg.Clone())
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = conn.Close()
-		log.Errorf("nowhere tls handshake from %v: %v", conn.RemoteAddr(), err)
-		return
-	}
-	s.Handler.HandleConn(ctx, tlsConn, tlsConn.RemoteAddr())
-}
-
-// ServeQUIC accepts QuicConn from the injected QuicListener.
+// ServeQUIC accepts QUIC connections from the injected listener.
 func (s *Server) ServeQUIC(ctx context.Context) error {
-	if s.QuicListener == nil {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if s.quicListener == nil {
 		return ErrQUICNotConfigured
 	}
-	s.Handler.Logger = resolveLogger(s.Logger)
-	if s.Handler.Upstream == nil {
-		s.Handler.Upstream = s.Upstream
-	}
 	for {
-		conn, err := s.QuicListener.Accept(ctx)
+		conn, err := s.quicListener.Accept(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -150,37 +149,48 @@ func (s *Server) ServeQUIC(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				resolveLogger(s.Logger).Debugf("nowhere quic accept: %v", err)
+				diagnostic.Emit(ctx, s.observer, diagnostic.Event{
+					Level: diagnostic.LevelWarn, Code: "quic_accept_failed", Component: "server", Err: err,
+				})
 				continue
 			}
 		}
-		go s.Handler.ServeQuicConn(ctx, conn)
+		go func() { _ = s.handler.ServeQUIC(ctx, conn) }()
 	}
 }
 
-// Close shuts down the TCP listener, pairing, and sessions.
+// Close shuts down listeners and all manager-owned state.
 func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
 	s.closed = true
-	ln := s.listener
+	listener := s.listener
 	s.listener = nil
 	s.mu.Unlock()
-	var err error
-	if ln != nil {
-		err = ln.Close()
+	var closeErr error
+	if listener != nil {
+		closeErr = listener.Close()
 	}
-	if s.Handler != nil {
-		if s.Handler.Pairing != nil {
-			s.Handler.Pairing.Close()
-		}
-		if s.Handler.Sessions != nil {
-			s.Handler.Sessions.Close()
-		}
+	if s.handler != nil {
+		_ = s.handler.Close()
 	}
-	if s.QuicListener != nil {
-		if e := s.QuicListener.Close(); e != nil && err == nil {
-			err = e
+	if s.quicListener != nil {
+		if err := s.quicListener.Close(); err != nil && closeErr == nil {
+			closeErr = err
 		}
 	}
-	return err
+	return closeErr
+}
+
+func (s *Server) validate() error {
+	if s == nil || s.config == nil || s.handler == nil {
+		return ErrInvalidConfig
+	}
+	return nil
 }

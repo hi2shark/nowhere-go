@@ -15,7 +15,6 @@ import (
 	"github.com/hi2shark/go-nowhere/wire"
 )
 
-
 type capturingLogger struct {
 	ch chan string
 }
@@ -34,7 +33,6 @@ func (l *capturingLogger) Debugf(format string, args ...any) {
 func (l *capturingLogger) Warnf(format string, args ...any) {
 	l.Debugf(format, args...)
 }
-
 
 func TestTCPPoolWarmBorrowConsumesCarrier(t *testing.T) {
 	dialer := &recordingTCPDialer{}
@@ -447,7 +445,7 @@ func TestTuneNowhereTCPConnSocketBufferEnv(t *testing.T) {
 		sub := logger.ch
 
 		tunable := &recordingTunableConn{recordingNetConn: newRecordingNetConn("default")}
-		tuneNowhereTCPConn(&TCPConnConfig{Logger: logger}, tunable, 10, "default")
+		tuneNowhereTCPConn(&Config{logger: logger}, tunable, 10, "default")
 
 		if tunable.readBufferCalls != 0 || tunable.writeBufferCalls != 0 {
 			t.Fatalf("unset env forced socket buffers: read_calls=%d write_calls=%d", tunable.readBufferCalls, tunable.writeBufferCalls)
@@ -461,7 +459,7 @@ func TestTuneNowhereTCPConnSocketBufferEnv(t *testing.T) {
 		sub := logger.ch
 
 		tunable := &recordingTunableConn{recordingNetConn: newRecordingNetConn("forced")}
-		tuneNowhereTCPConn(&TCPConnConfig{Logger: logger}, tunable, 11, "forced")
+		tuneNowhereTCPConn(&Config{logger: logger}, tunable, 11, "forced")
 
 		if tunable.readBuffer != 1048576 || tunable.writeBuffer != 1048576 {
 			t.Fatalf("buffers = read:%d write:%d, want 1048576", tunable.readBuffer, tunable.writeBuffer)
@@ -487,7 +485,7 @@ func TestTuneNowhereTCPConnSocketBufferEnv(t *testing.T) {
 			sub := logger.ch
 
 			tunable := &recordingTunableConn{recordingNetConn: newRecordingNetConn(tc.name)}
-			tuneNowhereTCPConn(&TCPConnConfig{Logger: logger}, tunable, 12, tc.name)
+			tuneNowhereTCPConn(&Config{logger: logger}, tunable, 12, tc.name)
 
 			if tunable.readBufferCalls != 0 || tunable.writeBufferCalls != 0 {
 				t.Fatalf("env %q forced socket buffers: read_calls=%d write_calls=%d", tc.value, tunable.readBufferCalls, tunable.writeBufferCalls)
@@ -634,21 +632,20 @@ func TestTCPPoolResizeEvictAndCloseDropIdleCarriers(t *testing.T) {
 	}
 }
 
-func testTCPConfig(t *testing.T, dialer TCPDialer, loggers ...*capturingLogger) *TCPConnConfig {
+func testTCPConfig(t *testing.T, dialer TCPDialer, loggers ...*capturingLogger) *Config {
 	t.Helper()
 	spec, err := wire.BuildEffectiveSpec("k", "auto", "now/1")
 	if err != nil {
 		t.Fatalf("BuildEffectiveSpec: %v", err)
 	}
-	cfg := &TCPConnConfig{
-		Addr:      "127.0.0.1:1",
-		Spec:      spec,
-		Key:       "k",
-		Dialer:    dialer,
-		TLSDialer: passthroughTLSDialer{},
+	cfg, err := NewConfig(TCPOptions{
+		Address: "127.0.0.1:1", Spec: spec, Key: "k", Dialer: dialer, TLSDialer: passthroughTLSDialer{},
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
 	}
 	if len(loggers) > 0 && loggers[0] != nil {
-		cfg.Logger = loggers[0]
+		cfg.logger = loggers[0]
 	}
 	return cfg
 }

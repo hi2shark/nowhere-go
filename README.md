@@ -1,6 +1,6 @@
 # Go-Nowhere
 
-Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server).
+Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). The v0.3 line targets upstream **v1.3.3** (`962408bd`) and remains an integration preview.
 
 This is a library, not a standalone proxy. Hosts such as [sing-box](https://github.com/SagerNet/sing-box) or [mihomo](https://github.com/MetaCubeX/mihomo) import it and supply platform pieces: TLS material, dialers, QUIC stacks, and routing.
 
@@ -58,7 +58,7 @@ Prefer importing subpackages. The root package only re-exports a few `wire` symb
 Typical path used by mihomo / sing-box outbound adapters:
 
 1. Build `wire.EffectiveSpec` from shared password, `spec`, and ALPN.
-2. Configure `tcptls.TCPConnConfig` with host dialers.
+2. Build an immutable `tcptls.Config` with host dialers.
 3. If either direction is UDP, inject a `carrier.QuicBackend`.
 4. Open flows through `bundle.CarrierBundle`.
 
@@ -74,20 +74,25 @@ if err != nil {
     return err
 }
 
-tcp := &tcptls.TCPConnConfig{
-    Addr:      serverAddr,
-    Spec:      spec,
-    Key:       password,
-    Dialer:    hostTCPDialer,
-    TLSDialer: hostTLSDialer,
+tcp, err := tcptls.NewConfig(tcptls.TCPOptions{
+	Address:   serverAddr,
+	Spec:      spec,
+	Key:       password,
+	Dialer:    hostTCPDialer,
+	TLSDialer: hostTLSDialer,
+	Observer:  hostObserver,
+})
+if err != nil {
+	return err
 }
 
-b, err := bundle.NewCarrierBundle(&bundle.BundleConfig{
-    TCP:      tcp,
-    Quic:     hostQuicBackend, // required when Up or Down is "udp"
-    PoolSize: pool,            // meaningful for tcp/tcp; UDP matrices use 0
-    Up:       "tcp",
-    Down:     "udp",
+up, down := wire.CarrierTCP, wire.CarrierUDP
+b, err := bundle.NewCarrierBundle(bundle.BundleOptions{
+	TCP:      tcp,
+	QUIC:     hostQuicBackend, // required when Up or Down is CarrierUDP
+	PoolSize: pool,            // meaningful for tcp/tcp; UDP matrices use 0
+	Up:       up,
+	Down:     down,
 })
 if err != nil {
     return err
@@ -118,18 +123,30 @@ import (
     "github.com/hi2shark/go-nowhere/server"
 )
 
-cfg, err := server.NewConfig(password, userSpec, "now/1", []string{"tcp"})
+cfg, err := server.NewConfig(server.ConfigOptions{
+	Password: password,
+	Spec:     userSpec,
+	ALPN:     "now/1",
+	Networks: []server.Network{server.NetworkTCP},
+})
 if err != nil {
     return err
 }
 
-srv := server.NewServer(cfg, tlsConfig, server.NewDialUpstream(nil))
-// Optional: srv.Logger = ...
-// For UDP: set srv.QuicListener to a host adapter, networks include "udp"
+srv, err := server.NewServer(server.ServerOptions{
+	Config:       cfg,
+	TLS:          tlsConfig,
+	Upstream:     server.NewDialUpstream(nil),
+	Observer:     hostObserver,
+	QUICListener: hostQuicListener, // required only when UDP is enabled
+})
+if err != nil {
+	return err
+}
 return srv.ListenAndServe(ctx, ":443")
 ```
 
-`networks`: `"tcp"`, `"udp"`, both, or empty (defaults to both).  
+`Networks`: `NetworkTCP`, `NetworkUDP`, both, or empty (defaults to both). Unknown and duplicate entries are rejected.
 UDP without `QuicListener` returns `server.ErrQUICNotConfigured`.
 
 ### B. Host-owned listener (e.g. sing-box)
@@ -137,16 +154,18 @@ UDP without `QuicListener` returns `server.ErrQUICNotConfigured`.
 Keep your own accept / TLS / QUIC stack. After the carrier is ready, call the protocol handler:
 
 ```go
-h := &server.Handler{
-    Config:   cfg,
-    Upstream: routerUpstream, // adapts host RouteConnection / RoutePacket
-    Pairing:  server.NewFlowPairManager(0),
-    Sessions: server.NewSessionManager(),
+h, err := server.NewHandler(server.HandlerOptions{
+	Config:   cfg,
+	Upstream: routerUpstream, // adapts host RouteConnection / RoutePacket
+	Observer: hostObserver,
+})
+if err != nil {
+	return err
 }
-h.HandleConnWithClose(ctx, tlsConn, remoteAddr, onClose)
+err = h.ServeTCP(ctx, rawConn, remoteAddr, hostTLSHandshake, onClose)
 ```
 
-QUIC: adapt your `quic-go` connection to `server.QuicConn` / `server.QuicListener`, then `Handler.ServeQuicConn` or `Server.ServeQUIC`.
+QUIC: adapt your connection to `server.QuicConn` / `server.QuicListener`, then call `Handler.ServeQUIC` or `Server.ServeQUIC`.
 
 ### Upstream interface
 
@@ -157,7 +176,14 @@ type Upstream interface {
 }
 ```
 
-On success the Upstream owns the connection lifecycle.
+On success the Upstream owns the wrapped connection lifecycle. Closing the wrapper or invoking the context `CloseHandler` closes every physical carrier and invokes each host callback exactly once. Normal close passes `nil`; terminal failures pass their cause. Callbacks run synchronously after close, must not block, and panics are isolated and reported to the Observer.
+
+### Default server guardrails
+
+- Authentication: 5 seconds with `[0.8, 1.2]` jitter; request idle: 40 seconds
+- Pending asymmetric pairs: 1024 per session, 4096 global; timeout: 5 seconds
+- QUIC UDP: 256 flows/session, 64 packets/flow, 4 MiB queued/session, 120 second idle
+- Active QUIC sessions: 1024; a matching session ID replaces the previous carrier
 
 ---
 
@@ -182,12 +208,14 @@ replace github.com/hi2shark/go-nowhere => ../go-nowhere
 
 ```bash
 go test ./...
+go test -race -shuffle=on -count=20 ./...
 go vet ./...
+staticcheck ./...
 go run ./cmd/nowhere-check            # wire vectors + self-check
 go run ./cmd/nowhere-check -version
 ```
 
-GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same on Go **1.20 / 1.22 / 1.24** for push, PR, and `workflow_dispatch`. No release binaries are published — consume the module with `go get`.
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) validates Go **1.20.x / 1.24.x / stable** for push, PR, and `workflow_dispatch`. No release binaries are published — consume the module with `go get`.
 
 ```bash
 go get github.com/hi2shark/go-nowhere@latest

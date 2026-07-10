@@ -10,30 +10,30 @@ func TestDefaults(t *testing.T) {
 	omit, _ := BuildEffectiveSpec("k", "", "")
 	empty, _ := BuildEffectiveSpec("k", "", "")
 	auto, _ := BuildEffectiveSpec("k", "auto", "")
-	if omit.EffectiveSpec != "auto" || empty.EffectiveSpec != "auto" || auto.EffectiveSpec != "auto" {
-		t.Fatalf("spec default wrong: %q %q %q", omit.EffectiveSpec, empty.EffectiveSpec, auto.EffectiveSpec)
+	if omit.Spec() != "auto" || empty.Spec() != "auto" || auto.Spec() != "auto" {
+		t.Fatalf("spec default wrong: %q %q %q", omit.Spec(), empty.Spec(), auto.Spec())
 	}
-	if omit.EffectiveALPN != "now/1" {
-		t.Fatalf("alpn default wrong: %q", omit.EffectiveALPN)
+	if omit.ALPN() != "now/1" {
+		t.Fatalf("alpn default wrong: %q", omit.ALPN())
 	}
 	withALPN, _ := BuildEffectiveSpec("k", "auto", "h3")
-	if withALPN.EffectiveALPN != "h3" {
-		t.Fatalf("explicit alpn not applied: %q", withALPN.EffectiveALPN)
+	if withALPN.ALPN() != "h3" {
+		t.Fatalf("explicit alpn not applied: %q", withALPN.ALPN())
 	}
-	if !bytes.Equal(withALPN.AuthMagic, omit.AuthMagic) || !equalTcpOrder(withALPN.TcpFrameOrder, omit.TcpFrameOrder) {
+	if !bytes.Equal(withALPN.authMagic, omit.authMagic) || !equalTcpOrder(withALPN.tcpFrameOrder, omit.tcpFrameOrder) {
 		t.Fatalf("explicit alpn changed derived material")
 	}
 
 	a, _ := BuildEffectiveSpec("k", "auto", "now/1")
 	b, _ := BuildEffectiveSpec("k", "auto", "now/1")
-	if a.EffectiveSpecID != b.EffectiveSpecID || !bytes.Equal(a.AuthMagic, b.AuthMagic) {
+	if a.SpecID() != b.SpecID() || !bytes.Equal(a.authMagic, b.authMagic) {
 		t.Fatalf("derivation not deterministic")
 	}
 
 	// Key must not change derived shape (auth tag is covered in frame_test).
 	k1, _ := BuildEffectiveSpec("key-one", "auto", "now/1")
 	k2, _ := BuildEffectiveSpec("key-two", "auto", "now/1")
-	if !bytes.Equal(k1.AuthMagic, k2.AuthMagic) {
+	if !bytes.Equal(k1.authMagic, k2.authMagic) {
 		t.Fatalf("derived material changed with key")
 	}
 }
@@ -44,8 +44,8 @@ func TestSpecIDParity(t *testing.T) {
 		t.Fatalf("BuildEffectiveSpec: %v", err)
 	}
 	// auto/now/1 → fixed 11-char base64url-no-pad spec id.
-	if len(spec.EffectiveSpecID) != 11 {
-		t.Fatalf("spec id length = %d, want 11", len(spec.EffectiveSpecID))
+	if len(spec.SpecID()) != 11 {
+		t.Fatalf("spec id length = %d, want 11", len(spec.SpecID()))
 	}
 }
 
@@ -56,24 +56,24 @@ func TestFrameOrderDeterministic(t *testing.T) {
 		t.Fatalf("BuildEffectiveSpec: %v", err)
 	}
 	canonical := []AuthFrameElement{AuthMagic, AuthNonce, AuthPadding, AuthTag}
-	if equalAuthOrder(spec.AuthFrameOrder, canonical) {
+	if equalAuthOrder(spec.authFrameOrder, canonical) {
 		t.Fatalf("auth frame order is canonical (must be rotated)")
 	}
-	if len(spec.AuthFrameOrder) != 4 || len(spec.TcpFrameOrder) != 3 || len(spec.UdpFrameOrder) != 4 {
+	if len(spec.authFrameOrder) != 4 || len(spec.tcpFrameOrder) != 3 || len(spec.udpFrameOrder) != 4 {
 		t.Fatalf("frame order lengths wrong")
 	}
 	// Each TCP/UDP element must appear exactly once.
-	if !isPerutation(spec.TcpFrameOrder) {
-		t.Fatalf("tcp frame order not a permutation: %v", spec.TcpFrameOrder)
+	if !isPerutation(spec.tcpFrameOrder) {
+		t.Fatalf("tcp frame order not a permutation: %v", spec.tcpFrameOrder)
 	}
-	if !isPermutationUdp(spec.UdpFrameOrder) {
-		t.Fatalf("udp frame order not a permutation: %v", spec.UdpFrameOrder)
+	if !isPermutationUdp(spec.udpFrameOrder) {
+		t.Fatalf("udp frame order not a permutation: %v", spec.udpFrameOrder)
 	}
 
 	// Different specs produce different orders (extremely likely; pick a spec
 	// known to differ from "auto").
 	other, _ := BuildEffectiveSpec("secret", "different-spec-value", "now/1")
-	if equalAuthOrder(spec.AuthFrameOrder, other.AuthFrameOrder) && equalTcpOrder(spec.TcpFrameOrder, other.TcpFrameOrder) {
+	if equalAuthOrder(spec.authFrameOrder, other.authFrameOrder) && equalTcpOrder(spec.tcpFrameOrder, other.tcpFrameOrder) {
 		// not a hard failure (collision is possible) but worth pinning a case
 		t.Logf("note: spec=%q and %q produced identical layouts", "auto", "different-spec-value")
 	}
@@ -98,6 +98,19 @@ func TestHKDFMatchesRFC5869(t *testing.T) {
 	okm := hkdfExpand(prk, info, 42)
 	if !bytes.Equal(okm, wantOKM) {
 		t.Fatalf("OKM mismatch\n got %x\nwant %x", okm, wantOKM)
+	}
+}
+
+func TestBuildEffectiveSpecRejectsInvalidUTF8(t *testing.T) {
+	invalid := string([]byte{0xff})
+	for _, input := range []struct{ key, spec, alpn string }{
+		{invalid, "auto", "now/1"},
+		{"secret", invalid, "now/1"},
+		{"secret", "auto", invalid},
+	} {
+		if _, err := BuildEffectiveSpec(input.key, input.spec, input.alpn); err == nil {
+			t.Fatalf("BuildEffectiveSpec(%q,%q,%q) accepted invalid UTF-8", input.key, input.spec, input.alpn)
+		}
 	}
 }
 

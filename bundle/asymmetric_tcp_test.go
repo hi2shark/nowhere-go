@@ -18,17 +18,14 @@ func TestAsymmetricOpenTCPCancelsOtherHalfOnFailure(t *testing.T) {
 	spec := mustNowhereSpec(t)
 	tcpDialer := newBlockingTCPDialer()
 	quic := &failAfterWaitQuic{wait: tcpDialer.started}
-	bundle, err := NewCarrierBundle(&BundleConfig{
-		Quic: quic,
-		TCP: &tcptls.TCPConnConfig{
-			Addr:      "127.0.0.1:1",
-			Spec:      spec,
-			Key:       "k",
-			Dialer:    tcpDialer,
-			TLSDialer: passthroughTLSDialer{},
-		},
-		Up:   "tcp",
-		Down: "udp",
+	tcpConfig, err := tcptls.NewConfig(tcptls.TCPOptions{
+		Address: "127.0.0.1:1", Spec: spec, Key: "k", Dialer: tcpDialer, TLSDialer: passthroughTLSDialer{},
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	bundle, err := NewCarrierBundle(BundleOptions{
+		QUIC: quic, TCP: tcpConfig, Up: wire.CarrierTCP, Down: wire.CarrierUDP,
 	})
 	if err != nil {
 		t.Fatalf("NewCarrierBundle: %v", err)
@@ -53,6 +50,18 @@ func TestAsymmetricOpenTCPCancelsOtherHalfOnFailure(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatalf("blocking TCP half was not canceled after the UDP half failed")
 	}
+}
+
+func testBundleTCPConfig(t *testing.T) *tcptls.Config {
+	t.Helper()
+	config, err := tcptls.NewConfig(tcptls.TCPOptions{
+		Address: "127.0.0.1:1", Spec: mustNowhereSpec(t), Key: "k",
+		Dialer: newBlockingTCPDialer(), TLSDialer: passthroughTLSDialer{},
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	return config
 }
 
 func TestSplicedConnForwardsDirectionalDeadlines(t *testing.T) {

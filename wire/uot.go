@@ -59,4 +59,3 @@ func ReadUOTSetupTarget(r io.Reader) (string, error) {
 	}
 	return target, nil
 }
-

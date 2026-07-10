@@ -16,6 +16,11 @@ import (
 // Version is overridden at link time: -ldflags "-X main.Version=v1.2.3"
 var Version = "dev"
 
+const (
+	UpstreamVersion = "v1.3.3"
+	UpstreamCommit  = "962408bd702591587ff5ed7e2f638d23b996834f"
+)
+
 func main() {
 	fs := flag.NewFlagSet("nowhere-check", flag.ExitOnError)
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -55,6 +60,7 @@ func printVersion() {
 	fmt.Printf("nowhere-check %s\n", resolveVersion())
 	fmt.Printf("go %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("module github.com/hi2shark/go-nowhere\n")
+	fmt.Printf("upstream nowhere %s %s\n", UpstreamVersion, UpstreamCommit)
 }
 
 func resolveVersion() string {

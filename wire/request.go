@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"unicode/utf8"
 )
 
 func EncodeTCPRequest(target string, spec *EffectiveSpec) ([]byte, error) {
@@ -18,7 +19,7 @@ func EncodeTCPRequest(target string, spec *EffectiveSpec) ([]byte, error) {
 	padding := tcpRequestPaddingBytes(spec, target)
 
 	frame := make([]byte, 0, 1+2+len(targetBytes)+1+len(padding))
-	for _, element := range spec.TcpFrameOrder {
+	for _, element := range spec.tcpFrameOrder {
 		switch element {
 		case TcpVersion:
 			frame = append(frame, ProxyFrameVersion)
@@ -26,7 +27,7 @@ func EncodeTCPRequest(target string, spec *EffectiveSpec) ([]byte, error) {
 			frame = append(frame, byte(len(targetBytes)>>8), byte(len(targetBytes)))
 			frame = append(frame, targetBytes...)
 		case TcpPadding:
-			frame = append(frame, spec.TcpPaddingLen)
+			frame = append(frame, spec.tcpPaddingLen)
 			frame = append(frame, padding...)
 		}
 	}
@@ -37,8 +38,8 @@ func tcpRequestPaddingBytes(spec *EffectiveSpec, target string) []byte {
 	info := make([]byte, 0, len(tcpPaddingBytesLabel)+len(target)+1)
 	info = append(info, tcpPaddingBytesLabel...)
 	info = append(info, target...)
-	info = append(info, spec.TcpPaddingLen)
-	return hkdfExpand(spec.TcpPaddingKey, info, int(spec.TcpPaddingLen))
+	info = append(info, spec.tcpPaddingLen)
+	return hkdfExpand(spec.tcpPaddingKey, info, int(spec.tcpPaddingLen))
 }
 
 func DecodeTCPRequest(r io.Reader, spec *EffectiveSpec) (string, error) {
@@ -49,7 +50,7 @@ func DecodeTCPRequest(r io.Reader, spec *EffectiveSpec) (string, error) {
 	var padding []byte
 	haveTarget, havePadding := false, false
 
-	for _, element := range spec.TcpFrameOrder {
+	for _, element := range spec.tcpFrameOrder {
 		switch element {
 		case TcpVersion:
 			var version [1]byte
@@ -87,10 +88,10 @@ func DecodeTCPRequest(r io.Reader, spec *EffectiveSpec) (string, error) {
 			if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 				return "", err
 			}
-			if lenBuf[0] != spec.TcpPaddingLen {
+			if lenBuf[0] != spec.tcpPaddingLen {
 				return "", ErrInvalidFrame
 			}
-			padding = make([]byte, int(spec.TcpPaddingLen))
+			padding = make([]byte, int(spec.tcpPaddingLen))
 			if len(padding) > 0 {
 				if _, err := io.ReadFull(r, padding); err != nil {
 					return "", err
@@ -122,6 +123,9 @@ func validateTCPPadding(spec *EffectiveSpec, target string, padding []byte) erro
 func validateTarget(target string) error {
 	if len(target) == 0 || len(target) > maxTargetLength {
 		return fmt.Errorf("%w: length %d", ErrInvalidTarget, len(target))
+	}
+	if !utf8.ValidString(target) {
+		return fmt.Errorf("%w: invalid UTF-8", ErrInvalidTarget)
 	}
 	port, err := splitHostPort(target)
 	if err != nil {

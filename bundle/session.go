@@ -12,19 +12,26 @@ import (
 	"github.com/hi2shark/go-nowhere/wire"
 )
 
-// BundleConfig lazily builds TLS/TCP pool and uses an injected QuicBackend.
-type BundleConfig struct {
-	// Quic is required when Up or Down is "udp"; nil is OK for tcp/tcp.
-	Quic     carrier.QuicBackend
-	TCP      *tcptls.TCPConnConfig
+// BundleOptions builds an immutable carrier bundle.
+type BundleOptions struct {
+	QUIC     carrier.QuicBackend
+	TCP      *tcptls.Config
 	PoolSize int
-	Up       string
-	Down     string
+	Up       wire.Carrier
+	Down     wire.Carrier
 }
 
-// CarrierBundle shares one session id across carriers and allocates flow ids for asymmetric pairing.
+type bundleConfig struct {
+	quic     carrier.QuicBackend
+	tcp      *tcptls.Config
+	poolSize int
+	up       wire.Carrier
+	down     wire.Carrier
+}
+
+// CarrierBundle shares one session id across carriers and allocates flow ids.
 type CarrierBundle struct {
-	cfg *BundleConfig
+	cfg bundleConfig
 
 	sessionIDOnce sync.Once
 	sessionID     wire.SessionID
@@ -41,45 +48,61 @@ type CarrierBundle struct {
 	nextFlowID atomic.Uint64
 }
 
-func NewCarrierBundle(cfg *BundleConfig) (*CarrierBundle, error) {
-	if cfg == nil || cfg.TCP == nil {
-		return nil, errors.New("nowhere: nil bundle config")
+// NewCarrierBundle validates options and returns an isolated session bundle.
+func NewCarrierBundle(options BundleOptions) (*CarrierBundle, error) {
+	if options.TCP == nil {
+		return nil, errors.New("nowhere: nil TCP carrier config")
 	}
-	if !isCarrier(cfg.Up) || !isCarrier(cfg.Down) {
+	if !isCarrier(options.Up) || !isCarrier(options.Down) {
 		return nil, errors.New("nowhere: invalid carrier selector")
 	}
-	if (cfg.Up == "udp" || cfg.Down == "udp") && cfg.Quic == nil {
+	if (options.Up == wire.CarrierUDP || options.Down == wire.CarrierUDP) && options.QUIC == nil {
 		return nil, errors.New("nowhere: nil quic backend")
 	}
-	b := &CarrierBundle{cfg: cfg}
-	b.nextFlowID.Store(1)
-	// Pin SessionID before first dial so early QUIC backends share the same id.
-	if _, err := b.SessionID(); err != nil {
+	if options.PoolSize < 0 {
+		return nil, errors.New("nowhere: negative pool size")
+	}
+	bundle := &CarrierBundle{cfg: bundleConfig{
+		quic: options.QUIC, tcp: options.TCP, poolSize: options.PoolSize,
+		up: options.Up, down: options.Down,
+	}}
+	bundle.nextFlowID.Store(1)
+	if _, err := bundle.SessionID(); err != nil {
 		return nil, err
 	}
-	return b, nil
+	return bundle, nil
 }
 
-func isCarrier(s string) bool { return s == "tcp" || s == "udp" }
+func isCarrier(value wire.Carrier) bool {
+	return value == wire.CarrierTCP || value == wire.CarrierUDP
+}
 
+// SessionID returns the lazily generated identity shared by all bundle carriers.
 func (b *CarrierBundle) SessionID() (wire.SessionID, error) {
 	b.sessionIDOnce.Do(func() {
-		if _, e := rand.Read(b.sessionID[:]); e != nil {
-			b.sessionID = wire.SessionID{}
-			b.sessionIDErr = e
+		if _, err := rand.Read(b.sessionID[:]); err != nil {
+			b.sessionIDErr = err
 			return
 		}
-		if q := b.cfg.Quic; q != nil {
-			q.SetSessionID(b.sessionID)
+		if b.cfg.quic != nil {
+			b.cfg.quic.SetSessionID(b.sessionID)
 		}
-		b.cfg.TCP.SessionID = b.sessionID
+		b.cfg.tcp = b.cfg.tcp.WithSessionID(b.sessionID)
 	})
 	return b.sessionID, b.sessionIDErr
 }
 
-func (b *CarrierBundle) UpCarrier() wire.Carrier   { return carrierFromString(b.cfg.Up) }
-func (b *CarrierBundle) DownCarrier() wire.Carrier { return carrierFromString(b.cfg.Down) }
-func (b *CarrierBundle) Asymmetric() bool          { return b.cfg.Up != b.cfg.Down }
+// UpCarrier returns the configured uplink carrier.
+func (b *CarrierBundle) UpCarrier() wire.Carrier { return b.cfg.up }
+
+// DownCarrier returns the configured downlink carrier.
+func (b *CarrierBundle) DownCarrier() wire.Carrier { return b.cfg.down }
+
+// Asymmetric reports whether uplink and downlink use different carriers.
+func (b *CarrierBundle) Asymmetric() bool { return b.cfg.up != b.cfg.down }
+
+// PoolTarget returns the configured TLS/TCP idle-pool target.
+func (b *CarrierBundle) PoolTarget() int { return b.cfg.poolSize }
 
 func (b *CarrierBundle) allocFlowID() uint64 {
 	for {
@@ -91,7 +114,7 @@ func (b *CarrierBundle) allocFlowID() uint64 {
 }
 
 func (b *CarrierBundle) quicClient() (carrier.QuicBackend, error) {
-	if b.cfg.Up != "udp" && b.cfg.Down != "udp" {
+	if b.cfg.up != wire.CarrierUDP && b.cfg.down != wire.CarrierUDP {
 		return nil, nil
 	}
 	b.quicOnce.Do(func() {
@@ -99,13 +122,13 @@ func (b *CarrierBundle) quicClient() (carrier.QuicBackend, error) {
 			b.quicErr = err
 			return
 		}
-		b.quic = b.cfg.Quic
+		b.quic = b.cfg.quic
 	})
 	return b.quic, b.quicErr
 }
 
 func (b *CarrierBundle) tcpPool() (*tcptls.TCPPool, error) {
-	if b.cfg.Up != "tcp" && b.cfg.Down != "tcp" {
+	if b.cfg.up != wire.CarrierTCP && b.cfg.down != wire.CarrierTCP {
 		return nil, nil
 	}
 	b.tcpOnce.Do(func() {
@@ -113,39 +136,34 @@ func (b *CarrierBundle) tcpPool() (*tcptls.TCPPool, error) {
 			b.tcpErr = err
 			return
 		}
-		b.tcp = tcptls.NewTCPPool(b.cfg.TCP, b.cfg.PoolSize)
+		b.tcp = tcptls.NewTCPPool(b.cfg.tcp, b.cfg.poolSize)
+		if b.tcp == nil {
+			b.tcpErr = errors.New("nowhere: invalid TCP pool config")
+		}
 	})
 	return b.tcp, b.tcpErr
 }
 
-func (b *CarrierBundle) QuicBackend() (carrier.QuicBackend, error) { return b.quicClient() }
-func (b *CarrierBundle) TCPPool() (*tcptls.TCPPool, error)         { return b.tcpPool() }
-func (b *CarrierBundle) PoolTarget() int                           { return b.cfg.PoolSize }
-
+// Close releases initialized carrier resources. It is safe on a nil bundle.
 func (b *CarrierBundle) Close() {
-	if c, _ := b.quicClient(); c != nil {
-		c.Close()
+	if b == nil {
+		return
 	}
-	if p, _ := b.tcpPool(); p != nil {
-		p.Close()
+	if client, _ := b.quicClient(); client != nil {
+		client.Close()
 	}
-}
-
-func carrierFromString(s string) wire.Carrier {
-	if s == "tcp" {
-		return wire.CarrierTCP
+	if pool, _ := b.tcpPool(); pool != nil {
+		pool.Close()
 	}
-	return wire.CarrierUDP
 }
 
 func (b *CarrierBundle) quicClientSync() carrier.QuicBackend {
-	c, _ := b.quicClient()
-	return c
+	client, _ := b.quicClient()
+	return client
 }
 
-func (b *CarrierBundle) releaseQUICFlow(s carrier.QuicSession, f carrier.QuicUDPFlow) {
-	if s == nil || f == nil {
-		return
+func (b *CarrierBundle) releaseQUICFlow(session carrier.QuicSession, flow carrier.QuicUDPFlow) {
+	if session != nil && flow != nil {
+		session.ReleaseUDPAsymmetricFlow(flow.FlowID())
 	}
-	s.ReleaseUDPAsymmetricFlow(f.FlowID())
 }

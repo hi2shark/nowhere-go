@@ -5,7 +5,6 @@ import (
 	"net"
 	"sync/atomic"
 	"time"
-
 )
 
 // carrierState tracks TLS/TCP carrier lifecycle for diagnostics only.

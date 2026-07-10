@@ -17,9 +17,9 @@ import (
 
 const warmTTL = 30 * time.Second
 
-func loggerFrom(cfg *TCPConnConfig) carrier.Logger {
-	if cfg != nil && cfg.Logger != nil {
-		return cfg.Logger
+func loggerFrom(cfg *Config) carrier.Logger {
+	if cfg != nil && cfg.logger != nil {
+		return cfg.logger
 	}
 	return carrier.NopLogger{}
 }
@@ -27,7 +27,6 @@ func loggerFrom(cfg *TCPConnConfig) carrier.Logger {
 func (p *TCPPool) logger() carrier.Logger {
 	return loggerFrom(p.cfg)
 }
-
 
 const (
 	nowhereTCPSocketBufferEnv = "NOWHERE_TCP_SOCKET_BUFFER"
@@ -50,7 +49,7 @@ type poolSnapshot struct {
 // Idle entries are pre-auth only; after a request frame the carrier is consumed
 // (no Release/Put). Each Acquire pops at most one connection under p.mu.
 type TCPPool struct {
-	cfg       *TCPConnConfig
+	cfg       *Config
 	target    int
 	mu        sync.Mutex
 	idle      []*warmConn
@@ -58,7 +57,10 @@ type TCPPool struct {
 	closed    bool
 }
 
-func NewTCPPool(cfg *TCPConnConfig, target int) *TCPPool {
+func NewTCPPool(cfg *Config, target int) *TCPPool {
+	if cfg == nil || cfg.spec == nil || cfg.dialer == nil || cfg.tlsDialer == nil {
+		return nil
+	}
 	if target < 0 {
 		target = 0
 	}
@@ -200,7 +202,7 @@ func (p *TCPPool) startPrepare(count int) {
 	}
 }
 
-func logPoolAcquire(cfg *TCPConnConfig, outcome string, flowID uint64, carrierID uint64, snapshot poolSnapshot, start time.Time) {
+func logPoolAcquire(cfg *Config, outcome string, flowID uint64, carrierID uint64, snapshot poolSnapshot, start time.Time) {
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] pool_acquire outcome=%s flow_id=%d carrier_id=%d idle=%d preparing=%d target=%d elapsed_ms=%d",
 		outcome, flowID, carrierID, snapshot.idle, snapshot.preparing, snapshot.target, time.Since(start).Milliseconds())
 }
@@ -263,11 +265,11 @@ func (p *TCPPool) prepareOne() {
 	p.mu.Unlock()
 }
 
-func dialAddr(cfg *TCPConnConfig) string {
-	if cfg.ConnectAddr != "" {
-		return cfg.ConnectAddr
+func dialAddr(cfg *Config) string {
+	if cfg.connectAddress != "" {
+		return cfg.connectAddress
 	}
-	return cfg.Addr
+	return cfg.address
 }
 
 func (p *TCPPool) evict(wc *warmConn) {
@@ -304,7 +306,7 @@ func newOpenTiming() openTiming {
 	return openTiming{start: time.Now()}
 }
 
-func logOpenTiming(cfg *TCPConnConfig, outcome string, flowID uint64, carrierID uint64, stage string, network string, target string, timing openTiming) {
+func logOpenTiming(cfg *Config, outcome string, flowID uint64, carrierID uint64, stage string, network string, target string, timing openTiming) {
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] open_timing outcome=%s flow_id=%d carrier_id=%d stage=%s network=%s target=%s raw_dial_ms=%d tls_ms=%d auth_write_ms=%d request_write_ms=%d open_total_ms=%d",
 		outcome,
 		flowID,
@@ -356,7 +358,7 @@ type writeBufferSetter interface {
 	SetWriteBuffer(int) error
 }
 
-func tuneNowhereTCPConn(cfg *TCPConnConfig, conn net.Conn, carrierID uint64, stage string) {
+func tuneNowhereTCPConn(cfg *Config, conn net.Conn, carrierID uint64, stage string) {
 	log := loggerFrom(cfg)
 	if setter, ok := conn.(noDelaySetter); ok {
 		if err := setter.SetNoDelay(true); err != nil {
@@ -414,14 +416,14 @@ func configuredTCPSocketBuffer() (bytes int, forced bool, invalidValue string) {
 }
 
 // prepare dials, TLS-handshakes, and authenticates. Caller moves to authenticatedIdle.
-func prepare(ctx context.Context, cfg *TCPConnConfig) (net.Conn, *carrierInfo, error) {
+func prepare(ctx context.Context, cfg *Config) (net.Conn, *carrierInfo, error) {
 	ci := newCarrierInfo(loggerFrom(cfg))
 	timing := newOpenTiming()
 	stage := "tls"
 	target := dialAddr(cfg)
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] dial_start carrier_id=%d stage=tls", ci.id)
 	rawDialStart := time.Now()
-	raw, err := cfg.Dialer.DialContext(ctx, "tcp", dialAddr(cfg))
+	raw, err := cfg.dialer.DialContext(ctx, "tcp", dialAddr(cfg))
 	timing.rawDial = time.Since(rawDialStart)
 	if err != nil {
 		ci.transition(stateClosed)
@@ -430,7 +432,7 @@ func prepare(ctx context.Context, cfg *TCPConnConfig) (net.Conn, *carrierInfo, e
 	}
 	tuneNowhereTCPConn(cfg, raw, ci.id, stage)
 	tlsStart := time.Now()
-	tlsConn, err := cfg.TLSDialer.DialTLSConn(ctx, raw)
+	tlsConn, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
 	timing.tlsHandshake = time.Since(tlsStart)
 	if err != nil {
 		_ = raw.Close()
@@ -457,19 +459,19 @@ func prepare(ctx context.Context, cfg *TCPConnConfig) (net.Conn, *carrierInfo, e
 	return tlsConn, ci, nil
 }
 
-func tcpAuthFrame(cfg *TCPConnConfig) ([]byte, error) {
-	if cfg.SessionID != (wire.SessionID{}) {
-		return wire.MakeAuthFrameWithSession(cfg.Key, cfg.Spec, cfg.SessionID)
+func tcpAuthFrame(cfg *Config) ([]byte, error) {
+	if cfg.sessionID != (wire.SessionID{}) {
+		return wire.MakeAuthFrameWithSession(cfg.key, cfg.spec, cfg.sessionID)
 	}
-	frame, _, err := wire.MakeAuthFrame(cfg.Key, cfg.Spec)
+	frame, _, err := wire.MakeAuthFrame(cfg.key, cfg.spec)
 	return frame, err
 }
 
 // activatePrepared sends the request on a warm connection; carrier must not return to the pool.
-func activatePrepared(conn net.Conn, ci *carrierInfo, flowID uint64, cfg *TCPConnConfig, dest string, mode TCPRelayMode) (net.Conn, error) {
+func activatePrepared(conn net.Conn, ci *carrierInfo, flowID uint64, cfg *Config, dest string, mode TCPRelayMode) (net.Conn, error) {
 	timing := newOpenTiming()
 	network := relayNetwork(mode)
-	req, err := requestPayload(cfg.Spec, dest, mode)
+	req, err := requestPayload(cfg.spec, dest, mode)
 	if err != nil {
 		logOpenTiming(cfg, "warm_failed", flowID, ci.id, "warm_activate", network, dest, timing)
 		return nil, err
@@ -488,7 +490,7 @@ func activatePrepared(conn net.Conn, ci *carrierInfo, flowID uint64, cfg *TCPCon
 }
 
 // openFresh dials, authenticates, and sends the request on a new connection (pool miss / disabled).
-func openFresh(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest string, mode TCPRelayMode, outcome string) (net.Conn, error) {
+func openFresh(ctx context.Context, cfg *Config, flowID uint64, dest string, mode TCPRelayMode, outcome string) (net.Conn, error) {
 	ci := newCarrierInfo(loggerFrom(cfg))
 	timing := newOpenTiming()
 	stage := "fresh_tls"
@@ -496,7 +498,7 @@ func openFresh(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest stri
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] dial_start carrier_id=%d flow_id=%d stage=%s", ci.id, flowID, stage)
 	ci.transition(stateBorrowed)
 	rawDialStart := time.Now()
-	raw, err := cfg.Dialer.DialContext(ctx, "tcp", dialAddr(cfg))
+	raw, err := cfg.dialer.DialContext(ctx, "tcp", dialAddr(cfg))
 	timing.rawDial = time.Since(rawDialStart)
 	if err != nil {
 		ci.transition(stateClosed)
@@ -505,7 +507,7 @@ func openFresh(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest stri
 	}
 	tuneNowhereTCPConn(cfg, raw, ci.id, stage)
 	tlsStart := time.Now()
-	tlsConn, err := cfg.TLSDialer.DialTLSConn(ctx, raw)
+	tlsConn, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
 	timing.tlsHandshake = time.Since(tlsStart)
 	if err != nil {
 		_ = raw.Close()
@@ -520,7 +522,7 @@ func openFresh(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest stri
 		logOpenTiming(cfg, outcome+"_failed", flowID, ci.id, stage, network, dest, timing)
 		return nil, err
 	}
-	req, err := requestPayload(cfg.Spec, dest, mode)
+	req, err := requestPayload(cfg.spec, dest, mode)
 	if err != nil {
 		_ = tlsConn.Close()
 		ci.transition(stateClosed)
@@ -586,7 +588,7 @@ func (p *TCPPool) AcquireFlowHalf(ctx context.Context, dest string, header wire.
 	return openFlowLane(ctx, p.cfg, header.FlowID, dest, header)
 }
 
-func openFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest string, header wire.FlowHeader) (net.Conn, error) {
+func openFlowLane(ctx context.Context, cfg *Config, flowID uint64, dest string, header wire.FlowHeader) (net.Conn, error) {
 	ci := newCarrierInfo(loggerFrom(cfg))
 	timing := newOpenTiming()
 	stage := "flow_lane"
@@ -594,7 +596,7 @@ func openFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest s
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] dial_start carrier_id=%d flow_id=%d stage=%s", ci.id, flowID, stage)
 	ci.transition(stateBorrowed)
 	rawDialStart := time.Now()
-	raw, err := cfg.Dialer.DialContext(ctx, "tcp", dialAddr(cfg))
+	raw, err := cfg.dialer.DialContext(ctx, "tcp", dialAddr(cfg))
 	timing.rawDial = time.Since(rawDialStart)
 	if err != nil {
 		ci.transition(stateClosed)
@@ -603,7 +605,7 @@ func openFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest s
 	}
 	tuneNowhereTCPConn(cfg, raw, ci.id, stage)
 	tlsStart := time.Now()
-	tlsConn, err := cfg.TLSDialer.DialTLSConn(ctx, raw)
+	tlsConn, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
 	timing.tlsHandshake = time.Since(tlsStart)
 	if err != nil {
 		_ = raw.Close()
@@ -625,7 +627,7 @@ func openFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest s
 		logOpenTiming(cfg, "fresh_failed", flowID, ci.id, stage, "tcp", dest, timing)
 		return nil, err
 	}
-	req, err := wire.EncodeTCPRequest(dest, cfg.Spec)
+	req, err := wire.EncodeTCPRequest(dest, cfg.spec)
 	if err != nil {
 		_ = tlsConn.Close()
 		ci.transition(stateClosed)
@@ -667,7 +669,7 @@ func (p *TCPPool) AcquireUDPFlowHalf(ctx context.Context, dest string, header wi
 	return openUDPFlowLane(ctx, p.cfg, header.FlowID, dest, header)
 }
 
-func openUDPFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, dest string, header wire.FlowHeader) (net.Conn, error) {
+func openUDPFlowLane(ctx context.Context, cfg *Config, flowID uint64, dest string, header wire.FlowHeader) (net.Conn, error) {
 	ci := newCarrierInfo(loggerFrom(cfg))
 	timing := newOpenTiming()
 	stage := "udp_flow_lane"
@@ -675,7 +677,7 @@ func openUDPFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, des
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] dial_start carrier_id=%d flow_id=%d stage=%s", ci.id, flowID, stage)
 	ci.transition(stateBorrowed)
 	rawDialStart := time.Now()
-	raw, err := cfg.Dialer.DialContext(ctx, "tcp", dialAddr(cfg))
+	raw, err := cfg.dialer.DialContext(ctx, "tcp", dialAddr(cfg))
 	timing.rawDial = time.Since(rawDialStart)
 	if err != nil {
 		ci.transition(stateClosed)
@@ -684,7 +686,7 @@ func openUDPFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, des
 	}
 	tuneNowhereTCPConn(cfg, raw, ci.id, stage)
 	tlsStart := time.Now()
-	tlsConn, err := cfg.TLSDialer.DialTLSConn(ctx, raw)
+	tlsConn, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
 	timing.tlsHandshake = time.Since(tlsStart)
 	if err != nil {
 		_ = raw.Close()
@@ -707,7 +709,7 @@ func openUDPFlowLane(ctx context.Context, cfg *TCPConnConfig, flowID uint64, des
 		return nil, err
 	}
 	// Real target (not UoT magic): Portal pairs on (session_id, flow_id, kind, target, up, down).
-	req, err := wire.EncodeTCPRequest(dest, cfg.Spec)
+	req, err := wire.EncodeTCPRequest(dest, cfg.spec)
 	if err != nil {
 		_ = tlsConn.Close()
 		ci.transition(stateClosed)

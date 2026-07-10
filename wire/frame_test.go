@@ -246,6 +246,16 @@ func TestAuthFrameValidation(t *testing.T) {
 	} else if got != sessionID {
 		t.Fatalf("session id mismatch: got %x want %x", got, sessionID)
 	}
+	if _, err := ValidateAuthFrame(frame, "wrong-key", spec); err == nil {
+		t.Fatal("ValidateAuthFrame accepted wrong key")
+	}
+	wrongSpec, err := BuildEffectiveSpec("secret", "edge-a", "now/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateAuthFrame(frame, "secret", wrongSpec); err == nil {
+		t.Fatal("ValidateAuthFrame accepted wrong spec")
+	}
 	// session_id is under the HMAC; any single-byte tamper must fail.
 	for i := range frame {
 		tampered := append([]byte(nil), frame...)

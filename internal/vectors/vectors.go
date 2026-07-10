@@ -59,14 +59,14 @@ func decodeHex(s string) ([]byte, error) {
 
 type authFile struct {
 	Cases []struct {
-		ID            string `json:"id"`
-		Key           string `json:"key"`
-		Spec          string `json:"spec"`
-		ALPN          string `json:"alpn"`
-		NonceHex      string `json:"nonce_hex"`
-		SessionIDHex  string `json:"session_id_hex"`
-		FrameHex      string `json:"frame_hex"`
-		FrameLen      int    `json:"frame_len"`
+		ID           string `json:"id"`
+		Key          string `json:"key"`
+		Spec         string `json:"spec"`
+		ALPN         string `json:"alpn"`
+		NonceHex     string `json:"nonce_hex"`
+		SessionIDHex string `json:"session_id_hex"`
+		FrameHex     string `json:"frame_hex"`
+		FrameLen     int    `json:"frame_len"`
 	} `json:"cases"`
 }
 

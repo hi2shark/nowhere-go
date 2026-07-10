@@ -36,7 +36,7 @@ func EncodeUDPDatagram(frameType uint8, flowID uint64, target string, payload []
 func encodeUDPHeader(frameType uint8, flowID uint64, target string, spec *EffectiveSpec) ([]byte, error) {
 	targetBytes := []byte(target)
 	header := make([]byte, 0, datagramHeaderFixedLen+len(targetBytes))
-	for _, element := range spec.UdpFrameOrder {
+	for _, element := range spec.udpFrameOrder {
 		switch element {
 		case UdpVersion:
 			header = append(header, ProxyFrameVersion)
@@ -72,7 +72,7 @@ func DecodeUDPDatagram(buf []byte, spec *EffectiveSpec) (*UDPMessage, error) {
 	var target string
 	haveType, haveFlowID, haveTarget := false, false, false
 
-	for _, element := range spec.UdpFrameOrder {
+	for _, element := range spec.udpFrameOrder {
 		switch element {
 		case UdpVersion:
 			if offset >= len(buf) {
@@ -239,4 +239,3 @@ func DecodeUDPCompact(buf []byte) (CompactUDPFrame, error) {
 		return CompactUDPFrame{}, ErrInvalidFrame
 	}
 }
-

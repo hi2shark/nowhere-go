@@ -49,24 +49,24 @@ func assembleAuthFrame(key string, spec *EffectiveSpec, nonce []byte, sessionID 
 
 	authKey := sha256.Sum256([]byte(key))
 	tagMsg := make([]byte, 0,
-		len(spec.AuthInfo)+len(spec.AuthContext)+len(nonce)+1+len(padding)+SessionIDLen)
-	tagMsg = append(tagMsg, spec.AuthInfo...)
-	tagMsg = append(tagMsg, spec.AuthContext...)
+		len(spec.authInfo)+len(spec.authContext)+len(nonce)+1+len(padding)+SessionIDLen)
+	tagMsg = append(tagMsg, spec.authInfo...)
+	tagMsg = append(tagMsg, spec.authContext...)
 	tagMsg = append(tagMsg, nonce...)
-	tagMsg = append(tagMsg, spec.AuthPaddingLen)
+	tagMsg = append(tagMsg, spec.authPaddingLen)
 	tagMsg = append(tagMsg, padding...)
 	tagMsg = append(tagMsg, sessionID[:]...)
 	tag := hmacSHA256(authKey[:], tagMsg)
 
 	paddingBlock := make([]byte, 1+len(padding))
-	paddingBlock[0] = spec.AuthPaddingLen
+	paddingBlock[0] = spec.authPaddingLen
 	copy(paddingBlock[1:], padding)
 
 	frame := make([]byte, 0, authFrameLen(spec))
-	for _, element := range spec.AuthFrameOrder {
+	for _, element := range spec.authFrameOrder {
 		switch element {
 		case AuthMagic:
-			frame = append(frame, spec.AuthMagic...)
+			frame = append(frame, spec.authMagic...)
 		case AuthNonce:
 			frame = append(frame, nonce...)
 		case AuthPadding:
@@ -80,15 +80,15 @@ func assembleAuthFrame(key string, spec *EffectiveSpec, nonce []byte, sessionID 
 }
 
 func authFrameLen(spec *EffectiveSpec) int {
-	return authMagicLength + authNonceLength + 1 + int(spec.AuthPaddingLen) + authTagLength + SessionIDLen
+	return authMagicLength + authNonceLength + 1 + int(spec.authPaddingLen) + authTagLength + SessionIDLen
 }
 
 func authPaddingBytes(spec *EffectiveSpec, nonce []byte) []byte {
 	info := make([]byte, 0, len(authPaddingBytesLabel)+len(nonce)+1)
 	info = append(info, authPaddingBytesLabel...)
 	info = append(info, nonce...)
-	info = append(info, spec.AuthPaddingLen)
-	return hkdfExpand(spec.AuthPaddingKey, info, int(spec.AuthPaddingLen))
+	info = append(info, spec.authPaddingLen)
+	return hkdfExpand(spec.authPaddingKey, info, int(spec.authPaddingLen))
 }
 
 // ValidateAuthFrame checks length, fields, and HMAC tag in constant time.
@@ -103,7 +103,7 @@ func ValidateAuthFrame(msg []byte, key string, spec *EffectiveSpec) (SessionID, 
 
 	offset := 0
 	var magic, nonce, paddingBlock, tag []byte
-	for _, element := range spec.AuthFrameOrder {
+	for _, element := range spec.authFrameOrder {
 		var fieldLen int
 		switch element {
 		case AuthMagic:
@@ -113,7 +113,7 @@ func ValidateAuthFrame(msg []byte, key string, spec *EffectiveSpec) (SessionID, 
 			fieldLen = authNonceLength
 			nonce = msg[offset : offset+fieldLen]
 		case AuthPadding:
-			fieldLen = 1 + int(spec.AuthPaddingLen)
+			fieldLen = 1 + int(spec.authPaddingLen)
 			paddingBlock = msg[offset : offset+fieldLen]
 		case AuthTag:
 			fieldLen = authTagLength
@@ -128,18 +128,18 @@ func ValidateAuthFrame(msg []byte, key string, spec *EffectiveSpec) (SessionID, 
 
 	authKey := sha256.Sum256([]byte(key))
 	tagMsg := make([]byte, 0,
-		len(spec.AuthInfo)+len(spec.AuthContext)+len(nonce)+1+len(padding)+SessionIDLen)
-	tagMsg = append(tagMsg, spec.AuthInfo...)
-	tagMsg = append(tagMsg, spec.AuthContext...)
+		len(spec.authInfo)+len(spec.authContext)+len(nonce)+1+len(padding)+SessionIDLen)
+	tagMsg = append(tagMsg, spec.authInfo...)
+	tagMsg = append(tagMsg, spec.authContext...)
 	tagMsg = append(tagMsg, nonce...)
-	tagMsg = append(tagMsg, spec.AuthPaddingLen)
+	tagMsg = append(tagMsg, spec.authPaddingLen)
 	tagMsg = append(tagMsg, padding...)
 	tagMsg = append(tagMsg, sessionID[:]...)
 	expectedTag := hmacSHA256(authKey[:], tagMsg)
 
 	var diff byte
-	diff |= constantTimeDiff(magic, spec.AuthMagic)
-	diff |= paddingBlock[0] ^ spec.AuthPaddingLen
+	diff |= constantTimeDiff(magic, spec.authMagic)
+	diff |= paddingBlock[0] ^ spec.authPaddingLen
 	diff |= constantTimeDiff(padding, expectedPadding)
 	diff |= constantTimeDiff(tag, expectedTag)
 	if diff != 0 {

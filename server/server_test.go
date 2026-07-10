@@ -43,11 +43,21 @@ func TestServerTCPEchoDialUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := server.NewConfig("secret", "auto", "now/1", []string{"tcp"})
+	cfg, err := server.NewConfig(server.ConfigOptions{
+		Password: "secret",
+		Spec:     "auto",
+		ALPN:     "now/1",
+		Networks: []server.Network{server.NetworkTCP},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.NewServer(cfg, tlsCfg, server.NewDialUpstream(nil))
+	srv, err := server.NewServer(server.ServerOptions{
+		Config: cfg, TLS: tlsCfg, Upstream: server.NewDialUpstream(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -84,7 +94,7 @@ func TestServerTCPEchoDialUpstream(t *testing.T) {
 	}
 	defer tlsConn.Close()
 
-	auth, _, err := wire.MakeAuthFrame("secret", cfg.Spec)
+	auth, _, err := wire.MakeAuthFrame("secret", cfg.EffectiveSpec())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +103,7 @@ func TestServerTCPEchoDialUpstream(t *testing.T) {
 	}
 
 	target := echoLn.Addr().String()
-	req, err := wire.EncodeTCPRequest(target, cfg.Spec)
+	req, err := wire.EncodeTCPRequest(target, cfg.EffectiveSpec())
 	if err != nil {
 		t.Fatal(err)
 	}

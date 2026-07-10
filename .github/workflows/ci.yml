@@ -5,6 +5,8 @@ on:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
 
 jobs:
   test:
@@ -13,24 +15,59 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Align with go.mod (1.20) plus common newer toolchains
-        go: ["1.20", "1.22", "1.24"]
+        go: ["1.20.x", "1.24.x", stable]
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
+          cache: true
+      - run: go test -count=1 ./...
+      - run: go vet ./...
+      - run: go build -o /tmp/nowhere-check ./cmd/nowhere-check
+      - run: /tmp/nowhere-check
 
-      - name: Test
-        run: go test ./...
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
+      - run: staticcheck ./...
 
-      - name: Vet
-        run: go vet ./...
+  race:
+    name: race and shuffle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: PR stress
+        if: github.event_name != 'schedule'
+        run: go test -race -shuffle=on -count=20 ./...
+      - name: Nightly stress
+        if: github.event_name == 'schedule'
+        run: go test -race -shuffle=on -count=100 ./...
 
-      # Local/CI self-check helper only — not a release artifact
-      - name: Build nowhere-check
-        run: go build -o /tmp/nowhere-check ./cmd/nowhere-check
-
-      - name: Run nowhere-check
-        run: /tmp/nowhere-check
+  fuzz:
+    name: nightly wire fuzz smoke
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - run: go test ./wire -run=^$ -fuzz=FuzzValidateAuthFrame -fuzztime=30s
+      - run: go test ./wire -run=^$ -fuzz=FuzzDecodeTCPRequest -fuzztime=30s
+      - run: go test ./wire -run=^$ -fuzz=FuzzReadFlowHeader -fuzztime=30s
+      - run: go test ./wire -run=^$ -fuzz=FuzzDecodeUDPFrames -fuzztime=30s
+      - run: go test ./wire -run=^$ -fuzz=FuzzReadUOTPacketFrame -fuzztime=30s
+      - run: go test ./wire -run=^$ -fuzz=FuzzBuildEffectiveSpec -fuzztime=30s

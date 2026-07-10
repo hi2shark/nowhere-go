@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // Upstream receives decoded Nowhere streams / packet flows after auth + framing.
@@ -113,7 +115,7 @@ func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ ne
 	case <-done:
 		retErr = nil
 	}
-	_ = pc.Close()
+	closePacketConnWithError(pc, retErr)
 	_ = remote.Close()
 	<-done
 	if onClose := CloseHandlerFromContext(ctx); onClose != nil {
@@ -123,21 +125,46 @@ func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ ne
 }
 
 func relay(a, b net.Conn) error {
-	done := make(chan error, 2)
+	type result struct {
+		direction int
+		err       error
+	}
+	done := make(chan result, 2)
 	go func() {
 		_, err := io.Copy(a, b)
-		done <- err
+		done <- result{direction: 0, err: err}
 	}()
 	go func() {
 		_, err := io.Copy(b, a)
-		done <- err
+		done <- result{direction: 1, err: err}
 	}()
-	err := <-done
-	_ = a.Close()
-	_ = b.Close()
-	<-done
-	if err == io.EOF {
-		return nil
+	first := <-done
+	if first.direction == 0 {
+		if closer, ok := a.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
+		}
+	} else if closer, ok := b.(interface{ CloseWrite() error }); ok {
+		_ = closer.CloseWrite()
 	}
-	return err
+	timer := time.NewTimer(DefaultTCPReadGrace)
+	var second result
+	select {
+	case second = <-done:
+		timer.Stop()
+	case <-timer.C:
+		second.err = context.DeadlineExceeded
+	}
+	resultErr := first.err
+	if resultErr == nil || errors.Is(resultErr, io.EOF) {
+		resultErr = second.err
+	}
+	if errors.Is(resultErr, io.EOF) {
+		resultErr = nil
+	}
+	closeConnWithError(a, resultErr)
+	_ = b.Close()
+	if second.err == context.DeadlineExceeded {
+		<-done
+	}
+	return resultErr
 }
