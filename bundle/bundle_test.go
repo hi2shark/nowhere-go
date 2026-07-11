@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/hi2shark/nowhere-go/carrier"
@@ -58,6 +59,23 @@ func testBundleTCPConfig(t *testing.T) *tcptls.Config {
 		t.Fatalf("NewConfig: %v", err)
 	}
 	return config
+}
+
+type blockingTCPDialer struct {
+	started chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func newBlockingTCPDialer() *blockingTCPDialer {
+	return &blockingTCPDialer{started: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (d *blockingTCPDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	d.once.Do(func() { close(d.started) })
+	defer close(d.done)
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 // stubQuicBackend is a no-op backend for config-only tests.

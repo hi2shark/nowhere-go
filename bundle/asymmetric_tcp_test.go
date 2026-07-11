@@ -150,23 +150,6 @@ func mustNowhereSpec(t *testing.T) *wire.EffectiveSpec {
 	return spec
 }
 
-type blockingTCPDialer struct {
-	started chan struct{}
-	done    chan struct{}
-	once    sync.Once
-}
-
-func newBlockingTCPDialer() *blockingTCPDialer {
-	return &blockingTCPDialer{started: make(chan struct{}), done: make(chan struct{})}
-}
-
-func (d *blockingTCPDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	d.once.Do(func() { close(d.started) })
-	defer close(d.done)
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
 type pipeTCPDialer struct {
 	closed chan struct{}
 	once   sync.Once
@@ -219,41 +202,6 @@ type dummyAddr string
 
 func (a dummyAddr) Network() string { return string(a) }
 func (a dummyAddr) String() string  { return string(a) }
-
-// failAfterWaitQuic fails OpenFlowStream after wait is signaled (TCP half started).
-type failAfterWaitQuic struct {
-	wait <-chan struct{}
-	id   wire.SessionID
-}
-
-func (q *failAfterWaitQuic) SetSessionID(id wire.SessionID) { q.id = id }
-func (q *failAfterWaitQuic) OpenTCP(context.Context, string) (net.Conn, error) {
-	return nil, errors.New("test: unexpected OpenTCP")
-}
-func (q *failAfterWaitQuic) OpenFlowStream(ctx context.Context, _ string, _ wire.FlowHeader) (net.Conn, error) {
-	select {
-	case <-q.wait:
-		return nil, errors.New("test: quic half failed")
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-func (q *failAfterWaitQuic) PrepareFlowStream(ctx context.Context) (quic.PreparedFlowStream, error) {
-	select {
-	case <-q.wait:
-		return nil, errors.New("test: quic prepare failed")
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-func (q *failAfterWaitQuic) OpenUDP(context.Context, string) (net.PacketConn, error) {
-	return nil, errors.New("test: unexpected OpenUDP")
-}
-func (q *failAfterWaitQuic) AcquireSession(context.Context) (carrier.QuicSession, error) {
-	return nil, errors.New("test: unexpected AcquireSession")
-}
-func (q *failAfterWaitQuic) InvalidateSession(carrier.QuicSession) {}
-func (q *failAfterWaitQuic) Close()                                {}
 
 type failPrepareQuic struct {
 	id wire.SessionID

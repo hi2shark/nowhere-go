@@ -179,35 +179,6 @@ func (b *CarrierBundle) prepareQUICHalf(ctx context.Context) (quic.PreparedFlowS
 	return client.PrepareFlowStream(ctx)
 }
 
-// openTCPHalf remains for tests that exercise a single half path.
-func (b *CarrierBundle) openTCPHalf(ctx context.Context, header wire.FlowHeader, dest string) (net.Conn, error) {
-	carrier := header.Uplink
-	if header.Role == wire.FlowRoleAttach {
-		carrier = header.Downlink
-	}
-	switch carrier {
-	case wire.CarrierUDP:
-		client, err := b.quicClient()
-		if err != nil {
-			return nil, err
-		}
-		if client == nil {
-			return nil, errors.New("nowhere: udp carrier unavailable")
-		}
-		return client.OpenFlowStream(ctx, dest, header)
-	case wire.CarrierTCP:
-		pool, err := b.tcpPool()
-		if err != nil {
-			return nil, err
-		}
-		if pool == nil {
-			return nil, errors.New("nowhere: tcp carrier unavailable")
-		}
-		return pool.AcquireFlowHalf(ctx, dest, header)
-	}
-	return nil, errors.New("nowhere: unknown carrier")
-}
-
 type splicedConn struct {
 	reader io.Reader
 	writer io.Writer
