@@ -76,12 +76,18 @@ type Event struct {
 	Stage              string
 	ContextCause       string
 	CloseReason        string
+	Server             string // portal dial address (distinct from business Target)
 	DialQueueMs        int64
 	RawDialMs          int64
 	TLSms              int64
 	AuthMs             int64
 	PairWaitMs         int64
 	FirstByteMs        int64
+	AcquireWaitMs      int64
+	OpenTotalMs        int64
+	PoolIdle           int
+	PoolPreparing      int
+	PoolTarget         int
 	RxBytes            uint64
 	TxBytes            uint64
 }

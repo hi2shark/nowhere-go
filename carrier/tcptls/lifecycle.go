@@ -1,11 +1,14 @@
 package tcptls
 
 import (
-	"github.com/hi2shark/nowhere-go/carrier"
-	"github.com/hi2shark/nowhere-go/diagnostic"
+	"errors"
+	"io"
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/diagnostic"
 )
 
 // carrierState tracks TLS/TCP carrier lifecycle for diagnostics only.
@@ -124,15 +127,16 @@ func legalTransition(prev, next carrierState) bool {
 
 type trackedConn struct {
 	net.Conn
-	carrier     *carrierInfo
-	flowID      uint64 // local log id (symmetric)
-	network     string // "tcp" or "udp" (UoT)
-	target      string
-	openedAt    time.Time
-	firstByteMs atomic.Int64
-	rxBytes     atomic.Uint64
-	txBytes     atomic.Uint64
-	closed      atomic.Bool
+	carrier      *carrierInfo
+	flowID       uint64 // local log id (symmetric)
+	network      string // "tcp" or "udp" (UoT)
+	target       string
+	openedAt     time.Time
+	firstByteMs  atomic.Int64
+	rxBytes      atomic.Uint64
+	txBytes      atomic.Uint64
+	sawRemoteEOF atomic.Bool
+	closed       atomic.Bool
 }
 
 func newTrackedConn(conn net.Conn, ci *carrierInfo, flowID uint64, network, target string) *trackedConn {
@@ -155,6 +159,9 @@ func (t *trackedConn) Read(p []byte) (int, error) {
 		if t.firstByteMs.Load() < 0 {
 			t.firstByteMs.CompareAndSwap(-1, time.Since(t.openedAt).Milliseconds())
 		}
+	}
+	if err != nil && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		t.sawRemoteEOF.Store(true)
 	}
 	return n, err
 }
@@ -182,6 +189,8 @@ func (t *trackedConn) Close() error {
 		} else {
 			reason = err.Error()
 		}
+	} else if t.sawRemoteEOF.Load() {
+		reason = diagnostic.ErrorClassRemoteClose
 	}
 	firstByte := t.firstByteMs.Load()
 	if firstByte < 0 {

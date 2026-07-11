@@ -253,6 +253,25 @@ func (p *TCPPool) maybeStartPrepare(count int) {
 	}
 }
 
+// Prewarm starts background prepares up to the configured pool target.
+// Business Acquire still shares dial slots and takes priority under contention.
+func (p *TCPPool) Prewarm() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed || p.target <= 0 {
+		p.mu.Unlock()
+		return
+	}
+	need := p.target - (len(p.idle) + p.preparing)
+	p.mu.Unlock()
+	if need > 0 {
+		p.logger().Debugf("[Nowhere] [carrier] pool_prewarm pool_target=%d count=%d", p.Target(), need)
+		p.maybeStartPrepare(need)
+	}
+}
+
 func (p *TCPPool) warmAllowedLocked() bool {
 	if p.nextWarmRetry.IsZero() {
 		return true
@@ -369,7 +388,7 @@ func (p *TCPPool) runPortalDial(ctx context.Context, fn func(context.Context) er
 }
 
 func logPoolAcquire(cfg *Config, outcome string, flowID uint64, carrierID uint64, snapshot poolSnapshot, start time.Time) {
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] pool_acquire outcome=%s flow_id=%d carrier_id=%d idle=%d preparing=%d target=%d elapsed_ms=%d",
+	loggerFrom(cfg).Debugf("[Nowhere] [carrier] pool_acquire outcome=%s flow_id=%d carrier_id=%d pool_idle=%d pool_preparing=%d pool_target=%d acquire_wait_ms=%d",
 		outcome, flowID, carrierID, snapshot.idle, snapshot.preparing, snapshot.target, time.Since(start).Milliseconds())
 }
 
@@ -485,17 +504,20 @@ func newOpenTiming() openTiming {
 }
 
 func logOpenTiming(cfg *Config, outcome string, flowID uint64, carrierID uint64, stage string, network string, target string, timing openTiming) {
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] open_timing outcome=%s flow_id=%d carrier_id=%d stage=%s network=%s target=%s raw_dial_ms=%d tls_ms=%d auth_write_ms=%d request_write_ms=%d open_total_ms=%d",
-		outcome,
-		flowID,
-		carrierID,
-		stage,
-		network,
-		target,
-		timing.rawDial.Milliseconds(),
-		timing.tlsHandshake.Milliseconds(),
-		timing.authWrite.Milliseconds(),
-		timing.requestWrite.Milliseconds(),
+	server := dialAddr(cfg)
+	// Warm prepare has no business destination; only portal server address.
+	if strings.HasPrefix(stage, "tls") || stage == "warm_prepare" || strings.Contains(outcome, "warm_prepare") {
+		loggerFrom(cfg).Debugf("[Nowhere] [carrier] open_timing outcome=%s flow_id=%d carrier_id=%d stage=%s network=%s server=%s raw_dial_ms=%d tls_ms=%d auth_write_ms=%d request_write_ms=%d open_total_ms=%d",
+			outcome, flowID, carrierID, stage, network, server,
+			timing.rawDial.Milliseconds(), timing.tlsHandshake.Milliseconds(),
+			timing.authWrite.Milliseconds(), timing.requestWrite.Milliseconds(),
+			time.Since(timing.start).Milliseconds())
+		return
+	}
+	loggerFrom(cfg).Debugf("[Nowhere] [carrier] open_timing outcome=%s flow_id=%d carrier_id=%d stage=%s network=%s target=%s server=%s raw_dial_ms=%d tls_ms=%d auth_write_ms=%d request_write_ms=%d open_total_ms=%d",
+		outcome, flowID, carrierID, stage, network, target, server,
+		timing.rawDial.Milliseconds(), timing.tlsHandshake.Milliseconds(),
+		timing.authWrite.Milliseconds(), timing.requestWrite.Milliseconds(),
 		time.Since(timing.start).Milliseconds())
 }
 

@@ -26,6 +26,9 @@ func FormatEvent(event Event) string {
 	if event.Target != "" {
 		parts = append(parts, fmt.Sprintf("target=%s", event.Target))
 	}
+	if event.Server != "" {
+		parts = append(parts, fmt.Sprintf("server=%s", event.Server))
+	}
 	if event.SessionID != (wire.SessionID{}) {
 		parts = append(parts, fmt.Sprintf("session_id=%x", event.SessionID))
 	}
@@ -75,6 +78,17 @@ func FormatEvent(event Event) string {
 	if event.CloseReason != "" {
 		parts = append(parts, "close_reason="+event.CloseReason)
 	}
+	if event.PoolIdle != 0 || event.PoolPreparing != 0 || event.PoolTarget != 0 || event.Code == "pool_acquire" {
+		if event.Code == "pool_acquire" || event.PoolIdle != 0 {
+			parts = append(parts, fmt.Sprintf("pool_idle=%d", event.PoolIdle))
+		}
+		if event.Code == "pool_acquire" || event.PoolPreparing != 0 {
+			parts = append(parts, fmt.Sprintf("pool_preparing=%d", event.PoolPreparing))
+		}
+		if event.Code == "pool_acquire" || event.PoolTarget != 0 {
+			parts = append(parts, fmt.Sprintf("pool_target=%d", event.PoolTarget))
+		}
+	}
 	if event.DialQueueMs != 0 {
 		parts = append(parts, fmt.Sprintf("dial_queue_ms=%d", event.DialQueueMs))
 	}
@@ -92,6 +106,12 @@ func FormatEvent(event Event) string {
 	}
 	if event.FirstByteMs != 0 {
 		parts = append(parts, fmt.Sprintf("first_byte_ms=%d", event.FirstByteMs))
+	}
+	if event.AcquireWaitMs != 0 {
+		parts = append(parts, fmt.Sprintf("acquire_wait_ms=%d", event.AcquireWaitMs))
+	}
+	if event.OpenTotalMs != 0 {
+		parts = append(parts, fmt.Sprintf("open_total_ms=%d", event.OpenTotalMs))
 	}
 	if event.RxBytes != 0 {
 		parts = append(parts, fmt.Sprintf("rx_bytes=%d", event.RxBytes))

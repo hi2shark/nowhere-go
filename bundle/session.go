@@ -14,19 +14,21 @@ import (
 
 // BundleOptions builds an immutable carrier bundle.
 type BundleOptions struct {
-	QUIC     carrier.QuicBackend
-	TCP      *tcptls.Config
-	PoolSize int
-	Up       wire.Carrier
-	Down     wire.Carrier
+	QUIC           carrier.QuicBackend
+	TCP            *tcptls.Config
+	PoolSize       int
+	PrewarmOnStart bool
+	Up             wire.Carrier
+	Down           wire.Carrier
 }
 
 type bundleConfig struct {
-	quic     carrier.QuicBackend
-	tcp      *tcptls.Config
-	poolSize int
-	up       wire.Carrier
-	down     wire.Carrier
+	quic           carrier.QuicBackend
+	tcp            *tcptls.Config
+	poolSize       int
+	prewarmOnStart bool
+	up             wire.Carrier
+	down           wire.Carrier
 }
 
 // CarrierBundle shares one session id across carriers and allocates flow ids.
@@ -64,11 +66,17 @@ func NewCarrierBundle(options BundleOptions) (*CarrierBundle, error) {
 	}
 	bundle := &CarrierBundle{cfg: bundleConfig{
 		quic: options.QUIC, tcp: options.TCP, poolSize: options.PoolSize,
+		prewarmOnStart: options.PrewarmOnStart,
 		up: options.Up, down: options.Down,
 	}}
 	bundle.nextFlowID.Store(1)
 	if _, err := bundle.SessionID(); err != nil {
 		return nil, err
+	}
+	if options.PrewarmOnStart && options.PoolSize > 0 {
+		if _, err := bundle.tcpPool(); err != nil {
+			return nil, err
+		}
 	}
 	return bundle, nil
 }
@@ -139,6 +147,8 @@ func (b *CarrierBundle) tcpPool() (*tcptls.TCPPool, error) {
 		b.tcp = tcptls.NewTCPPool(b.cfg.tcp, b.cfg.poolSize)
 		if b.tcp == nil {
 			b.tcpErr = errors.New("nowhere: invalid TCP pool config")
+		} else if b.cfg.prewarmOnStart && b.cfg.poolSize > 0 {
+			b.tcp.Prewarm()
 		}
 	})
 	return b.tcp, b.tcpErr

@@ -39,7 +39,14 @@ func ParseCarrierLog(msg string) Event {
 		case "carrier_id":
 			ev.CarrierID = parseUint(val)
 		case "target":
-			ev.Target = val
+			// pool_acquire historically used target= for pool size; ignore numeric-only there.
+			if ev.Code == "pool_acquire" && isAllDigits(val) {
+				ev.PoolTarget = int(parseInt64(val))
+			} else {
+				ev.Target = val
+			}
+		case "server":
+			ev.Server = val
 		case "network":
 			ev.Transport = val
 		case "stage":
@@ -59,24 +66,39 @@ func ParseCarrierLog(msg string) Event {
 			ev.TxBytes = parseUint(val)
 		case "first_byte_ms":
 			ev.FirstByteMs = parseInt64(val)
+		case "pool_idle", "idle":
+			ev.PoolIdle = int(parseInt64(val))
+		case "pool_preparing", "preparing":
+			ev.PoolPreparing = int(parseInt64(val))
+		case "pool_target":
+			ev.PoolTarget = int(parseInt64(val))
+		case "acquire_wait_ms", "elapsed_ms":
+			if ev.AcquireWaitMs == 0 {
+				ev.AcquireWaitMs = parseInt64(val)
+			}
+		case "open_total_ms":
+			ev.OpenTotalMs = parseInt64(val)
 		case "close_reason":
 			ev.CloseReason = val
-			if val == "ok" {
+			switch val {
+			case "ok":
 				ev.Result = ResultOK
-			} else if val == ErrorClassRemoteClose || val == ErrorClassLocalCancel || val == ErrorClassNetwork || val == ErrorClassProtocol || val == ErrorClassProbeClose {
+			case ErrorClassRemoteClose:
 				ev.ErrorClass = val
-				if val == ErrorClassLocalCancel || val == ErrorClassRemoteClose {
-					ev.Result = ResultCanceled
-				} else {
-					ev.Result = ResultFailed
-				}
-			} else {
+				ev.Result = ResultOK
+			case ErrorClassLocalCancel, ErrorClassProbeClose:
+				ev.ErrorClass = val
+				ev.Result = ResultCanceled
+			case ErrorClassNetwork, ErrorClassProtocol:
+				ev.ErrorClass = val
+				ev.Result = ResultFailed
+			default:
 				ev.Result, ev.ErrorClass = ClassifyClose(errString(val))
 			}
 		case "role":
 			ev.HalfRole = val
-		case "elapsed_ms", "open_total_ms", "delay_ms", "next_retry_ms", "pair_wait_ms":
-			if ev.PairWaitMs == 0 && key == "pair_wait_ms" {
+		case "delay_ms", "next_retry_ms", "pair_wait_ms":
+			if key == "pair_wait_ms" && ev.PairWaitMs == 0 {
 				ev.PairWaitMs = parseInt64(val)
 			}
 		}
@@ -101,6 +123,18 @@ func parseUint(s string) uint64 {
 func parseInt64(s string) int64 {
 	n, _ := strconv.ParseInt(s, 10, 64)
 	return n
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func mapOutcomeResult(outcome string) string {

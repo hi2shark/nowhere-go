@@ -296,7 +296,7 @@ func (h *Handler) routeStream(ctx context.Context, conn net.Conn, source net.Add
 	}
 	if err := h.upstream.HandleStream(ctx, conn, source, target); err != nil {
 		closeConnWithError(conn, err)
-		h.emit(ctx, diagnostic.LevelError, "upstream_stream_failed", source, target, wire.SessionID{}, 0, err)
+		h.emit(ctx, diagnostic.LevelWarn, "upstream_stream_failed", source, target, wire.SessionID{}, 0, err)
 		return report(err)
 	}
 	return nil
@@ -312,7 +312,7 @@ func (h *Handler) routePacket(ctx context.Context, pc net.PacketConn, source net
 	}
 	if err := h.upstream.HandlePacket(ctx, pc, source, target); err != nil {
 		closePacketConnWithError(pc, err)
-		h.emit(ctx, diagnostic.LevelError, "upstream_packet_failed", source, target, wire.SessionID{}, 0, err)
+		h.emit(ctx, diagnostic.LevelWarn, "upstream_packet_failed", source, target, wire.SessionID{}, 0, err)
 		return report(err)
 	}
 	return nil

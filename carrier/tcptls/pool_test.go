@@ -297,10 +297,10 @@ func TestTCPPoolAcquireLogsOutcomeAndPoolSnapshot(t *testing.T) {
 		"outcome=fresh",
 		"flow_id=",
 		"carrier_id=",
-		"idle=",
-		"preparing=",
-		"target=",
-		"elapsed_ms=",
+		"pool_idle=",
+		"pool_preparing=",
+		"pool_target=",
+		"acquire_wait_ms=",
 	} {
 		if !strings.Contains(payload, want) {
 			t.Fatalf("pool_acquire log %q missing %q", payload, want)
@@ -321,7 +321,7 @@ func TestTCPPoolOpenTimingLogsFreshWarmAndFallbackPaths(t *testing.T) {
 	_ = freshConn.Close()
 
 	payload := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh", "stage=fresh_tls")
-	assertOpenTimingFields(t, payload, "network=tcp", "target=example.com:443")
+	assertOpenTimingFields(t, payload, "network=tcp", "target=example.com:443", "server=127.0.0.1:1")
 
 	warmDialer := &recordingTCPDialer{}
 	warmPool := NewTCPPool(testTCPConfig(t, warmDialer, logger), 1)
@@ -330,7 +330,10 @@ func TestTCPPoolOpenTimingLogsFreshWarmAndFallbackPaths(t *testing.T) {
 	waitPoolIdle(t, warmPool, 1)
 
 	preparePayload := waitForLogPayloads(t, sub, "open_timing", "outcome=warm_prepare", "stage=tls")
-	assertOpenTimingFields(t, preparePayload, "network=tcp", "target=127.0.0.1:1")
+	assertOpenTimingFields(t, preparePayload, "network=tcp", "server=127.0.0.1:1")
+	if strings.Contains(preparePayload, " target=") {
+		t.Fatalf("warm_prepare should use server= not target=: %q", preparePayload)
+	}
 
 	warmConn, err := warmPool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
 	if err != nil {
@@ -339,7 +342,7 @@ func TestTCPPoolOpenTimingLogsFreshWarmAndFallbackPaths(t *testing.T) {
 	_ = warmConn.Close()
 
 	warmPayload := waitForLogPayloads(t, sub, "open_timing", "outcome=warm", "stage=warm_activate")
-	assertOpenTimingFields(t, warmPayload, "network=tcp", "target=example.com:443")
+	assertOpenTimingFields(t, warmPayload, "network=tcp", "target=example.com:443", "server=127.0.0.1:1")
 
 	failingWarm := newRecordingNetConn("warm")
 	failingWarm.failWriteAt = 2
@@ -722,7 +725,6 @@ func assertOpenTimingFields(t *testing.T, payload string, wants ...string) {
 		"carrier_id=",
 		"stage=",
 		"network=",
-		"target=",
 		"outcome=",
 		"raw_dial_ms=",
 		"tls_ms=",
@@ -733,6 +735,9 @@ func assertOpenTimingFields(t *testing.T, payload string, wants ...string) {
 		if !strings.Contains(payload, want) {
 			t.Fatalf("open_timing log %q missing %q", payload, want)
 		}
+	}
+	if !strings.Contains(payload, "target=") && !strings.Contains(payload, "server=") {
+		t.Fatalf("open_timing log %q missing target= or server=", payload)
 	}
 }
 

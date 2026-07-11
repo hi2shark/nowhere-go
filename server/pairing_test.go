@@ -17,6 +17,20 @@ func TestFlowPairManagerPairsTCP(t *testing.T) {
 	m := newFlowPairManager(2 * time.Second)
 	defer m.Close()
 
+	var (
+		mu    sync.Mutex
+		codes []string
+		last  diagnostic.Event
+	)
+	m.setObserver(diagnostic.ObserverFunc(func(_ context.Context, event diagnostic.Event) {
+		mu.Lock()
+		codes = append(codes, event.Code)
+		if event.Code == "pair_success" {
+			last = event
+		}
+		mu.Unlock()
+	}))
+
 	c1, c2 := net.Pipe()
 	c3, c4 := net.Pipe()
 	defer c2.Close()
@@ -64,6 +78,24 @@ func TestFlowPairManagerPairsTCP(t *testing.T) {
 		t.Fatalf("open half: %v", err)
 	}
 	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	foundSuccess := false
+	for _, code := range codes {
+		if code == "pair_success" {
+			foundSuccess = true
+		}
+	}
+	if !foundSuccess {
+		t.Fatalf("codes=%v, want pair_success", codes)
+	}
+	if last.FlowID != 7 || last.SessionID != session || last.Target != "1.2.3.4:80" {
+		t.Fatalf("pair_success fields = %+v", last)
+	}
+	if last.UplinkTransport != "tcp" || last.DownlinkTransport != "quic" {
+		t.Fatalf("transports up=%s down=%s", last.UplinkTransport, last.DownlinkTransport)
+	}
 }
 
 func TestFlowPairManagerTimeout(t *testing.T) {

@@ -194,6 +194,7 @@ func (m *flowPairManager) submit(ctx context.Context, key pairKey, current *pend
 		existing.err = nil
 		close(existing.done)
 		m.mu.Unlock()
+		m.emitPairSuccess(ctx, existing, current)
 		return existing, nil
 	}
 	if len(m.pending) >= m.maxGlobal || m.perSession[key.session] >= m.maxPerSession {
@@ -288,7 +289,7 @@ func (m *flowPairManager) emitPair(ctx context.Context, pending *pendingFlow, co
 		level = diagnostic.LevelWarn
 		result = diagnostic.ResultTimeout
 	case "pair_cancel":
-		level = diagnostic.LevelInfo
+		level = diagnostic.LevelDebug
 		result = diagnostic.ResultCanceled
 	case "pair_wait":
 		result = ""
@@ -324,6 +325,40 @@ func (m *flowPairManager) emitPair(ctx context.Context, pending *pendingFlow, co
 		ErrorClass:        errorClass,
 		Err:               err,
 	})
+}
+
+func (m *flowPairManager) emitPairSuccess(ctx context.Context, waiting, arriving *pendingFlow) {
+	if m == nil || waiting == nil || arriving == nil {
+		return
+	}
+	waitMs := time.Since(waiting.started).Milliseconds()
+	if sinceArriving := time.Since(arriving.started).Milliseconds(); sinceArriving > waitMs {
+		waitMs = sinceArriving
+	}
+	diagnostic.Emit(ctx, m.observer, diagnostic.Event{
+		Level:             diagnostic.LevelDebug,
+		Code:              "pair_success",
+		Component:         "server",
+		Carrier:           mapPairCarrier(arriving.transport),
+		Source:            arriving.source,
+		Target:            arriving.meta.target,
+		SessionID:         arriving.sessionID,
+		FlowID:            arriving.flowID,
+		UplinkTransport:   carrierTransportName(arriving.meta.up),
+		DownlinkTransport: carrierTransportName(arriving.meta.down),
+		PairWaitMs:        waitMs,
+		Result:            diagnostic.ResultOK,
+		Stage:             "pair_success",
+	})
+}
+
+func carrierTransportName(c wire.Carrier) string {
+	switch c {
+	case wire.CarrierUDP:
+		return "quic"
+	default:
+		return "tcp"
+	}
 }
 
 func mapPairCarrier(transport string) string {

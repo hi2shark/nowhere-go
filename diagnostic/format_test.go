@@ -1,6 +1,7 @@
 package diagnostic
 
 import (
+	"io"
 	"strings"
 	"testing"
 )
@@ -79,9 +80,58 @@ func TestFormatEventPairTimeoutKeys(t *testing.T) {
 	}
 }
 
+func TestFormatEventPoolAcquireFields(t *testing.T) {
+	got := FormatEvent(Event{
+		Component:     "tcptls",
+		Code:          "pool_acquire",
+		Carrier:       CarrierTCPTLS,
+		Outcome:       "warm",
+		Result:        ResultOK,
+		PoolIdle:      3,
+		PoolPreparing: 1,
+		PoolTarget:    5,
+		AcquireWaitMs: 12,
+		Server:        "127.0.0.1:2077",
+	})
+	for _, part := range []string{
+		"event=pool_acquire",
+		"pool_idle=3",
+		"pool_preparing=1",
+		"pool_target=5",
+		"acquire_wait_ms=12",
+		"server=127.0.0.1:2077",
+		"outcome=warm",
+	} {
+		if !strings.Contains(got, part) {
+			t.Fatalf("FormatEvent() = %q, want %q", got, part)
+		}
+	}
+	if strings.Contains(got, " target=") || strings.HasPrefix(got, "target=") {
+		t.Fatalf("pool_acquire should not set business target: %q", got)
+	}
+}
+
+func TestParseCarrierLogPoolFields(t *testing.T) {
+	ev := ParseCarrierLog("[Nowhere] [carrier] pool_acquire outcome=fresh flow_id=1 carrier_id=2 pool_idle=0 pool_preparing=0 pool_target=5 acquire_wait_ms=9")
+	if ev.Code != "pool_acquire" || ev.PoolTarget != 5 || ev.AcquireWaitMs != 9 || ev.Result != ResultOK {
+		t.Fatalf("ParseCarrierLog pool = %+v", ev)
+	}
+}
+
 func TestClassifyCloseLocalCancel(t *testing.T) {
 	result, class := ClassifyClose(errString("stream 5 canceled by local with error code 256"))
 	if result != ResultCanceled || class != ErrorClassLocalCancel {
 		t.Fatalf("ClassifyClose = %s/%s", result, class)
+	}
+}
+
+func TestClassifyCloseRemoteEOFIsOK(t *testing.T) {
+	result, class := ClassifyClose(io.EOF)
+	if result != ResultOK || class != ErrorClassRemoteClose {
+		t.Fatalf("ClassifyClose(EOF) = %s/%s, want ok/remote_close", result, class)
+	}
+	ev := ParseCarrierLog("[Nowhere] [carrier] relay_end close_reason=remote_close")
+	if ev.Result != ResultOK || ev.ErrorClass != ErrorClassRemoteClose {
+		t.Fatalf("ParseCarrierLog remote_close = result=%s class=%s", ev.Result, ev.ErrorClass)
 	}
 }

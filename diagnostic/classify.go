@@ -19,7 +19,11 @@ func ClassifyClose(err error) (result, class string) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ResultTimeout, ErrorClassNetwork
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+	// Normal peer EOF is a successful close, not a canceled flow.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return ResultOK, ErrorClassRemoteClose
+	}
+	if errors.Is(err, net.ErrClosed) {
 		return ResultCanceled, ErrorClassRemoteClose
 	}
 	msg := strings.ToLower(err.Error())
