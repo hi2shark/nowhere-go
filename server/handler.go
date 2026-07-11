@@ -29,14 +29,15 @@ type HandlerOptions struct {
 
 // Handler authenticates carriers and hands decoded flows to Upstream.
 type Handler struct {
-	config    *Config
-	upstream  Upstream
-	observer  diagnostic.Observer
-	pairing   *flowPairManager
-	sessions  *sessionManager
-	admission *unauthenticatedAdmission
-	now       func() time.Time
-	randRead  func([]byte) (int, error)
+	config     *Config
+	upstream   Upstream
+	observer   diagnostic.Observer
+	pairing    *flowPairManager
+	sessions   *sessionManager
+	admission  *unauthenticatedAdmission
+	handshake  *handshakeGate
+	now        func() time.Time
+	randRead   func([]byte) (int, error)
 
 	admissionLogMu   sync.Mutex
 	admissionLastLog time.Time
@@ -61,10 +62,12 @@ func NewHandler(options HandlerOptions) (*Handler, error) {
 			options.Config.limits.MaxUnauthenticatedConnections,
 			options.Config.limits.MaxUnauthenticatedPerSource,
 		),
-		now:      time.Now,
-		randRead: rand.Read,
+		handshake: newHandshakeGate(options.Config.limits.MaxConcurrentHandshakes),
+		now:       time.Now,
+		randRead:  rand.Read,
 	}
 	h.pairing.configureLimits(options.Config.limits)
+	h.pairing.setObserver(options.Observer)
 	h.sessions.configureLimit(options.Config.limits.ActiveQUICSessions)
 	return h, nil
 }
@@ -110,9 +113,16 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 		life.Close(ErrTLSNotConfigured)
 		return ErrTLSNotConfigured
 	}
+	releaseHandshake, err := h.handshake.acquire(ctx)
+	if err != nil {
+		life.Close(err)
+		return report(err)
+	}
+
 	handshakeCtx, cancel := context.WithTimeout(ctx, h.config.timeouts.TLSHandshake)
 	conn, err := handshake(handshakeCtx, raw)
 	cancel()
+	releaseHandshake()
 	if err != nil {
 		life.Close(err)
 		h.emit(ctx, classifyTLSHandshake(err), "tls_handshake_failed", source, "", wire.SessionID{}, 0, err)
@@ -215,7 +225,7 @@ func (h *Handler) handleAsymmetric(ctx context.Context, conn net.Conn, source ne
 }
 
 func (h *Handler) handleAsymmetricTCP(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string) error {
-	paired, err := h.pairing.SubmitTCP(ctx, sessionID, header, target, conn)
+	paired, err := h.pairing.SubmitTCPWithSource(ctx, sessionID, header, target, conn, source)
 	if err != nil {
 		closeConnWithError(conn, err)
 		return err
@@ -253,7 +263,7 @@ func (h *Handler) handleAsymmetricUDPStream(ctx context.Context, conn net.Conn, 
 }
 
 func (h *Handler) submitAndRouteUDP(ctx context.Context, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) error {
-	paired, err := h.pairing.SubmitUDP(ctx, sessionID, header, target, half)
+	paired, err := h.pairing.SubmitUDPWithSource(ctx, sessionID, header, target, half, source, udpHalfTransport(header, half))
 	if err != nil {
 		closeUDPHalfWithError(half, err)
 		return err

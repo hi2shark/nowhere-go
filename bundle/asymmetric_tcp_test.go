@@ -6,18 +6,20 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func TestAsymmetricOpenTCPCancelsOtherHalfOnFailure(t *testing.T) {
 	spec := mustNowhereSpec(t)
-	tcpDialer := newBlockingTCPDialer()
-	quic := &failAfterWaitQuic{wait: tcpDialer.started}
+	tcpDialer := newPipeTCPDialer()
+	quic := &failPrepareQuic{}
 	tcpConfig, err := tcptls.NewConfig(tcptls.TCPOptions{
 		Address: "127.0.0.1:1", Spec: spec, Key: "k", Dialer: tcpDialer, TLSDialer: passthroughTLSDialer{},
 	})
@@ -42,13 +44,13 @@ func TestAsymmetricOpenTCPCancelsOtherHalfOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatalf("AsymmetricOpenTCP succeeded; want failure")
 	}
-	if elapsed > 150*time.Millisecond {
-		t.Fatalf("AsymmetricOpenTCP waited %s; want fast failure after other half errors", elapsed)
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("AsymmetricOpenTCP waited %s; want fast failure after QUIC prepare errors", elapsed)
 	}
 	select {
-	case <-tcpDialer.done:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatalf("blocking TCP half was not canceled after the UDP half failed")
+	case <-tcpDialer.closed:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("prepared TCP half was not closed after QUIC prepare failed")
 	}
 }
 
@@ -165,6 +167,30 @@ func (d *blockingTCPDialer) DialContext(ctx context.Context, network, address st
 	return nil, ctx.Err()
 }
 
+type pipeTCPDialer struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newPipeTCPDialer() *pipeTCPDialer {
+	return &pipeTCPDialer{closed: make(chan struct{})}
+}
+
+func (d *pipeTCPDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	c1, c2 := net.Pipe()
+	go func() {
+		defer c2.Close()
+		buf := make([]byte, 4096)
+		for {
+			if _, err := c2.Read(buf); err != nil {
+				d.once.Do(func() { close(d.closed) })
+				return
+			}
+		}
+	}()
+	return c1, nil
+}
+
 type passthroughTLSDialer struct{}
 
 func (passthroughTLSDialer) DialTLSConn(ctx context.Context, c net.Conn) (net.Conn, error) {
@@ -212,6 +238,14 @@ func (q *failAfterWaitQuic) OpenFlowStream(ctx context.Context, _ string, _ wire
 		return nil, ctx.Err()
 	}
 }
+func (q *failAfterWaitQuic) PrepareFlowStream(ctx context.Context) (quic.PreparedFlowStream, error) {
+	select {
+	case <-q.wait:
+		return nil, errors.New("test: quic prepare failed")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 func (q *failAfterWaitQuic) OpenUDP(context.Context, string) (net.PacketConn, error) {
 	return nil, errors.New("test: unexpected OpenUDP")
 }
@@ -220,3 +254,222 @@ func (q *failAfterWaitQuic) AcquireSession(context.Context) (carrier.QuicSession
 }
 func (q *failAfterWaitQuic) InvalidateSession(carrier.QuicSession) {}
 func (q *failAfterWaitQuic) Close()                                {}
+
+type failPrepareQuic struct {
+	id wire.SessionID
+}
+
+func (q *failPrepareQuic) SetSessionID(id wire.SessionID) { q.id = id }
+func (q *failPrepareQuic) OpenTCP(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("test: unexpected OpenTCP")
+}
+func (q *failPrepareQuic) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
+	return nil, errors.New("test: unexpected OpenFlowStream")
+}
+func (q *failPrepareQuic) PrepareFlowStream(context.Context) (quic.PreparedFlowStream, error) {
+	return nil, errors.New("test: quic prepare failed")
+}
+func (q *failPrepareQuic) OpenUDP(context.Context, string) (net.PacketConn, error) {
+	return nil, errors.New("test: unexpected OpenUDP")
+}
+func (q *failPrepareQuic) AcquireSession(context.Context) (carrier.QuicSession, error) {
+	return nil, errors.New("test: unexpected AcquireSession")
+}
+func (q *failPrepareQuic) InvalidateSession(carrier.QuicSession) {}
+func (q *failPrepareQuic) Close()                                {}
+
+type recordingPreparedStream struct {
+	committed chan struct{}
+	closed    chan struct{}
+	failCommit bool
+	once      sync.Once
+}
+
+func (p *recordingPreparedStream) Commit(context.Context, string, wire.FlowHeader) (net.Conn, error) {
+	if p.failCommit {
+		p.once.Do(func() { close(p.closed) })
+		return nil, errors.New("test: commit failed")
+	}
+	c1, c2 := net.Pipe()
+	go func() { _ = c2.Close() }()
+	p.once.Do(func() { close(p.committed) })
+	return c1, nil
+}
+
+func (p *recordingPreparedStream) Close() error {
+	p.once.Do(func() { close(p.closed) })
+	return nil
+}
+
+type prepareOKQuic struct {
+	id       wire.SessionID
+	prepared *recordingPreparedStream
+}
+
+func (q *prepareOKQuic) SetSessionID(id wire.SessionID) { q.id = id }
+func (q *prepareOKQuic) OpenTCP(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("test: unexpected OpenTCP")
+}
+func (q *prepareOKQuic) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
+	return nil, errors.New("test: unexpected OpenFlowStream")
+}
+func (q *prepareOKQuic) PrepareFlowStream(context.Context) (quic.PreparedFlowStream, error) {
+	if q.prepared == nil {
+		q.prepared = &recordingPreparedStream{committed: make(chan struct{}), closed: make(chan struct{})}
+	}
+	return q.prepared, nil
+}
+func (q *prepareOKQuic) OpenUDP(context.Context, string) (net.PacketConn, error) {
+	return nil, errors.New("test: unexpected OpenUDP")
+}
+func (q *prepareOKQuic) AcquireSession(context.Context) (carrier.QuicSession, error) {
+	return nil, errors.New("test: unexpected AcquireSession")
+}
+func (q *prepareOKQuic) InvalidateSession(carrier.QuicSession) {}
+func (q *prepareOKQuic) Close()                                {}
+
+func TestAsymmetricOpenTCPClosesTCPOnQUICCommitFailure(t *testing.T) {
+	spec := mustNowhereSpec(t)
+	tcpDialer := newPipeTCPDialer()
+	quic := &prepareOKQuic{prepared: &recordingPreparedStream{
+		committed:  make(chan struct{}),
+		closed:     make(chan struct{}),
+		failCommit: true,
+	}}
+	tcpConfig, err := tcptls.NewConfig(tcptls.TCPOptions{
+		Address: "127.0.0.1:1", Spec: spec, Key: "k", Dialer: tcpDialer, TLSDialer: passthroughTLSDialer{},
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	bundle, err := NewCarrierBundle(BundleOptions{
+		QUIC: quic, TCP: tcpConfig, Up: wire.CarrierTCP, Down: wire.CarrierUDP,
+	})
+	if err != nil {
+		t.Fatalf("NewCarrierBundle: %v", err)
+	}
+	conn, err := bundle.AsymmetricOpenTCP(context.Background(), "example.com:443")
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected commit failure")
+	}
+	select {
+	case <-tcpDialer.closed:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("TCP half not closed after QUIC commit failure")
+	}
+}
+
+func TestAsymmetricOpenTCPNoFLOWBeforeBothPrepared(t *testing.T) {
+	spec := mustNowhereSpec(t)
+	var mu sync.Mutex
+	var sawRequest bool
+	tcpDialer := &hookPipeDialer{onWrite: func(p []byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(p) > 0 && p[0] == wire.FlowFrameMagic {
+			sawRequest = true
+		}
+	}}
+	quicReady := make(chan struct{})
+	quic := &gatePrepareQuic{ready: quicReady}
+	tcpConfig, err := tcptls.NewConfig(tcptls.TCPOptions{
+		Address: "127.0.0.1:1", Spec: spec, Key: "k", Dialer: tcpDialer, TLSDialer: passthroughTLSDialer{},
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	bundle, err := NewCarrierBundle(BundleOptions{
+		QUIC: quic, TCP: tcpConfig, Up: wire.CarrierTCP, Down: wire.CarrierUDP,
+	})
+	if err != nil {
+		t.Fatalf("NewCarrierBundle: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := bundle.AsymmetricOpenTCP(context.Background(), "example.com:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		errCh <- err
+	}()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if tcpDialer.prepared.Load() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	leaked := sawRequest
+	mu.Unlock()
+	if leaked {
+		t.Fatal("FLOW frame written before QUIC prepare completed")
+	}
+	close(quicReady)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("AsymmetricOpenTCP: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AsymmetricOpenTCP timed out")
+	}
+}
+
+type hookPipeDialer struct {
+	prepared atomic.Bool
+	onWrite  func([]byte)
+}
+
+func (d *hookPipeDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	c1, c2 := net.Pipe()
+	go func() {
+		defer c2.Close()
+		buf := make([]byte, 4096)
+		for {
+			n, err := c2.Read(buf)
+			if n > 0 && d.onWrite != nil {
+				d.onWrite(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+			d.prepared.Store(true)
+		}
+	}()
+	return c1, nil
+}
+
+type gatePrepareQuic struct {
+	ready <-chan struct{}
+	id    wire.SessionID
+}
+
+func (q *gatePrepareQuic) SetSessionID(id wire.SessionID) { q.id = id }
+func (q *gatePrepareQuic) OpenTCP(context.Context, string) (net.Conn, error) {
+	return nil, errors.New("test: unexpected OpenTCP")
+}
+func (q *gatePrepareQuic) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
+	return nil, errors.New("test: unexpected OpenFlowStream")
+}
+func (q *gatePrepareQuic) PrepareFlowStream(ctx context.Context) (quic.PreparedFlowStream, error) {
+	select {
+	case <-q.ready:
+		return &recordingPreparedStream{committed: make(chan struct{}), closed: make(chan struct{})}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (q *gatePrepareQuic) OpenUDP(context.Context, string) (net.PacketConn, error) {
+	return nil, errors.New("test: unexpected OpenUDP")
+}
+func (q *gatePrepareQuic) AcquireSession(context.Context) (carrier.QuicSession, error) {
+	return nil, errors.New("test: unexpected AcquireSession")
+}
+func (q *gatePrepareQuic) InvalidateSession(carrier.QuicSession) {}
+func (q *gatePrepareQuic) Close()                                {}

@@ -51,15 +51,24 @@ type pairedUDP struct {
 // SubmitUDP caches or pairs a UDP half. Completing half returns *pairedUDP;
 // waiting half returns (nil, nil).
 func (m *flowPairManager) SubmitUDP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) (*pairedUDP, error) {
+	return m.SubmitUDPWithSource(ctx, sessionID, header, target, half, nil, udpHalfTransport(header, half))
+}
+
+// SubmitUDPWithSource is SubmitUDP with source/transport diagnostics.
+func (m *flowPairManager) SubmitUDPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf, source net.Addr, transport string) (*pairedUDP, error) {
 	if err := validatePairHeader(header, wire.FlowKindUDP); err != nil {
 		return nil, err
 	}
+	if transport == "" {
+		transport = udpHalfTransport(header, half)
+	}
 	pending := &pendingFlow{
-		meta: metadataFrom(header, target), role: half.Role, udp: half,
-		done: make(chan struct{}), state: pairWaiting,
+		meta: metadataFrom(header, target), role: half.Role, transport: transport, udp: half,
+		done: make(chan struct{}), state: pairWaiting, started: time.Now(),
+		sessionID: sessionID, flowID: header.FlowID, source: source,
 	}
 	key := pairKey{session: sessionID, flowID: header.FlowID}
-	existing, err := m.submit(key, pending)
+	existing, err := m.submit(ctx, key, pending)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +98,22 @@ func (m *flowPairManager) SubmitUDP(ctx context.Context, sessionID wire.SessionI
 		}, nil
 	}
 	return nil, m.wait(ctx, key, pending)
+}
+
+func udpHalfTransport(header wire.FlowHeader, half udpHalf) string {
+	carrier := header.Uplink
+	if half.Role == wire.FlowRoleAttach {
+		carrier = header.Downlink
+	}
+	switch carrier {
+	case wire.CarrierUDP:
+		if half.Role == wire.FlowRoleAttach {
+			return "quic"
+		}
+		return "udp"
+	default:
+		return "tcp"
+	}
 }
 
 func closeUDPHalfWithError(half udpHalf, err error) {

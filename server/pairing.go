@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
@@ -40,14 +41,19 @@ const (
 )
 
 type pendingFlow struct {
-	meta  pairMetadata
-	role  wire.FlowRole
-	tcp   net.Conn
-	udp   udpHalf
-	timer *time.Timer
-	done  chan struct{}
-	state pairState
-	err   error
+	meta      pairMetadata
+	role      wire.FlowRole
+	transport string
+	tcp       net.Conn
+	udp       udpHalf
+	timer     *time.Timer
+	done      chan struct{}
+	state     pairState
+	err       error
+	started   time.Time
+	sessionID wire.SessionID
+	flowID    uint64
+	source    net.Addr
 }
 
 // flowPairManager pairs asymmetric FLOW_OPEN / FLOW_ATTACH halves.
@@ -61,6 +67,7 @@ type flowPairManager struct {
 	maxPerSession int
 	maxGlobal     int
 	closed        bool
+	observer      diagnostic.Observer
 }
 
 func newFlowPairManager(timeout time.Duration) *flowPairManager {
@@ -80,6 +87,12 @@ func (m *flowPairManager) configureLimits(limits Limits) {
 	m.mu.Lock()
 	m.maxPerSession = limits.PendingPairsPerSession
 	m.maxGlobal = limits.PendingPairsGlobal
+	m.mu.Unlock()
+}
+
+func (m *flowPairManager) setObserver(observer diagnostic.Observer) {
+	m.mu.Lock()
+	m.observer = observer
 	m.mu.Unlock()
 }
 
@@ -107,12 +120,18 @@ func (m *flowPairManager) Close() {
 	m.perSession = make(map[wire.SessionID]int)
 	m.mu.Unlock()
 	for _, half := range pending {
+		m.emitPair(context.Background(), half, "pair_cancel", ErrClosed)
 		closePendingFlowWithError(half, ErrClosed)
 	}
 }
 
 // SubmitTCP caches or pairs a TCP half.
 func (m *flowPairManager) SubmitTCP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, conn net.Conn) (net.Conn, error) {
+	return m.SubmitTCPWithSource(ctx, sessionID, header, target, conn, nil)
+}
+
+// SubmitTCPWithSource is SubmitTCP with optional source for diagnostics.
+func (m *flowPairManager) SubmitTCPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, conn net.Conn, source net.Addr) (net.Conn, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("%w: nil tcp half", ErrInvalidHandler)
 	}
@@ -120,10 +139,11 @@ func (m *flowPairManager) SubmitTCP(ctx context.Context, sessionID wire.SessionI
 		return nil, err
 	}
 	pending := &pendingFlow{
-		meta: metadataFrom(header, target), role: header.Role, tcp: conn,
-		done: make(chan struct{}), state: pairWaiting,
+		meta: metadataFrom(header, target), role: header.Role, transport: "tcp", tcp: conn,
+		done: make(chan struct{}), state: pairWaiting, started: time.Now(),
+		sessionID: sessionID, flowID: header.FlowID, source: source,
 	}
-	existing, err := m.submit(pairKey{session: sessionID, flowID: header.FlowID}, pending)
+	existing, err := m.submit(ctx, pairKey{session: sessionID, flowID: header.FlowID}, pending)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +166,7 @@ func (m *flowPairManager) SubmitTCP(ctx context.Context, sessionID wire.SessionI
 }
 
 // submit returns the existing complementary half, or nil when current is stored.
-func (m *flowPairManager) submit(key pairKey, current *pendingFlow) (*pendingFlow, error) {
+func (m *flowPairManager) submit(ctx context.Context, key pairKey, current *pendingFlow) (*pendingFlow, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -184,6 +204,7 @@ func (m *flowPairManager) submit(key pairKey, current *pendingFlow) (*pendingFlo
 	m.pending[key] = current
 	m.perSession[key.session]++
 	m.mu.Unlock()
+	m.emitPair(ctx, current, "pair_wait", nil)
 	return nil, nil
 }
 
@@ -205,6 +226,7 @@ func (m *flowPairManager) wait(ctx context.Context, key pairKey, pending *pendin
 			pending.err = ctx.Err()
 			close(pending.done)
 			m.mu.Unlock()
+			m.emitPair(ctx, pending, "pair_cancel", ctx.Err())
 			closePendingFlowWithError(pending, ctx.Err())
 			return ctx.Err()
 		}
@@ -232,6 +254,7 @@ func (m *flowPairManager) timeoutFlow(key pairKey, pending *pendingFlow) {
 	pending.err = err
 	close(pending.done)
 	m.mu.Unlock()
+	m.emitPair(context.Background(), pending, "pair_timeout", err)
 	closePendingFlowWithError(pending, err)
 }
 
@@ -251,6 +274,61 @@ func (m *flowPairManager) removeLocked(key pairKey, pending *pendingFlow) {
 		delete(m.perSession, key.session)
 	} else {
 		m.perSession[key.session] = count - 1
+	}
+}
+
+func (m *flowPairManager) emitPair(ctx context.Context, pending *pendingFlow, code string, err error) {
+	if m == nil || pending == nil {
+		return
+	}
+	level := diagnostic.LevelDebug
+	switch code {
+	case "pair_timeout":
+		level = diagnostic.LevelWarn
+	case "pair_cancel":
+		level = diagnostic.LevelInfo
+	}
+	cause := ""
+	if err != nil {
+		cause = err.Error()
+	}
+	diagnostic.Emit(ctx, m.observer, diagnostic.Event{
+		Level:        level,
+		Code:         code,
+		Component:    "server",
+		Source:       pending.source,
+		Target:       pending.meta.target,
+		SessionID:    pending.sessionID,
+		FlowID:       pending.flowID,
+		HalfRole:     flowRoleName(pending.role),
+		Transport:    pending.transport,
+		Stage:        code,
+		MissingHalf:  complementaryRoleName(pending.role),
+		PairWaitMs:   time.Since(pending.started).Milliseconds(),
+		ContextCause: cause,
+		Err:          err,
+	})
+}
+
+func flowRoleName(role wire.FlowRole) string {
+	switch role {
+	case wire.FlowRoleOpen:
+		return "open"
+	case wire.FlowRoleAttach:
+		return "attach"
+	default:
+		return "unknown"
+	}
+}
+
+func complementaryRoleName(role wire.FlowRole) string {
+	switch role {
+	case wire.FlowRoleOpen:
+		return "attach"
+	case wire.FlowRoleAttach:
+		return "open"
+	default:
+		return "unknown"
 	}
 }
 

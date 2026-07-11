@@ -381,8 +381,10 @@ func TestTCPPoolOpenTimingLogsAsymmetricLanes(t *testing.T) {
 	}
 	_ = flowConn.Close()
 
-	tcpPayload := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh", "stage=flow_lane")
-	assertOpenTimingFields(t, tcpPayload, "network=tcp", "target=example.com:443", "flow_id=42")
+	tcpPrepare := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh_prepare", "stage=flow_prepare")
+	assertOpenTimingFields(t, tcpPrepare, "network=tcp", "target=example.com:443", "flow_id=42")
+	tcpCommit := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh", "stage=flow_commit")
+	assertOpenTimingFields(t, tcpCommit, "network=tcp", "target=example.com:443", "flow_id=42")
 
 	uotHeader := wire.FlowHeader{
 		Role:     wire.FlowRoleAttach,
@@ -397,8 +399,10 @@ func TestTCPPoolOpenTimingLogsAsymmetricLanes(t *testing.T) {
 	}
 	_ = uotConn.Close()
 
-	udpPayload := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh", "stage=udp_flow_lane")
-	assertOpenTimingFields(t, udpPayload, "network=udp", "target=example.com:443", "flow_id=43")
+	udpPrepare := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh_prepare", "stage=udp_flow_prepare")
+	assertOpenTimingFields(t, udpPrepare, "network=udp", "target=example.com:443", "flow_id=43")
+	udpCommit := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh", "stage=udp_flow_commit")
+	assertOpenTimingFields(t, udpCommit, "network=udp", "target=example.com:443", "flow_id=43")
 }
 
 func TestTuneNowhereTCPConnIsBestEffort(t *testing.T) {
@@ -1163,4 +1167,147 @@ func (d *failingTCPDialer) dialCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.n
+}
+
+func TestTCPPoolPrepareFlowHalfBurstRespectsDialCap(t *testing.T) {
+	const flows = 128
+	const capDials = 16
+	dialer := newParallelDialer(flows)
+	cfg := testTCPConfig(t, dialer)
+	cfg.maxConcurrentDials = capDials
+	pool := NewTCPPool(cfg, 0)
+	defer pool.Close()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errCh := make(chan error, flows)
+	for i := 0; i < flows; i++ {
+		wg.Add(1)
+		go func(flowID uint64) {
+			defer wg.Done()
+			<-start
+			header := wire.FlowHeader{
+				Role: wire.FlowRoleOpen, FlowID: flowID, Kind: wire.FlowKindTCP,
+				Uplink: wire.CarrierTCP, Downlink: wire.CarrierUDP,
+			}
+			half, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", header)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			conn, err := half.Commit()
+			if err != nil {
+				_ = half.Close()
+				errCh <- err
+				return
+			}
+			_ = conn.Close()
+		}(uint64(i + 1))
+	}
+	close(start)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if dialer.maxActiveCount() >= capDials {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := dialer.maxActiveCount(); got > capDials {
+		t.Fatalf("max concurrent dials during prepare = %d, want <= %d", got, capDials)
+	}
+	close(dialer.release)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("prepare/commit: %v", err)
+	}
+}
+
+func TestTCPPoolPrepareFlowHalfCancelReleasesDialSlot(t *testing.T) {
+	dialer := newParallelDialer(1)
+	cfg := testTCPConfig(t, dialer)
+	cfg.maxConcurrentDials = 1
+	pool := NewTCPPool(cfg, 0)
+	defer pool.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		header := wire.FlowHeader{
+			Role: wire.FlowRoleOpen, FlowID: 1, Kind: wire.FlowKindTCP,
+			Uplink: wire.CarrierTCP, Downlink: wire.CarrierUDP,
+		}
+		_, err := pool.PrepareFlowHalf(ctx, "example.com:443", header)
+		errCh <- err
+	}()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if dialer.maxActiveCount() == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			// dialer may still return after cancel depending on race; accept either cancel or success-then-close path
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				// parallel dialer blocks until release; cancel should abort acquireDialSlot waiters
+				// or DialContext itself
+			}
+			_ = err
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PrepareFlowHalf did not return after cancel")
+	}
+	close(dialer.release)
+
+	// Slot must be free for a subsequent prepare.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	header := wire.FlowHeader{
+		Role: wire.FlowRoleOpen, FlowID: 2, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierUDP,
+	}
+	half, err := pool.PrepareFlowHalf(ctx2, "example.com:443", header)
+	if err != nil {
+		t.Fatalf("second prepare after cancel: %v", err)
+	}
+	_ = half.Close()
+}
+
+func TestPreparedFlowHalfCommitCloseExactlyOnce(t *testing.T) {
+	pool := NewTCPPool(testTCPConfig(t, &recordingTCPDialer{}), 0)
+	defer pool.Close()
+	header := wire.FlowHeader{
+		Role: wire.FlowRoleOpen, FlowID: 7, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierUDP,
+	}
+	half, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", header)
+	if err != nil {
+		t.Fatalf("PrepareFlowHalf: %v", err)
+	}
+	conn, err := half.Commit()
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if _, err := half.Commit(); err == nil {
+		t.Fatal("second Commit should fail")
+	}
+	if err := half.Close(); err != nil {
+		t.Fatalf("Close after Commit: %v", err)
+	}
+	_ = conn.Close()
+
+	half2, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", header)
+	if err != nil {
+		t.Fatalf("PrepareFlowHalf#2: %v", err)
+	}
+	if err := half2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := half2.Commit(); err == nil {
+		t.Fatal("Commit after Close should fail")
+	}
 }

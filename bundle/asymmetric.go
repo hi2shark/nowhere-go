@@ -8,6 +8,8 @@ import (
 	"net"
 	"time"
 
+	"github.com/hi2shark/nowhere-go/carrier/quic"
+	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
@@ -17,56 +19,97 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	type half struct {
-		role string
-		conn net.Conn
-		err  error
+	openHeader := wire.FlowHeader{Role: wire.FlowRoleOpen, FlowID: flowID, Kind: wire.FlowKindTCP, Uplink: up, Downlink: down}
+	attachHeader := wire.FlowHeader{Role: wire.FlowRoleAttach, FlowID: flowID, Kind: wire.FlowKindTCP, Uplink: up, Downlink: down}
+
+	var (
+		tcpHeader  wire.FlowHeader
+		quicHeader wire.FlowHeader
+		tcpIsOpen  bool
+	)
+	switch {
+	case up == wire.CarrierTCP && down == wire.CarrierUDP:
+		tcpHeader, quicHeader, tcpIsOpen = openHeader, attachHeader, true
+	case up == wire.CarrierUDP && down == wire.CarrierTCP:
+		tcpHeader, quicHeader, tcpIsOpen = attachHeader, openHeader, false
+	default:
+		return nil, errors.New("nowhere: asymmetric tcp requires mixed carriers")
 	}
-	closePendingHalf := func(resultCh <-chan half) {
-		res := <-resultCh
-		if res.conn != nil {
-			_ = res.conn.Close()
+
+	tcpHalf, err := b.prepareTCPHalf(ctx, dest, tcpHeader)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere: prepare tcp half: %w", err)
+	}
+	defer func() {
+		if tcpHalf != nil {
+			_ = tcpHalf.Close()
 		}
-	}
-	resultCh := make(chan half, 2)
-	go func() {
-		c, e := b.openTCPHalf(ctx, wire.FlowHeader{Role: wire.FlowRoleOpen, FlowID: flowID, Kind: wire.FlowKindTCP, Uplink: up, Downlink: down}, dest)
-		resultCh <- half{role: "uplink", conn: c, err: e}
-	}()
-	go func() {
-		c, e := b.openTCPHalf(ctx, wire.FlowHeader{Role: wire.FlowRoleAttach, FlowID: flowID, Kind: wire.FlowKindTCP, Uplink: up, Downlink: down}, dest)
-		resultCh <- half{role: "downlink", conn: c, err: e}
 	}()
 
-	first := <-resultCh
-	if first.err != nil {
+	quicPrep, err := b.prepareQUICHalf(ctx)
+	if err != nil {
 		cancel()
-		go closePendingHalf(resultCh)
-		return nil, fmt.Errorf("nowhere: open %s half: %w", first.role, first.err)
+		return nil, fmt.Errorf("nowhere: prepare quic half: %w", err)
 	}
-	second := <-resultCh
-	if second.err != nil {
-		cancel()
-		_ = first.conn.Close()
-		return nil, fmt.Errorf("nowhere: open %s half: %w", second.role, second.err)
-	}
+	defer func() {
+		if quicPrep != nil {
+			_ = quicPrep.Close()
+		}
+	}()
 
-	var openRes, attachRes half
-	if first.role == "uplink" {
-		openRes, attachRes = first, second
+	tcpConn, err := tcpHalf.Commit()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("nowhere: commit tcp half: %w", err)
+	}
+	tcpHalf = nil
+
+	quicConn, err := quicPrep.Commit(ctx, dest, quicHeader)
+	if err != nil {
+		cancel()
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("nowhere: commit quic half: %w", err)
+	}
+	quicPrep = nil
+
+	var openConn, attachConn net.Conn
+	if tcpIsOpen {
+		openConn, attachConn = tcpConn, quicConn
 	} else {
-		openRes, attachRes = second, first
+		openConn, attachConn = quicConn, tcpConn
 	}
-
 	return &splicedConn{
-		reader: attachRes.conn,
-		writer: openRes.conn,
-		closer: []io.Closer{openRes.conn, attachRes.conn},
-		remote: openRes.conn.RemoteAddr(),
-		local:  openRes.conn.LocalAddr(),
+		reader: attachConn,
+		writer: openConn,
+		closer: []io.Closer{openConn, attachConn},
+		remote: openConn.RemoteAddr(),
+		local:  openConn.LocalAddr(),
 	}, nil
 }
 
+func (b *CarrierBundle) prepareTCPHalf(ctx context.Context, dest string, header wire.FlowHeader) (*tcptls.PreparedFlowHalf, error) {
+	pool, err := b.tcpPool()
+	if err != nil {
+		return nil, err
+	}
+	if pool == nil {
+		return nil, errors.New("nowhere: tcp carrier unavailable")
+	}
+	return pool.PrepareFlowHalf(ctx, dest, header)
+}
+
+func (b *CarrierBundle) prepareQUICHalf(ctx context.Context) (quic.PreparedFlowStream, error) {
+	client, err := b.quicClient()
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		return nil, errors.New("nowhere: udp carrier unavailable")
+	}
+	return client.PrepareFlowStream(ctx)
+}
+
+// openTCPHalf remains for tests that exercise a single half path.
 func (b *CarrierBundle) openTCPHalf(ctx context.Context, header wire.FlowHeader, dest string) (net.Conn, error) {
 	carrier := header.Uplink
 	if header.Role == wire.FlowRoleAttach {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
@@ -119,6 +120,105 @@ func TestFlowPairManagerTCPCancelUnblocksPeer(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("SubmitTCP blocked after ctx cancel")
+	}
+}
+
+func TestFlowPairManagerAttachFirstThenOpen(t *testing.T) {
+	m := newFlowPairManager(2 * time.Second)
+	defer m.Close()
+
+	c1, c2 := net.Pipe()
+	c3, c4 := net.Pipe()
+	defer c2.Close()
+	defer c4.Close()
+
+	session := wire.SessionID{2}
+	headerAttach := wire.FlowHeader{
+		Role: wire.FlowRoleAttach, Kind: wire.FlowKindTCP, FlowID: 11,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierUDP,
+	}
+	headerOpen := headerAttach
+	headerOpen.Role = wire.FlowRoleOpen
+
+	errCh := make(chan error, 1)
+	go func() {
+		paired, err := m.SubmitTCP(context.Background(), session, headerAttach, "h:1", c1)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if paired != nil {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		errCh <- nil
+	}()
+	time.Sleep(20 * time.Millisecond)
+	paired, err := m.SubmitTCP(context.Background(), session, headerOpen, "h:1", c3)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if paired == nil {
+		t.Fatal("expected paired conn")
+	}
+	_ = paired.Close()
+	if err := <-errCh; err != nil {
+		t.Fatalf("attach half: %v", err)
+	}
+	m.mu.Lock()
+	pending := len(m.pending)
+	m.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending=%d, want 0", pending)
+	}
+}
+
+func TestFlowPairManagerEmitsPairDiagnostics(t *testing.T) {
+	m := newFlowPairManager(40 * time.Millisecond)
+	defer m.Close()
+
+	var mu sync.Mutex
+	var codes []string
+	m.setObserver(diagnostic.ObserverFunc(func(_ context.Context, event diagnostic.Event) {
+		mu.Lock()
+		codes = append(codes, event.Code)
+		mu.Unlock()
+		if event.Code == "pair_timeout" {
+			if event.HalfRole != "open" || event.MissingHalf != "attach" || event.Transport != "tcp" {
+				t.Errorf("pair_timeout fields role=%s missing=%s transport=%s", event.HalfRole, event.MissingHalf, event.Transport)
+			}
+		}
+	}))
+
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	header := wire.FlowHeader{
+		Role: wire.FlowRoleOpen, Kind: wire.FlowKindTCP, FlowID: 99,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierUDP,
+	}
+	_, err := m.SubmitTCPWithSource(context.Background(), wire.SessionID{1}, header, "h:1", c1, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})
+	if err == nil {
+		t.Fatal("expected timeout")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	foundWait, foundTimeout := false, false
+	for _, code := range codes {
+		if code == "pair_wait" {
+			foundWait = true
+		}
+		if code == "pair_timeout" {
+			foundTimeout = true
+		}
+	}
+	if !foundWait || !foundTimeout {
+		t.Fatalf("codes=%v, want pair_wait and pair_timeout", codes)
+	}
+	m.mu.Lock()
+	pending := len(m.pending)
+	m.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending=%d after timeout, want 0", pending)
 	}
 }
 

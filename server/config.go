@@ -70,6 +70,7 @@ type Limits struct {
 	ActiveQUICSessions             int
 	MaxUnauthenticatedConnections  int
 	MaxUnauthenticatedPerSource    int
+	MaxConcurrentHandshakes        int
 }
 
 // ConfigOptions builds an immutable server Config.
@@ -180,6 +181,7 @@ func normalizeLimits(value Limits) (Limits, error) {
 		ActiveQUICSessions:            DefaultActiveQUICSessions,
 		MaxUnauthenticatedConnections: DefaultMaxUnauthenticatedConnections,
 		MaxUnauthenticatedPerSource:   DefaultMaxUnauthenticatedPerSource,
+		MaxConcurrentHandshakes:       DefaultMaxConcurrentHandshakes,
 	}
 	fields := []struct {
 		name string
@@ -194,6 +196,7 @@ func normalizeLimits(value Limits) (Limits, error) {
 		{"active quic sessions", &value.ActiveQUICSessions, &defaults.ActiveQUICSessions},
 		{"max unauthenticated connections", &value.MaxUnauthenticatedConnections, &defaults.MaxUnauthenticatedConnections},
 		{"max unauthenticated per source", &value.MaxUnauthenticatedPerSource, &defaults.MaxUnauthenticatedPerSource},
+		{"max concurrent handshakes", &value.MaxConcurrentHandshakes, &defaults.MaxConcurrentHandshakes},
 	}
 	for _, field := range fields {
 		if *field.in < 0 {

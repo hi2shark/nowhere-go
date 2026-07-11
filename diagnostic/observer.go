@@ -36,6 +36,18 @@ type Event struct {
 	Bytes     uint64
 	Duration  time.Duration
 	Err       error
+
+	// Half / pair correlation fields (asymmetric flows).
+	HalfRole      string // "open" | "attach"
+	Transport     string // "tcp" | "quic" | "udp"
+	Stage         string // prepare | commit | pair_wait | ...
+	MissingHalf   string // complementary role when waiting/timeout
+	ContextCause  string // context cancel cause / timeout reason
+	DialQueueMs   int64
+	RawDialMs     int64
+	TLSms         int64
+	AuthMs        int64
+	PairWaitMs    int64
 }
 
 // Observer receives diagnostic events. Implementations must return promptly.

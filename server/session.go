@@ -401,7 +401,11 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream) {
 func (s *portalSession) handleAsymmetricStream(ctx context.Context, conn net.Conn, source net.Addr, header wire.FlowHeader, target string) {
 	switch header.Kind {
 	case wire.FlowKindTCP:
-		_ = s.Handler.handleAsymmetricTCP(ctx, conn, source, s.ID, header, target)
+		if err := s.Handler.handleAsymmetricTCP(ctx, conn, source, s.ID, header, target); err != nil {
+			if !IsReported(err) {
+				s.Handler.emit(ctx, diagnostic.LevelWarn, "asymmetric_tcp_failed", source, target, s.ID, header.FlowID, err)
+			}
+		}
 	case wire.FlowKindUDP:
 		if header.Role != wire.FlowRoleAttach {
 			_ = conn.Close()
@@ -415,7 +419,11 @@ func (s *portalSession) handleAsymmetricStream(ctx context.Context, conn net.Con
 			Role:     wire.FlowRoleAttach,
 			Downlink: newQUICUDPDownlink(s.SendDatagram),
 		}
-		_ = s.Handler.submitAndRouteUDP(ctx, source, s.ID, header, target, half)
+		if err := s.Handler.submitAndRouteUDP(ctx, source, s.ID, header, target, half); err != nil {
+			if !IsReported(err) {
+				s.Handler.emit(ctx, diagnostic.LevelWarn, "asymmetric_udp_failed", source, target, s.ID, header.FlowID, err)
+			}
+		}
 		_ = conn.Close()
 	default:
 		_ = conn.Close()

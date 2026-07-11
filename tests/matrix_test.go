@@ -9,6 +9,7 @@ import (
 
 	"github.com/hi2shark/nowhere-go/bundle"
 	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/wire"
 )
@@ -156,6 +157,9 @@ func (q *recordingQuic) OpenTCP(context.Context, string) (net.Conn, error) {
 	return nil, errors.New("stub")
 }
 func (q *recordingQuic) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
+	return nil, errors.New("stub")
+}
+func (q *recordingQuic) PrepareFlowStream(context.Context) (quic.PreparedFlowStream, error) {
 	return nil, errors.New("stub")
 }
 func (q *recordingQuic) OpenUDP(context.Context, string) (net.PacketConn, error) {

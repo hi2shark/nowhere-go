@@ -19,7 +19,8 @@ const (
 	DefaultPoolSize = defaultPoolSize
 
 	// DefaultMaxConcurrentDials caps in-flight physical TCP dials per outbound.
-	DefaultMaxConcurrentDials = 32
+	// Conservative default for mixed TCP/QUIC bursts (dial+TLS+auth share the slot).
+	DefaultMaxConcurrentDials = 16
 	// DefaultWarmBackoffInitial is the first warm-prepare retry delay after failure.
 	DefaultWarmBackoffInitial = time.Second
 	// DefaultWarmBackoffMax caps exponential warm-prepare backoff.

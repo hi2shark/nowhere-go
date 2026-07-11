@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/wire"
 )
@@ -70,6 +71,9 @@ func (s *stubQuicBackend) OpenTCP(context.Context, string) (net.Conn, error) {
 }
 func (s *stubQuicBackend) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
 	return nil, errors.New("stub: OpenFlowStream")
+}
+func (s *stubQuicBackend) PrepareFlowStream(context.Context) (quic.PreparedFlowStream, error) {
+	return nil, errors.New("stub: PrepareFlowStream")
 }
 func (s *stubQuicBackend) OpenUDP(context.Context, string) (net.PacketConn, error) {
 	return nil, errors.New("stub: OpenUDP")
