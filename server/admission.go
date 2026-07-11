@@ -136,16 +136,3 @@ func (a *unauthenticatedAdmission) active() int {
 	defer a.mu.Unlock()
 	return a.total
 }
-
-func (a *unauthenticatedAdmission) activeFor(source net.Addr) int {
-	if a == nil {
-		return 0
-	}
-	key, ok := sourceKeyFromAddr(source)
-	if !ok {
-		return 0
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.perSource[key]
-}
