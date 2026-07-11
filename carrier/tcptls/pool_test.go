@@ -1029,3 +1029,138 @@ type testAddr string
 
 func (a testAddr) Network() string { return string(a) }
 func (a testAddr) String() string  { return string(a) }
+
+func TestTCPPoolUnreachableDoesNotAmplifyWarmPrepare(t *testing.T) {
+	const n = 20
+	dialer := &failingTCPDialer{err: errors.New("connection refused")}
+	cfg := testTCPConfig(t, dialer)
+	cfg.maxConcurrentDials = 64
+	pool := NewTCPPool(cfg, 5)
+	defer pool.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+		}()
+	}
+	wg.Wait()
+	time.Sleep(50 * time.Millisecond)
+
+	if got := dialer.dialCount(); got != n {
+		t.Fatalf("physical dials = %d, want %d (no warm amplification on failure)", got, n)
+	}
+	waitPoolIdle(t, pool, 0)
+}
+
+func TestTCPPoolWarmBackoffSkipsPrepareAfterFailure(t *testing.T) {
+	logger := newCapturingLogger()
+	dialer := &failingTCPDialer{err: errors.New("connection refused")}
+	cfg := testTCPConfig(t, dialer, logger)
+	cfg.warmBackoffInitial = 200 * time.Millisecond
+	cfg.warmBackoffMax = time.Second
+	pool := NewTCPPool(cfg, 1)
+	defer pool.Close()
+
+	pool.prepareOne()
+	_ = waitForLogPayloads(t, logger.ch, "warm_prepare_failed")
+
+	before := dialer.dialCount()
+	pool.maybeStartPrepare(1)
+	time.Sleep(30 * time.Millisecond)
+	if got := dialer.dialCount(); got != before {
+		t.Fatalf("warm prepare dialed during backoff: before=%d after=%d", before, got)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		pool.mu.Lock()
+		allowed := pool.warmAllowedLocked()
+		pool.mu.Unlock()
+		if allowed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	pool.prepareOne()
+	if got := dialer.dialCount(); got < before+1 {
+		t.Fatalf("warm prepare did not resume after backoff: dials=%d", got)
+	}
+}
+
+func TestTCPPoolMaxConcurrentDialsCapsParallelFresh(t *testing.T) {
+	const n = 8
+	const capDials = 3
+	dialer := newParallelDialer(n)
+	cfg := testTCPConfig(t, dialer)
+	cfg.maxConcurrentDials = capDials
+	pool := NewTCPPool(cfg, 0)
+	defer pool.Close()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+			if err == nil {
+				_ = conn.Close()
+			}
+		}()
+	}
+	close(start)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if dialer.maxActiveCount() >= capDials {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := dialer.maxActiveCount(); got > capDials {
+		t.Fatalf("max concurrent dials = %d, want <= %d", got, capDials)
+	}
+	close(dialer.release)
+	wg.Wait()
+	if got := dialer.maxActiveCount(); got > capDials {
+		t.Fatalf("observed max concurrent dials = %d, want <= %d", got, capDials)
+	}
+}
+
+func TestNewConfigRejectsInvertedWarmBackoff(t *testing.T) {
+	spec, err := wire.BuildEffectiveSpec("k", "auto", "now/1")
+	if err != nil {
+		t.Fatalf("BuildEffectiveSpec: %v", err)
+	}
+	_, err = NewConfig(TCPOptions{
+		Address: "127.0.0.1:1", Spec: spec, Key: "k",
+		Dialer: &recordingTCPDialer{}, TLSDialer: passthroughTLSDialer{},
+		WarmBackoffInitial: time.Second, WarmBackoffMax: 100 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected inverted warm backoff to fail")
+	}
+}
+
+type failingTCPDialer struct {
+	err error
+	mu  sync.Mutex
+	n   int
+}
+
+func (d *failingTCPDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	d.mu.Lock()
+	d.n++
+	d.mu.Unlock()
+	return nil, d.err
+}
+
+func (d *failingTCPDialer) dialCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.n
+}

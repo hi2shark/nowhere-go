@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/hi2shark/nowhere-go/carrier"
 	"github.com/hi2shark/nowhere-go/diagnostic"
@@ -16,6 +17,13 @@ const (
 	defaultPoolSize = 5
 	// DefaultPoolSize is the protocol-aligned TLS/TCP idle carrier target.
 	DefaultPoolSize = defaultPoolSize
+
+	// DefaultMaxConcurrentDials caps in-flight physical TCP dials per outbound.
+	DefaultMaxConcurrentDials = 32
+	// DefaultWarmBackoffInitial is the first warm-prepare retry delay after failure.
+	DefaultWarmBackoffInitial = time.Second
+	// DefaultWarmBackoffMax caps exponential warm-prepare backoff.
+	DefaultWarmBackoffMax = 30 * time.Second
 )
 
 // TCPDialer establishes the physical TCP carrier connection.
@@ -47,19 +55,32 @@ type TCPOptions struct {
 	Dialer         TCPDialer
 	TLSDialer      TLSDialer
 	Observer       diagnostic.Observer
+
+	// MaxConcurrentDials limits in-flight physical dials (TCP+TLS+auth) per pool.
+	// Zero uses DefaultMaxConcurrentDials; negative values are rejected.
+	MaxConcurrentDials int
+	// WarmBackoffInitial is the first delay after a warm-prepare failure.
+	// Zero uses DefaultWarmBackoffInitial; negative values are rejected.
+	WarmBackoffInitial time.Duration
+	// WarmBackoffMax caps warm-prepare exponential backoff.
+	// Zero uses DefaultWarmBackoffMax; negative values are rejected.
+	WarmBackoffMax time.Duration
 }
 
 // Config is immutable and safe to share between bundles.
 type Config struct {
-	address        string
-	connectAddress string
-	spec           *wire.EffectiveSpec
-	key            string
-	dialer         TCPDialer
-	tlsDialer      TLSDialer
-	observer       diagnostic.Observer
-	sessionID      wire.SessionID
-	logger         carrier.Logger
+	address            string
+	connectAddress     string
+	spec               *wire.EffectiveSpec
+	key                string
+	dialer             TCPDialer
+	tlsDialer          TLSDialer
+	observer           diagnostic.Observer
+	sessionID          wire.SessionID
+	logger             carrier.Logger
+	maxConcurrentDials int
+	warmBackoffInitial time.Duration
+	warmBackoffMax     time.Duration
 }
 
 // NewConfig validates a TLS/TCP carrier configuration.
@@ -79,10 +100,37 @@ func NewConfig(options TCPOptions) (*Config, error) {
 	if options.TLSDialer == nil {
 		return nil, fmt.Errorf("nowhere: nil TLS dialer")
 	}
+	maxDials := options.MaxConcurrentDials
+	if maxDials < 0 {
+		return nil, fmt.Errorf("nowhere: max concurrent dials must be >= 0")
+	}
+	if maxDials == 0 {
+		maxDials = DefaultMaxConcurrentDials
+	}
+	warmInitial := options.WarmBackoffInitial
+	if warmInitial < 0 {
+		return nil, fmt.Errorf("nowhere: warm backoff initial must be >= 0")
+	}
+	if warmInitial == 0 {
+		warmInitial = DefaultWarmBackoffInitial
+	}
+	warmMax := options.WarmBackoffMax
+	if warmMax < 0 {
+		return nil, fmt.Errorf("nowhere: warm backoff max must be >= 0")
+	}
+	if warmMax == 0 {
+		warmMax = DefaultWarmBackoffMax
+	}
+	if warmInitial > warmMax {
+		return nil, fmt.Errorf("nowhere: warm backoff initial exceeds max")
+	}
 	config := &Config{
 		address: options.Address, connectAddress: options.ConnectAddress,
 		spec: options.Spec, key: options.Key, dialer: options.Dialer,
 		tlsDialer: options.TLSDialer, observer: options.Observer,
+		maxConcurrentDials: maxDials,
+		warmBackoffInitial: warmInitial,
+		warmBackoffMax:     warmMax,
 	}
 	config.logger = observerLogger{observer: options.Observer}
 	return config, nil
@@ -96,6 +144,30 @@ func (c *Config) WithSessionID(sessionID wire.SessionID) *Config {
 	clone := *c
 	clone.sessionID = sessionID
 	return &clone
+}
+
+// MaxConcurrentDials returns the normalized dial concurrency cap.
+func (c *Config) MaxConcurrentDials() int {
+	if c == nil {
+		return DefaultMaxConcurrentDials
+	}
+	return c.maxConcurrentDials
+}
+
+// WarmBackoffInitial returns the normalized warm-prepare backoff floor.
+func (c *Config) WarmBackoffInitial() time.Duration {
+	if c == nil {
+		return DefaultWarmBackoffInitial
+	}
+	return c.warmBackoffInitial
+}
+
+// WarmBackoffMax returns the normalized warm-prepare backoff ceiling.
+func (c *Config) WarmBackoffMax() time.Duration {
+	if c == nil {
+		return DefaultWarmBackoffMax
+	}
+	return c.warmBackoffMax
 }
 
 type observerLogger struct{ observer diagnostic.Observer }

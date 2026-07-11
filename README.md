@@ -181,9 +181,17 @@ On success the Upstream owns the wrapped connection lifecycle. Closing the wrapp
 ### Default server guardrails
 
 - Authentication: 5 seconds with `[0.8, 1.2]` jitter; request idle: 40 seconds
+- Pre-auth admission: 256 global, 32 per source (IPv4 `/32`, IPv6 `/64`)
 - Pending asymmetric pairs: 1024 per session, 4096 global; timeout: 5 seconds
 - QUIC UDP: 256 flows/session, 64 packets/flow, 4 MiB queued/session, 120 second idle
 - Active QUIC sessions: 1024; a matching session ID replaces the previous carrier
+
+### Default outbound TCP guardrails
+
+- Warm pool only for `tcp/tcp` (default target 5, max 9); consumed carriers never return
+- Fresh-first replenish: warm prepare starts only after a successful business dial
+- Max concurrent physical dials per outbound: 32
+- Warm-prepare failure backoff: 1s → 30s with jitter
 
 ---
 

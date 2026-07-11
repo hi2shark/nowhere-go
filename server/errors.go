@@ -17,6 +17,8 @@ var (
 	ErrDuplicateHalf = errors.New("nowhere: duplicate flow half")
 	// ErrSessionLimit identifies an exhausted active-session budget.
 	ErrSessionLimit = errors.New("nowhere: active session limit reached")
+	// ErrAdmissionLimit identifies an exhausted pre-authentication admission budget.
+	ErrAdmissionLimit = errors.New("nowhere: unauthenticated connection limit exceeded")
 	// ErrUpstreamNotConfigured identifies a missing flow destination.
 	ErrUpstreamNotConfigured = errors.New("nowhere: upstream not configured")
 	// ErrClosed identifies operations attempted after manager shutdown.
@@ -28,3 +30,40 @@ var (
 	// ErrUnsupportedFlow identifies a valid frame unsupported by this endpoint.
 	ErrUnsupportedFlow = errors.New("nowhere: unsupported flow")
 )
+
+// ReportedError marks an error that the protocol core already emitted to Observer.
+// Host adapters should avoid logging the same failure again.
+type ReportedError struct {
+	Err error
+}
+
+func (e *ReportedError) Error() string {
+	if e == nil || e.Err == nil {
+		return "nowhere: reported error"
+	}
+	return e.Err.Error()
+}
+
+func (e *ReportedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// IsReported reports whether err (or any wrapped error) was already observed.
+func IsReported(err error) bool {
+	var reported *ReportedError
+	return errors.As(err, &reported)
+}
+
+// report wraps err as ReportedError when non-nil.
+func report(err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsReported(err) {
+		return err
+	}
+	return &ReportedError{Err: err}
+}

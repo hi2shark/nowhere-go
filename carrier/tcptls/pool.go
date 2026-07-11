@@ -2,6 +2,8 @@ package tcptls
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -51,10 +53,14 @@ type poolSnapshot struct {
 type TCPPool struct {
 	cfg       *Config
 	target    int
+	dialSlots chan struct{}
 	mu        sync.Mutex
 	idle      []*warmConn
 	preparing int
 	closed    bool
+
+	warmFailCount int
+	nextWarmRetry time.Time
 }
 
 func NewTCPPool(cfg *Config, target int) *TCPPool {
@@ -67,7 +73,15 @@ func NewTCPPool(cfg *Config, target int) *TCPPool {
 	if target > maxPoolSize {
 		target = maxPoolSize
 	}
-	return &TCPPool{cfg: cfg, target: target}
+	maxDials := cfg.maxConcurrentDials
+	if maxDials <= 0 {
+		maxDials = DefaultMaxConcurrentDials
+	}
+	return &TCPPool{
+		cfg:       cfg,
+		target:    target,
+		dialSlots: make(chan struct{}, maxDials),
+	}
 }
 
 func (p *TCPPool) Target() int {
@@ -129,7 +143,6 @@ func (p *TCPPool) acquire(ctx context.Context, dest string, mode TCPRelayMode) (
 		}
 		selected = wc
 	}
-	replenish := p.replenishBudgetLocked(selected)
 	snapshot := p.snapshotLocked()
 	p.mu.Unlock()
 
@@ -144,25 +157,26 @@ func (p *TCPPool) acquire(ctx context.Context, dest string, mode TCPRelayMode) (
 			selected.carrier.transition(stateClosed)
 			_ = selected.conn.Close()
 			p.mu.Lock()
-			replenish = p.replenishBudgetLocked(nil)
 			snapshot = p.snapshotLocked()
 			p.mu.Unlock()
 		} else {
-			p.startPrepare(replenish)
+			p.maybeStartPrepare(p.replenishBudget(true))
 			logPoolAcquire(p.cfg, "warm", flowID, selected.carrier.id, snapshot, start)
 			return conn, nil
 		}
 	}
 
-	p.startPrepare(replenish)
+	// Fresh-first: never start warm prepare before a successful business dial.
+	// This avoids ~2x amplification when the portal is unreachable.
 	outcome := "fresh"
 	if selected != nil {
 		outcome = "warm_failed_fresh"
 	}
-	conn, err := openFresh(ctx, p.cfg, flowID, dest, mode, outcome)
+	conn, err := p.openFresh(ctx, flowID, dest, mode, outcome)
 	if err != nil {
 		return nil, err
 	}
+	p.maybeStartPrepare(p.replenishBudget(false))
 	logPoolAcquire(p.cfg, outcome, flowID, carrierIDOf(conn), snapshot, start)
 	return conn, nil
 }
@@ -175,14 +189,23 @@ func (p *TCPPool) snapshotLocked() poolSnapshot {
 	}
 }
 
-func (p *TCPPool) replenishBudgetLocked(selected *warmConn) int {
+func (p *TCPPool) replenishBudget(afterWarmHit bool) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.replenishBudgetLocked(afterWarmHit)
+}
+
+func (p *TCPPool) replenishBudgetLocked(afterWarmHit bool) int {
 	max := 0
-	if selected != nil {
+	if afterWarmHit {
 		max = 2
 	} else if len(p.idle)+p.preparing == 0 {
 		max = 1
 	}
 	if max <= 0 || p.target <= 0 {
+		return 0
+	}
+	if !p.warmAllowedLocked() {
 		return 0
 	}
 	room := p.target - (len(p.idle) + p.preparing)
@@ -195,10 +218,124 @@ func (p *TCPPool) replenishBudgetLocked(selected *warmConn) int {
 	return max
 }
 
-func (p *TCPPool) startPrepare(count int) {
+func (p *TCPPool) maybeStartPrepare(count int) {
+	if count <= 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.closed || p.target <= 0 {
+		p.mu.Unlock()
+		return
+	}
+	if !p.warmAllowedLocked() {
+		delay := time.Until(p.nextWarmRetry)
+		p.mu.Unlock()
+		p.logger().Debugf("[Nowhere] [carrier] warm_backoff delay_ms=%d", delay.Milliseconds())
+		return
+	}
+	room := p.target - (len(p.idle) + p.preparing)
+	if room <= 0 {
+		p.mu.Unlock()
+		return
+	}
+	if count > room {
+		count = room
+	}
+	p.mu.Unlock()
 	for i := 0; i < count; i++ {
 		go p.prepareOne()
 	}
+}
+
+func (p *TCPPool) warmAllowedLocked() bool {
+	if p.nextWarmRetry.IsZero() {
+		return true
+	}
+	return !time.Now().Before(p.nextWarmRetry)
+}
+
+func (p *TCPPool) noteWarmFailureLocked() {
+	p.warmFailCount++
+	base := p.cfg.warmBackoffInitial
+	if base <= 0 {
+		base = DefaultWarmBackoffInitial
+	}
+	max := p.cfg.warmBackoffMax
+	if max <= 0 {
+		max = DefaultWarmBackoffMax
+	}
+	delay := base
+	for i := 1; i < p.warmFailCount; i++ {
+		if delay >= max {
+			delay = max
+			break
+		}
+		next := delay * 2
+		if next > max || next < delay {
+			delay = max
+			break
+		}
+		delay = next
+	}
+	delay = jitterDuration(delay)
+	if delay > max {
+		delay = max
+	}
+	p.nextWarmRetry = time.Now().Add(delay)
+	p.logger().Debugf("[Nowhere] [carrier] warm_prepare_failed fail_count=%d next_retry_ms=%d",
+		p.warmFailCount, delay.Milliseconds())
+}
+
+func (p *TCPPool) clearWarmBackoffLocked() {
+	p.warmFailCount = 0
+	p.nextWarmRetry = time.Time{}
+}
+
+func jitterDuration(base time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return base
+	}
+	ratio := float64(binary.BigEndian.Uint64(raw[:])) / float64(^uint64(0))
+	factor := 0.8 + ratio*0.4
+	return time.Duration(float64(base) * factor)
+}
+
+func (p *TCPPool) acquireDialSlot(ctx context.Context) (func(), error) {
+	if p == nil || p.dialSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case p.dialSlots <- struct{}{}:
+		return func() { <-p.dialSlots }, nil
+	case <-ctx.Done():
+		p.logger().Debugf("[Nowhere] [carrier] dial_throttled outcome=context_canceled")
+		return nil, ctx.Err()
+	}
+}
+
+func (p *TCPPool) tryAcquireDialSlot() (func(), bool) {
+	if p == nil || p.dialSlots == nil {
+		return func() {}, true
+	}
+	select {
+	case p.dialSlots <- struct{}{}:
+		return func() { <-p.dialSlots }, true
+	default:
+		return nil, false
+	}
+}
+
+func (p *TCPPool) openFresh(ctx context.Context, flowID uint64, dest string, mode TCPRelayMode, outcome string) (net.Conn, error) {
+	release, err := p.acquireDialSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return openFresh(ctx, p.cfg, flowID, dest, mode, outcome)
 }
 
 func logPoolAcquire(cfg *Config, outcome string, flowID uint64, carrierID uint64, snapshot poolSnapshot, start time.Time) {
@@ -230,12 +367,22 @@ func (p *TCPPool) Close() {
 
 func (p *TCPPool) prepareOne() {
 	p.mu.Lock()
-	if p.closed || p.preparing+len(p.idle) >= p.target {
+	if p.closed || p.preparing+len(p.idle) >= p.target || !p.warmAllowedLocked() {
 		p.mu.Unlock()
 		return
 	}
 	p.preparing++
 	p.mu.Unlock()
+
+	release, ok := p.tryAcquireDialSlot()
+	if !ok {
+		p.mu.Lock()
+		p.preparing--
+		p.mu.Unlock()
+		p.logger().Debugf("[Nowhere] [carrier] dial_throttled outcome=warm_skipped")
+		return
+	}
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	conn, ci, err := prepare(ctx, p.cfg)
@@ -244,6 +391,7 @@ func (p *TCPPool) prepareOne() {
 		p.logger().Debugf("[Nowhere] warm prepare failed: %v", err)
 		p.mu.Lock()
 		p.preparing--
+		p.noteWarmFailureLocked()
 		p.mu.Unlock()
 		return
 	}
@@ -251,6 +399,7 @@ func (p *TCPPool) prepareOne() {
 	wc := &warmConn{conn: conn, carrier: ci}
 	p.mu.Lock()
 	p.preparing--
+	p.clearWarmBackoffLocked()
 	if p.closed || len(p.idle) >= p.target {
 		p.mu.Unlock()
 		ci.transition(stateClosed)
@@ -583,6 +732,11 @@ func (p *TCPPool) AcquireFlowHalf(ctx context.Context, dest string, header wire.
 	if closed {
 		return nil, errors.New("nowhere: tcp pool closed")
 	}
+	release, err := p.acquireDialSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	// Reuse wire FlowID for log correlation across open/attach halves.
 	return openFlowLane(ctx, p.cfg, header.FlowID, dest, header)
 }
@@ -665,6 +819,11 @@ func (p *TCPPool) AcquireUDPFlowHalf(ctx context.Context, dest string, header wi
 	if closed {
 		return nil, errors.New("nowhere: tcp pool closed")
 	}
+	release, err := p.acquireDialSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	return openUDPFlowLane(ctx, p.cfg, header.FlowID, dest, header)
 }
 

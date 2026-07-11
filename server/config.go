@@ -62,12 +62,14 @@ type Timeouts struct {
 
 // Limits controls process and session resource bounds. Zero values use defaults.
 type Limits struct {
-	PendingPairsPerSession int
-	PendingPairsGlobal     int
-	QUICFlowsPerSession    int
-	QUICQueueBytes         int
-	QUICQueuePackets       int
-	ActiveQUICSessions     int
+	PendingPairsPerSession         int
+	PendingPairsGlobal             int
+	QUICFlowsPerSession            int
+	QUICQueueBytes                 int
+	QUICQueuePackets               int
+	ActiveQUICSessions             int
+	MaxUnauthenticatedConnections  int
+	MaxUnauthenticatedPerSource    int
 }
 
 // ConfigOptions builds an immutable server Config.
@@ -170,12 +172,14 @@ func normalizeTimeouts(value Timeouts) (Timeouts, error) {
 
 func normalizeLimits(value Limits) (Limits, error) {
 	defaults := Limits{
-		PendingPairsPerSession: DefaultPendingPairsPerSession,
-		PendingPairsGlobal:     DefaultPendingPairsGlobal,
-		QUICFlowsPerSession:    DefaultQUICFlowsPerSession,
-		QUICQueueBytes:         DefaultQUICQueueBytes,
-		QUICQueuePackets:       DefaultQUICQueuePackets,
-		ActiveQUICSessions:     DefaultActiveQUICSessions,
+		PendingPairsPerSession:        DefaultPendingPairsPerSession,
+		PendingPairsGlobal:            DefaultPendingPairsGlobal,
+		QUICFlowsPerSession:           DefaultQUICFlowsPerSession,
+		QUICQueueBytes:                DefaultQUICQueueBytes,
+		QUICQueuePackets:              DefaultQUICQueuePackets,
+		ActiveQUICSessions:            DefaultActiveQUICSessions,
+		MaxUnauthenticatedConnections: DefaultMaxUnauthenticatedConnections,
+		MaxUnauthenticatedPerSource:   DefaultMaxUnauthenticatedPerSource,
 	}
 	fields := []struct {
 		name string
@@ -188,6 +192,8 @@ func normalizeLimits(value Limits) (Limits, error) {
 		{"quic queue bytes", &value.QUICQueueBytes, &defaults.QUICQueueBytes},
 		{"quic queue packets", &value.QUICQueuePackets, &defaults.QUICQueuePackets},
 		{"active quic sessions", &value.ActiveQUICSessions, &defaults.ActiveQUICSessions},
+		{"max unauthenticated connections", &value.MaxUnauthenticatedConnections, &defaults.MaxUnauthenticatedConnections},
+		{"max unauthenticated per source", &value.MaxUnauthenticatedPerSource, &defaults.MaxUnauthenticatedPerSource},
 	}
 	for _, field := range fields {
 		if *field.in < 0 {
@@ -199,6 +205,9 @@ func normalizeLimits(value Limits) (Limits, error) {
 	}
 	if defaults.PendingPairsPerSession > defaults.PendingPairsGlobal {
 		return Limits{}, fmt.Errorf("%w: per-session pair limit exceeds global limit", ErrInvalidConfig)
+	}
+	if defaults.MaxUnauthenticatedPerSource > defaults.MaxUnauthenticatedConnections {
+		return Limits{}, fmt.Errorf("%w: per-source unauthenticated limit exceeds global limit", ErrInvalidConfig)
 	}
 	return defaults, nil
 }

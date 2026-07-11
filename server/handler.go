@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/hi2shark/nowhere-go/diagnostic"
@@ -27,13 +29,18 @@ type HandlerOptions struct {
 
 // Handler authenticates carriers and hands decoded flows to Upstream.
 type Handler struct {
-	config   *Config
-	upstream Upstream
-	observer diagnostic.Observer
-	pairing  *flowPairManager
-	sessions *sessionManager
-	now      func() time.Time
-	randRead func([]byte) (int, error)
+	config    *Config
+	upstream  Upstream
+	observer  diagnostic.Observer
+	pairing   *flowPairManager
+	sessions  *sessionManager
+	admission *unauthenticatedAdmission
+	now       func() time.Time
+	randRead  func([]byte) (int, error)
+
+	admissionLogMu   sync.Mutex
+	admissionLastLog time.Time
+	admissionSkipped int
 }
 
 // NewHandler constructs a handler whose internal state is always initialized.
@@ -45,11 +52,15 @@ func NewHandler(options HandlerOptions) (*Handler, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidHandler, ErrUpstreamNotConfigured)
 	}
 	h := &Handler{
-		config:   options.Config,
-		upstream: options.Upstream,
-		observer: options.Observer,
-		pairing:  newFlowPairManager(options.Config.timeouts.FlowPair),
-		sessions: newSessionManager(),
+		config:    options.Config,
+		upstream:  options.Upstream,
+		observer:  options.Observer,
+		pairing:   newFlowPairManager(options.Config.timeouts.FlowPair),
+		sessions:  newSessionManager(),
+		admission: newUnauthenticatedAdmission(
+			options.Config.limits.MaxUnauthenticatedConnections,
+			options.Config.limits.MaxUnauthenticatedPerSource,
+		),
 		now:      time.Now,
 		randRead: rand.Read,
 	}
@@ -86,6 +97,15 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 		return fmt.Errorf("%w: nil tcp connection", ErrInvalidHandler)
 	}
 	life := newLifecycle(ctx, raw, onClose, h.observer)
+	guard, ok := h.admission.tryAcquire(source)
+	if !ok {
+		life.Close(ErrAdmissionLimit)
+		h.emitAdmissionLimited(ctx, source)
+		return report(ErrAdmissionLimit)
+	}
+	releaseAdmission := guard.Release
+	defer releaseAdmission()
+
 	if handshake == nil {
 		life.Close(ErrTLSNotConfigured)
 		return ErrTLSNotConfigured
@@ -95,8 +115,8 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 	cancel()
 	if err != nil {
 		life.Close(err)
-		h.emit(ctx, diagnostic.LevelError, "tls_handshake_failed", source, "", wire.SessionID{}, 0, err)
-		return err
+		h.emit(ctx, classifyTLSHandshake(err), "tls_handshake_failed", source, "", wire.SessionID{}, 0, err)
+		return report(err)
 	}
 	if conn == nil {
 		err = fmt.Errorf("%w: TLS handshaker returned nil conn", ErrInvalidHandler)
@@ -104,7 +124,7 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 		return err
 	}
 	owned := &ownedConn{Conn: conn, life: life}
-	return h.handleTCPConn(ctx, owned, source)
+	return h.handleTCPConn(ctx, owned, source, releaseAdmission)
 }
 
 // HandleConn handles an already handshaked carrier. Hosts should prefer ServeTCP
@@ -115,7 +135,7 @@ func (h *Handler) HandleConn(ctx context.Context, conn net.Conn, source net.Addr
 	}, onClose)
 }
 
-func (h *Handler) handleTCPConn(ctx context.Context, conn *ownedConn, source net.Addr) error {
+func (h *Handler) handleTCPConn(ctx context.Context, conn *ownedConn, source net.Addr, releaseAdmission func()) error {
 	deadline := h.authDeadline()
 	_ = conn.SetDeadline(deadline)
 	br := bufio.NewReader(conn)
@@ -127,6 +147,9 @@ func (h *Handler) handleTCPConn(ctx context.Context, conn *ownedConn, source net
 		conn.closeWithError(err)
 		h.emit(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
 		return err
+	}
+	if releaseAdmission != nil {
+		releaseAdmission()
 	}
 	_ = conn.SetDeadline(time.Time{})
 	_ = conn.SetReadDeadline(h.now().Add(h.config.timeouts.RequestIdle))
@@ -322,6 +345,54 @@ func (h *Handler) emit(ctx context.Context, level diagnostic.Level, code string,
 		Level: level, Code: code, Component: "server", Source: source,
 		Target: target, SessionID: sessionID, FlowID: flowID, Err: err,
 	})
+}
+
+func (h *Handler) emitAdmissionLimited(ctx context.Context, source net.Addr) {
+	h.admissionLogMu.Lock()
+	now := h.now()
+	if !h.admissionLastLog.IsZero() && now.Sub(h.admissionLastLog) < time.Second {
+		h.admissionSkipped++
+		h.admissionLogMu.Unlock()
+		return
+	}
+	skipped := h.admissionSkipped
+	h.admissionSkipped = 0
+	h.admissionLastLog = now
+	h.admissionLogMu.Unlock()
+
+	outcome := ""
+	if skipped > 0 {
+		outcome = fmt.Sprintf("suppressed=%d", skipped)
+	}
+	diagnostic.Emit(ctx, h.observer, diagnostic.Event{
+		Level: diagnostic.LevelWarn, Code: "admission_limited", Component: "server",
+		Source: source, Outcome: outcome, Err: ErrAdmissionLimit,
+	})
+}
+
+func classifyTLSHandshake(err error) diagnostic.Level {
+	if err == nil {
+		return diagnostic.LevelError
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return diagnostic.LevelWarn
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return diagnostic.LevelWarn
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return diagnostic.LevelDebug
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "use of closed network connection"):
+		return diagnostic.LevelDebug
+	default:
+		return diagnostic.LevelError
+	}
 }
 
 func closeConnWithError(conn net.Conn, err error) {
