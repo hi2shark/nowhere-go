@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/dialgate"
 	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
@@ -25,6 +26,11 @@ const (
 	DefaultWarmBackoffInitial = time.Second
 	// DefaultWarmBackoffMax caps exponential warm-prepare backoff.
 	DefaultWarmBackoffMax = 30 * time.Second
+
+	// DefaultDialBackoffInitial is the first portal dial retry after refused/timeout.
+	DefaultDialBackoffInitial = dialgate.DefaultInitial
+	// DefaultDialBackoffMax caps portal dial exponential backoff.
+	DefaultDialBackoffMax = dialgate.DefaultMax
 )
 
 // TCPDialer establishes the physical TCP carrier connection.
@@ -66,6 +72,12 @@ type TCPOptions struct {
 	// WarmBackoffMax caps warm-prepare exponential backoff.
 	// Zero uses DefaultWarmBackoffMax; negative values are rejected.
 	WarmBackoffMax time.Duration
+	// DialBackoffInitial is the first delay after portal connection refused / dial timeout.
+	// Zero uses DefaultDialBackoffInitial; negative values are rejected.
+	DialBackoffInitial time.Duration
+	// DialBackoffMax caps portal dial exponential backoff.
+	// Zero uses DefaultDialBackoffMax; negative values are rejected.
+	DialBackoffMax time.Duration
 }
 
 // Config is immutable and safe to share between bundles.
@@ -82,6 +94,8 @@ type Config struct {
 	maxConcurrentDials int
 	warmBackoffInitial time.Duration
 	warmBackoffMax     time.Duration
+	dialBackoffInitial time.Duration
+	dialBackoffMax     time.Duration
 }
 
 // NewConfig validates a TLS/TCP carrier configuration.
@@ -125,6 +139,23 @@ func NewConfig(options TCPOptions) (*Config, error) {
 	if warmInitial > warmMax {
 		return nil, fmt.Errorf("nowhere: warm backoff initial exceeds max")
 	}
+	dialInitial := options.DialBackoffInitial
+	if dialInitial < 0 {
+		return nil, fmt.Errorf("nowhere: dial backoff initial must be >= 0")
+	}
+	if dialInitial == 0 {
+		dialInitial = DefaultDialBackoffInitial
+	}
+	dialMax := options.DialBackoffMax
+	if dialMax < 0 {
+		return nil, fmt.Errorf("nowhere: dial backoff max must be >= 0")
+	}
+	if dialMax == 0 {
+		dialMax = DefaultDialBackoffMax
+	}
+	if dialInitial > dialMax {
+		return nil, fmt.Errorf("nowhere: dial backoff initial exceeds max")
+	}
 	config := &Config{
 		address: options.Address, connectAddress: options.ConnectAddress,
 		spec: options.Spec, key: options.Key, dialer: options.Dialer,
@@ -132,6 +163,8 @@ func NewConfig(options TCPOptions) (*Config, error) {
 		maxConcurrentDials: maxDials,
 		warmBackoffInitial: warmInitial,
 		warmBackoffMax:     warmMax,
+		dialBackoffInitial: dialInitial,
+		dialBackoffMax:     dialMax,
 	}
 	config.logger = observerLogger{observer: options.Observer}
 	return config, nil
@@ -171,18 +204,45 @@ func (c *Config) WarmBackoffMax() time.Duration {
 	return c.warmBackoffMax
 }
 
+// DialBackoffInitial returns the normalized portal dial backoff floor.
+func (c *Config) DialBackoffInitial() time.Duration {
+	if c == nil {
+		return DefaultDialBackoffInitial
+	}
+	return c.dialBackoffInitial
+}
+
+// DialBackoffMax returns the normalized portal dial backoff ceiling.
+func (c *Config) DialBackoffMax() time.Duration {
+	if c == nil {
+		return DefaultDialBackoffMax
+	}
+	return c.dialBackoffMax
+}
+
+// Observer returns the configured diagnostic observer (may be nil).
+func (c *Config) Observer() diagnostic.Observer {
+	if c == nil {
+		return nil
+	}
+	return c.observer
+}
+
 type observerLogger struct{ observer diagnostic.Observer }
 
 func (l observerLogger) Debugf(format string, args ...any) {
-	diagnostic.Emit(context.Background(), l.observer, diagnostic.Event{
-		Level: diagnostic.LevelDebug, Code: "carrier_debug", Component: "tcptls",
-		Outcome: fmt.Sprintf(format, args...),
-	})
+	msg := fmt.Sprintf(format, args...)
+	ev := diagnostic.ParseCarrierLog(msg)
+	ev.Level = diagnostic.LevelDebug
+	diagnostic.Emit(context.Background(), l.observer, ev)
 }
 
 func (l observerLogger) Warnf(format string, args ...any) {
-	diagnostic.Emit(context.Background(), l.observer, diagnostic.Event{
-		Level: diagnostic.LevelWarn, Code: "carrier_warning", Component: "tcptls",
-		Outcome: fmt.Sprintf(format, args...),
-	})
+	msg := fmt.Sprintf(format, args...)
+	ev := diagnostic.ParseCarrierLog(msg)
+	ev.Level = diagnostic.LevelWarn
+	if ev.Code == "" || ev.Code == "carrier_debug" {
+		ev.Code = "carrier_warning"
+	}
+	diagnostic.Emit(context.Background(), l.observer, ev)
 }

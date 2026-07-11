@@ -7,11 +7,19 @@ import (
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-// FormatEvent renders a structured Event as a single log line.
-// Zero-valued optional fields are omitted. Host adapters should prefer this
-// helper so client and server logs stay correlatable.
+// FormatEvent renders a structured Event as a single log line of key=value fields.
+// Zero-valued optional fields are omitted.
 func FormatEvent(event Event) string {
-	parts := []string{"nowhere", event.Component, event.Code}
+	parts := []string{"nowhere"}
+	if event.Component != "" {
+		parts = append(parts, "component="+event.Component)
+	}
+	if event.Carrier != "" {
+		parts = append(parts, "carrier="+event.Carrier)
+	}
+	if event.Code != "" {
+		parts = append(parts, "event="+event.Code)
+	}
 	if event.Source != nil {
 		parts = append(parts, fmt.Sprintf("source=%v", event.Source))
 	}
@@ -27,17 +35,45 @@ func FormatEvent(event Event) string {
 	if event.CarrierID != 0 {
 		parts = append(parts, fmt.Sprintf("carrier_id=%d", event.CarrierID))
 	}
-	if event.HalfRole != "" {
-		parts = append(parts, fmt.Sprintf("half_role=%s", event.HalfRole))
+	if event.UplinkCarrierID != 0 {
+		parts = append(parts, fmt.Sprintf("uplink_carrier_id=%d", event.UplinkCarrierID))
 	}
-	if event.Transport != "" {
-		parts = append(parts, fmt.Sprintf("transport=%s", event.Transport))
+	if event.DownlinkCarrierID != 0 {
+		parts = append(parts, fmt.Sprintf("downlink_carrier_id=%d", event.DownlinkCarrierID))
 	}
-	if event.Stage != "" {
-		parts = append(parts, fmt.Sprintf("stage=%s", event.Stage))
+	if event.UplinkTransport != "" {
+		parts = append(parts, "uplink_transport="+event.UplinkTransport)
+	}
+	if event.DownlinkTransport != "" {
+		parts = append(parts, "downlink_transport="+event.DownlinkTransport)
+	}
+	receivedHalf := event.ReceivedHalf
+	if receivedHalf == "" {
+		receivedHalf = event.HalfRole
+	}
+	if receivedHalf != "" {
+		parts = append(parts, "received_half="+receivedHalf)
 	}
 	if event.MissingHalf != "" {
-		parts = append(parts, fmt.Sprintf("missing_half=%s", event.MissingHalf))
+		parts = append(parts, "missing_half="+event.MissingHalf)
+	}
+	if event.Transport != "" {
+		parts = append(parts, "received_transport="+event.Transport)
+	}
+	if event.ExpectedTransport != "" {
+		parts = append(parts, "expected_transport="+event.ExpectedTransport)
+	}
+	if event.Stage != "" {
+		parts = append(parts, "stage="+event.Stage)
+	}
+	if event.Result != "" {
+		parts = append(parts, "result="+event.Result)
+	}
+	if event.ErrorClass != "" {
+		parts = append(parts, "error_class="+event.ErrorClass)
+	}
+	if event.CloseReason != "" {
+		parts = append(parts, "close_reason="+event.CloseReason)
 	}
 	if event.DialQueueMs != 0 {
 		parts = append(parts, fmt.Sprintf("dial_queue_ms=%d", event.DialQueueMs))
@@ -54,14 +90,32 @@ func FormatEvent(event Event) string {
 	if event.PairWaitMs != 0 {
 		parts = append(parts, fmt.Sprintf("pair_wait_ms=%d", event.PairWaitMs))
 	}
+	if event.FirstByteMs != 0 {
+		parts = append(parts, fmt.Sprintf("first_byte_ms=%d", event.FirstByteMs))
+	}
+	if event.RxBytes != 0 {
+		parts = append(parts, fmt.Sprintf("rx_bytes=%d", event.RxBytes))
+	}
+	if event.TxBytes != 0 {
+		parts = append(parts, fmt.Sprintf("tx_bytes=%d", event.TxBytes))
+	}
+	if event.Duration != 0 {
+		parts = append(parts, fmt.Sprintf("duration_ms=%d", event.Duration.Milliseconds()))
+	}
 	if event.ContextCause != "" {
 		parts = append(parts, fmt.Sprintf("context_cause=%q", event.ContextCause))
 	}
-	if event.Outcome != "" {
-		parts = append(parts, fmt.Sprintf("outcome=%s", event.Outcome))
+	if event.Outcome != "" && !strings.Contains(event.Outcome, "[Nowhere]") {
+		parts = append(parts, "outcome="+event.Outcome)
+	}
+	if event.State != "" {
+		parts = append(parts, "state="+event.State)
 	}
 	if event.Count != 0 {
 		parts = append(parts, fmt.Sprintf("count=%d", event.Count))
+	}
+	if event.Bytes != 0 && event.RxBytes == 0 && event.TxBytes == 0 {
+		parts = append(parts, fmt.Sprintf("bytes=%d", event.Bytes))
 	}
 	if event.Err != nil {
 		parts = append(parts, fmt.Sprintf("error=%q", event.Err.Error()))

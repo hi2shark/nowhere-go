@@ -55,15 +55,23 @@ func (p *TCPPool) prepareFlowHalf(ctx context.Context, dest string, header wire.
 		return nil, errors.New("nowhere: tcp pool closed")
 	}
 
-	queueStart := time.Now()
-	release, err := p.acquireDialSlot(ctx)
-	if err != nil {
-		return nil, err
-	}
-	dialQueueMs := time.Since(queueStart).Milliseconds()
-
-	half, err := prepareAuthenticatedLane(ctx, p.cfg, header.FlowID, dest, header, mode)
-	release()
+	var half *PreparedFlowHalf
+	var dialQueueMs int64
+	err := p.runPortalDial(ctx, func(ctx context.Context) error {
+		queueStart := time.Now()
+		release, err := p.acquireDialSlot(ctx)
+		if err != nil {
+			return err
+		}
+		dialQueueMs = time.Since(queueStart).Milliseconds()
+		h, err := prepareAuthenticatedLane(ctx, p.cfg, header.FlowID, dest, header, mode)
+		release()
+		if err != nil {
+			return err
+		}
+		half = h
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}

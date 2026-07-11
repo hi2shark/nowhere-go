@@ -2,6 +2,7 @@ package tcptls
 
 import (
 	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/diagnostic"
 	"net"
 	"sync/atomic"
 	"time"
@@ -123,29 +124,37 @@ func legalTransition(prev, next carrierState) bool {
 
 type trackedConn struct {
 	net.Conn
-	carrier *carrierInfo
-	flowID  uint64 // local log id (symmetric)
-	network string // "tcp" or "udp" (UoT)
-	target  string
-	rxBytes atomic.Uint64
-	txBytes atomic.Uint64
-	closed  atomic.Bool
+	carrier     *carrierInfo
+	flowID      uint64 // local log id (symmetric)
+	network     string // "tcp" or "udp" (UoT)
+	target      string
+	openedAt    time.Time
+	firstByteMs atomic.Int64
+	rxBytes     atomic.Uint64
+	txBytes     atomic.Uint64
+	closed      atomic.Bool
 }
 
 func newTrackedConn(conn net.Conn, ci *carrierInfo, flowID uint64, network, target string) *trackedConn {
-	return &trackedConn{
-		Conn:    conn,
-		carrier: ci,
-		flowID:  flowID,
-		network: network,
-		target:  target,
+	t := &trackedConn{
+		Conn:     conn,
+		carrier:  ci,
+		flowID:   flowID,
+		network:  network,
+		target:   target,
+		openedAt: time.Now(),
 	}
+	t.firstByteMs.Store(-1)
+	return t
 }
 
 func (t *trackedConn) Read(p []byte) (int, error) {
 	n, err := t.Conn.Read(p)
 	if n > 0 {
 		t.rxBytes.Add(uint64(n))
+		if t.firstByteMs.Load() < 0 {
+			t.firstByteMs.CompareAndSwap(-1, time.Since(t.openedAt).Milliseconds())
+		}
 	}
 	return n, err
 }
@@ -162,14 +171,23 @@ func (t *trackedConn) Close() error {
 	if t.closed.Swap(true) {
 		return nil
 	}
-	reason := "ok"
 	t.carrier.transition(stateClosing)
 	err := t.Conn.Close()
-	if err != nil {
-		reason = err.Error()
-	}
 	t.carrier.transition(stateClosed)
-	t.carrier.logger().Debugf("[Nowhere] [carrier] relay_end flow_id=%d carrier_id=%d network=%s target=%s rx_bytes=%d tx_bytes=%d close_reason=%s",
-		t.flowID, t.carrier.id, t.network, t.target, t.rxBytes.Load(), t.txBytes.Load(), reason)
+	reason := "ok"
+	if err != nil {
+		_, class := diagnostic.ClassifyClose(err)
+		if class != "" {
+			reason = class
+		} else {
+			reason = err.Error()
+		}
+	}
+	firstByte := t.firstByteMs.Load()
+	if firstByte < 0 {
+		firstByte = 0
+	}
+	t.carrier.logger().Debugf("[Nowhere] [carrier] relay_end flow_id=%d carrier_id=%d network=%s target=%s first_byte_ms=%d rx_bytes=%d tx_bytes=%d close_reason=%s",
+		t.flowID, t.carrier.id, t.network, t.target, firstByte, t.rxBytes.Load(), t.txBytes.Load(), reason)
 	return err
 }

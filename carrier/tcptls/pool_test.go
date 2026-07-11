@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1053,8 +1054,11 @@ func TestTCPPoolUnreachableDoesNotAmplifyWarmPrepare(t *testing.T) {
 	wg.Wait()
 	time.Sleep(50 * time.Millisecond)
 
-	if got := dialer.dialCount(); got != n {
-		t.Fatalf("physical dials = %d, want %d (no warm amplification on failure)", got, n)
+	if got := dialer.dialCount(); got > n {
+		t.Fatalf("physical dials = %d, want <= %d (no warm amplification on failure)", got, n)
+	}
+	if got := dialer.dialCount(); got == 0 {
+		t.Fatal("expected at least one dial attempt")
 	}
 	waitPoolIdle(t, pool, 0)
 }
@@ -1311,3 +1315,54 @@ func TestPreparedFlowHalfCommitCloseExactlyOnce(t *testing.T) {
 		t.Fatal("Commit after Close should fail")
 	}
 }
+
+func TestTCPPoolPortalDialCoalescesRefused(t *testing.T) {
+	dialer := &refusedCountingDialer{}
+	cfg := testTCPConfig(t, dialer)
+	cfg.dialBackoffInitial = 500 * time.Millisecond
+	cfg.dialBackoffMax = time.Second
+	pool := NewTCPPool(cfg, 0)
+	defer pool.Close()
+
+	// Seed degraded state.
+	if _, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP); err == nil {
+		t.Fatal("expected refused")
+	}
+	seed := dialer.dials.Load()
+	attemptsSeed := pool.DialAttempts()
+
+	const n = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err == nil {
+			t.Fatal("expected refused error")
+		}
+	}
+	if got := dialer.dials.Load(); got != seed {
+		t.Fatalf("physical dials=%d, want seed %d (coalesced during backoff)", got, seed)
+	}
+	if got := pool.DialAttempts(); got != attemptsSeed {
+		t.Fatalf("gate attempts=%d, want seed %d", got, attemptsSeed)
+	}
+}
+
+type refusedCountingDialer struct {
+	dials atomic.Uint64
+}
+
+func (d *refusedCountingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	d.dials.Add(1)
+	return nil, errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
+}
+

@@ -10,12 +10,14 @@ import (
 
 	"github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/carrier/tcptls"
+	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net.Conn, error) {
 	up, down := b.UpCarrier(), b.DownCarrier()
 	flowID := b.allocFlowID()
+	started := time.Now()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -38,8 +40,10 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 
 	tcpHalf, err := b.prepareTCPHalf(ctx, dest, tcpHeader)
 	if err != nil {
+		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, 0, 0, started, err)
 		return nil, fmt.Errorf("nowhere: prepare tcp half: %w", err)
 	}
+	tcpCarrierID := tcpHalf.CarrierID()
 	defer func() {
 		if tcpHalf != nil {
 			_ = tcpHalf.Close()
@@ -49,6 +53,7 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 	quicPrep, err := b.prepareQUICHalf(ctx)
 	if err != nil {
 		cancel()
+		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
 		return nil, fmt.Errorf("nowhere: prepare quic half: %w", err)
 	}
 	defer func() {
@@ -60,6 +65,7 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 	tcpConn, err := tcpHalf.Commit()
 	if err != nil {
 		cancel()
+		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
 		return nil, fmt.Errorf("nowhere: commit tcp half: %w", err)
 	}
 	tcpHalf = nil
@@ -68,6 +74,7 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 	if err != nil {
 		cancel()
 		_ = tcpConn.Close()
+		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
 		return nil, fmt.Errorf("nowhere: commit quic half: %w", err)
 	}
 	quicPrep = nil
@@ -78,6 +85,8 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 	} else {
 		openConn, attachConn = quicConn, tcpConn
 	}
+	upCarrierID, downCarrierID := asymmetricCarrierIDs(up, down, tcpIsOpen, tcpCarrierID)
+	b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, upCarrierID, downCarrierID, started, nil)
 	return &splicedConn{
 		reader: attachConn,
 		writer: openConn,
@@ -85,6 +94,67 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 		remote: openConn.RemoteAddr(),
 		local:  openConn.LocalAddr(),
 	}, nil
+}
+
+func asymmetricCarrierIDs(up, down wire.Carrier, tcpIsOpen bool, tcpCarrierID uint64) (upID, downID uint64) {
+	if up == wire.CarrierTCP {
+		upID = tcpCarrierID
+	}
+	if down == wire.CarrierTCP {
+		downID = tcpCarrierID
+	}
+	_ = tcpIsOpen
+	return upID, downID
+}
+
+func (b *CarrierBundle) emitAsymmetric(
+	ctx context.Context,
+	code string,
+	flowID uint64,
+	dest string,
+	up, down wire.Carrier,
+	upCarrierID, downCarrierID uint64,
+	started time.Time,
+	err error,
+) {
+	observer := b.cfg.tcp.Observer()
+	if observer == nil {
+		return
+	}
+	result := diagnostic.ResultOK
+	errorClass := ""
+	level := diagnostic.LevelDebug
+	if err != nil {
+		result, errorClass = diagnostic.ClassifyClose(err)
+		if result == diagnostic.ResultOK {
+			result = diagnostic.ResultFailed
+		}
+		level = diagnostic.LevelWarn
+	}
+	diagnostic.Emit(ctx, observer, diagnostic.Event{
+		Level:             level,
+		Code:              code,
+		Component:         "bundle",
+		Target:            dest,
+		FlowID:            flowID,
+		UplinkTransport:   carrierTransportName(up),
+		DownlinkTransport: carrierTransportName(down),
+		UplinkCarrierID:   upCarrierID,
+		DownlinkCarrierID: downCarrierID,
+		Result:            result,
+		ErrorClass:        errorClass,
+		Duration:          time.Since(started),
+		Err:               err,
+	})
+}
+
+func carrierTransportName(c wire.Carrier) string {
+	switch c {
+	case wire.CarrierUDP:
+		return "quic"
+	default:
+		return "tcp"
+	}
 }
 
 func (b *CarrierBundle) prepareTCPHalf(ctx context.Context, dest string, header wire.FlowHeader) (*tcptls.PreparedFlowHalf, error) {

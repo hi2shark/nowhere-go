@@ -19,12 +19,36 @@ const (
 	LevelError
 )
 
+// Well-known Result values.
+const (
+	ResultOK       = "ok"
+	ResultCanceled = "canceled"
+	ResultTimeout  = "timeout"
+	ResultFailed   = "failed"
+)
+
+// Well-known ErrorClass values.
+const (
+	ErrorClassRemoteClose = "remote_close"
+	ErrorClassLocalCancel = "local_cancel"
+	ErrorClassNetwork     = "network"
+	ErrorClassProtocol    = "protocol"
+	ErrorClassProbeClose  = "probe_close"
+)
+
+// Well-known Carrier values.
+const (
+	CarrierTCPTLS = "tcp_tls"
+	CarrierQUIC   = "quic"
+)
+
 // Event is a structured diagnostic emitted by the protocol core.
 // Zero-valued fields are omitted by host adapters.
 type Event struct {
 	Level     Level
-	Code      string
-	Component string
+	Code      string // event name, e.g. flow_open / pair_timeout
+	Component string // server | tcptls | quic | ...
+	Carrier   string // tcp_tls | quic
 	Source    net.Addr
 	Target    string
 	SessionID wire.SessionID
@@ -32,22 +56,34 @@ type Event struct {
 	CarrierID uint64
 	State     string
 	Outcome   string
+	Result    string // ok | canceled | timeout | failed
+	ErrorClass string
 	Count     int
 	Bytes     uint64
 	Duration  time.Duration
 	Err       error
 
 	// Half / pair correlation fields (asymmetric flows).
-	HalfRole      string // "open" | "attach"
-	Transport     string // "tcp" | "quic" | "udp"
-	Stage         string // prepare | commit | pair_wait | ...
-	MissingHalf   string // complementary role when waiting/timeout
-	ContextCause  string // context cancel cause / timeout reason
-	DialQueueMs   int64
-	RawDialMs     int64
-	TLSms         int64
-	AuthMs        int64
-	PairWaitMs    int64
+	HalfRole           string // open | attach (received role)
+	MissingHalf        string
+	Transport          string // received transport tcp|quic|udp
+	ExpectedTransport  string
+	ReceivedHalf       string // alias clarity for pair diagnostics
+	UplinkCarrierID    uint64
+	DownlinkCarrierID  uint64
+	UplinkTransport    string
+	DownlinkTransport  string
+	Stage              string
+	ContextCause       string
+	CloseReason        string
+	DialQueueMs        int64
+	RawDialMs          int64
+	TLSms              int64
+	AuthMs             int64
+	PairWaitMs         int64
+	FirstByteMs        int64
+	RxBytes            uint64
+	TxBytes            uint64
 }
 
 // Observer receives diagnostic events. Implementations must return promptly.

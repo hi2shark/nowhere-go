@@ -282,32 +282,74 @@ func (m *flowPairManager) emitPair(ctx context.Context, pending *pendingFlow, co
 		return
 	}
 	level := diagnostic.LevelDebug
+	result := diagnostic.ResultOK
 	switch code {
 	case "pair_timeout":
 		level = diagnostic.LevelWarn
+		result = diagnostic.ResultTimeout
 	case "pair_cancel":
 		level = diagnostic.LevelInfo
+		result = diagnostic.ResultCanceled
+	case "pair_wait":
+		result = ""
 	}
 	cause := ""
+	errorClass := ""
 	if err != nil {
 		cause = err.Error()
+		_, errorClass = diagnostic.ClassifyClose(err)
+		if code == "pair_timeout" {
+			errorClass = diagnostic.ErrorClassNetwork
+		}
 	}
+	expected := complementaryTransport(pending.meta, pending.role, pending.transport)
 	diagnostic.Emit(ctx, m.observer, diagnostic.Event{
-		Level:        level,
-		Code:         code,
-		Component:    "server",
-		Source:       pending.source,
-		Target:       pending.meta.target,
-		SessionID:    pending.sessionID,
-		FlowID:       pending.flowID,
-		HalfRole:     flowRoleName(pending.role),
-		Transport:    pending.transport,
-		Stage:        code,
-		MissingHalf:  complementaryRoleName(pending.role),
-		PairWaitMs:   time.Since(pending.started).Milliseconds(),
-		ContextCause: cause,
-		Err:          err,
+		Level:             level,
+		Code:              code,
+		Component:         "server",
+		Carrier:           mapPairCarrier(pending.transport),
+		Source:            pending.source,
+		Target:            pending.meta.target,
+		SessionID:         pending.sessionID,
+		FlowID:            pending.flowID,
+		HalfRole:          flowRoleName(pending.role),
+		ReceivedHalf:      flowRoleName(pending.role),
+		Transport:         pending.transport,
+		ExpectedTransport: expected,
+		Stage:             code,
+		MissingHalf:       complementaryRoleName(pending.role),
+		PairWaitMs:        time.Since(pending.started).Milliseconds(),
+		ContextCause:      cause,
+		Result:            result,
+		ErrorClass:        errorClass,
+		Err:               err,
 	})
+}
+
+func mapPairCarrier(transport string) string {
+	switch transport {
+	case "quic", "udp":
+		return diagnostic.CarrierQUIC
+	default:
+		return diagnostic.CarrierTCPTLS
+	}
+}
+
+func complementaryTransport(meta pairMetadata, role wire.FlowRole, received string) string {
+	// Missing half uses the complementary matrix carrier.
+	wantCarrier := meta.down
+	if role == wire.FlowRoleAttach {
+		wantCarrier = meta.up
+	}
+	switch wantCarrier {
+	case wire.CarrierUDP:
+		if received == "tcp" {
+			return "quic"
+		}
+		return "udp"
+	default:
+		return "tcp"
+	}
 }
 
 func flowRoleName(role wire.FlowRole) string {

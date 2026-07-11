@@ -187,6 +187,9 @@ func TestFlowPairManagerEmitsPairDiagnostics(t *testing.T) {
 			if event.HalfRole != "open" || event.MissingHalf != "attach" || event.Transport != "tcp" {
 				t.Errorf("pair_timeout fields role=%s missing=%s transport=%s", event.HalfRole, event.MissingHalf, event.Transport)
 			}
+			if event.ReceivedHalf != "open" || event.ExpectedTransport == "" {
+				t.Errorf("pair_timeout received_half=%s expected_transport=%s", event.ReceivedHalf, event.ExpectedTransport)
+			}
 		}
 	}))
 

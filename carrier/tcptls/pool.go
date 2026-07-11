@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/dialgate"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
@@ -54,6 +55,7 @@ type TCPPool struct {
 	cfg       *Config
 	target    int
 	dialSlots chan struct{}
+	dialGate  *dialgate.Gate
 	mu        sync.Mutex
 	idle      []*warmConn
 	preparing int
@@ -81,6 +83,10 @@ func NewTCPPool(cfg *Config, target int) *TCPPool {
 		cfg:       cfg,
 		target:    target,
 		dialSlots: make(chan struct{}, maxDials),
+		dialGate: dialgate.New(dialgate.Options{
+			Initial: cfg.DialBackoffInitial(),
+			Max:     cfg.DialBackoffMax(),
+		}),
 	}
 }
 
@@ -330,12 +336,36 @@ func (p *TCPPool) tryAcquireDialSlot() (func(), bool) {
 }
 
 func (p *TCPPool) openFresh(ctx context.Context, flowID uint64, dest string, mode TCPRelayMode, outcome string) (net.Conn, error) {
-	release, err := p.acquireDialSlot(ctx)
-	if err != nil {
-		return nil, err
+	var conn net.Conn
+	err := p.runPortalDial(ctx, func(ctx context.Context) error {
+		release, err := p.acquireDialSlot(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		c, err := openFresh(ctx, p.cfg, flowID, dest, mode, outcome)
+		if err != nil {
+			return err
+		}
+		conn = c
+		return nil
+	})
+	return conn, err
+}
+
+// DialAttempts returns portal establish attempts observed by the dial gate (tests).
+func (p *TCPPool) DialAttempts() uint64 {
+	if p == nil || p.dialGate == nil {
+		return 0
 	}
-	defer release()
-	return openFresh(ctx, p.cfg, flowID, dest, mode, outcome)
+	return p.dialGate.Attempts()
+}
+
+func (p *TCPPool) runPortalDial(ctx context.Context, fn func(context.Context) error) error {
+	if p == nil || p.dialGate == nil {
+		return fn(ctx)
+	}
+	return p.dialGate.Run(ctx, fn)
 }
 
 func logPoolAcquire(cfg *Config, outcome string, flowID uint64, carrierID uint64, snapshot poolSnapshot, start time.Time) {

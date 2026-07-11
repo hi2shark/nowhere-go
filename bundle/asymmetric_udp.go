@@ -65,6 +65,7 @@ func (b *CarrierBundle) openTCPUDP(
 	quicSession carrier.QuicSession,
 	quicFlow carrier.QuicUDPFlow,
 ) (net.PacketConn, error) {
+	started := time.Now()
 	pool, err := b.tcpPool()
 	if err != nil {
 		b.releaseQUICFlow(quicSession, quicFlow)
@@ -78,8 +79,10 @@ func (b *CarrierBundle) openTCPUDP(
 	tcpHalf, err := pool.PrepareUDPFlowHalf(ctx, dest, openHeader)
 	if err != nil {
 		b.releaseQUICFlow(quicSession, quicFlow)
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, 0, started, err)
 		return nil, err
 	}
+	tcpCarrierID := tcpHalf.CarrierID()
 	defer func() {
 		if tcpHalf != nil {
 			_ = tcpHalf.Close()
@@ -89,12 +92,14 @@ func (b *CarrierBundle) openTCPUDP(
 	client := b.quicClientSync()
 	if client == nil {
 		b.releaseQUICFlow(quicSession, quicFlow)
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, errors.New("nowhere: udp downlink carrier unavailable"))
 		return nil, errors.New("nowhere: udp downlink carrier unavailable")
 	}
 	quicPrep, err := client.PrepareFlowStream(ctx)
 	if err != nil {
 		cancel()
 		b.releaseQUICFlow(quicSession, quicFlow)
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
 		return nil, err
 	}
 	defer func() {
@@ -107,6 +112,7 @@ func (b *CarrierBundle) openTCPUDP(
 	if err != nil {
 		cancel()
 		b.releaseQUICFlow(quicSession, quicFlow)
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
 		return nil, fmt.Errorf("nowhere: commit tcp open half: %w", err)
 	}
 	tcpHalf = nil
@@ -117,10 +123,12 @@ func (b *CarrierBundle) openTCPUDP(
 		cancel()
 		_ = tcpConn.Close()
 		b.releaseQUICFlow(quicSession, quicFlow)
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
 		return nil, fmt.Errorf("nowhere: commit quic attach half: %w", err)
 	}
 	quicPrep = nil
 
+	b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, nil)
 	return &asymmetricPacketConn{
 		dest:     dest,
 		uplink:   &uotLaneUplink{raw: tcpConn},

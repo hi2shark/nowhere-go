@@ -156,7 +156,7 @@ func (h *Handler) handleTCPConn(ctx context.Context, conn *ownedConn, source net
 		h.waitAuthFailure(ctx, deadline)
 		conn.closeWithError(err)
 		h.emit(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
-		return err
+		return report(err)
 	}
 	if releaseAdmission != nil {
 		releaseAdmission()
@@ -169,6 +169,7 @@ func (h *Handler) handleTCPConn(ctx context.Context, conn *ownedConn, source net
 		conn.closeWithError(err)
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
 			h.emit(ctx, diagnostic.LevelError, "request_read_failed", source, "", sessionID, 0, err)
+			return report(err)
 		}
 		return err
 	}
@@ -296,7 +297,7 @@ func (h *Handler) routeStream(ctx context.Context, conn net.Conn, source net.Add
 	if err := h.upstream.HandleStream(ctx, conn, source, target); err != nil {
 		closeConnWithError(conn, err)
 		h.emit(ctx, diagnostic.LevelError, "upstream_stream_failed", source, target, wire.SessionID{}, 0, err)
-		return err
+		return report(err)
 	}
 	return nil
 }
@@ -312,7 +313,7 @@ func (h *Handler) routePacket(ctx context.Context, pc net.PacketConn, source net
 	if err := h.upstream.HandlePacket(ctx, pc, source, target); err != nil {
 		closePacketConnWithError(pc, err)
 		h.emit(ctx, diagnostic.LevelError, "upstream_packet_failed", source, target, wire.SessionID{}, 0, err)
-		return err
+		return report(err)
 	}
 	return nil
 }
@@ -351,9 +352,14 @@ func (h *Handler) waitAuthFailure(ctx context.Context, deadline time.Time) {
 }
 
 func (h *Handler) emit(ctx context.Context, level diagnostic.Level, code string, source net.Addr, target string, sessionID wire.SessionID, flowID uint64, err error) {
+	result, class := "", ""
+	if err != nil {
+		result, class = diagnostic.ClassifyClose(err)
+	}
 	diagnostic.Emit(ctx, h.observer, diagnostic.Event{
-		Level: level, Code: code, Component: "server", Source: source,
-		Target: target, SessionID: sessionID, FlowID: flowID, Err: err,
+		Level: level, Code: code, Component: "server", Carrier: diagnostic.CarrierTCPTLS,
+		Source: source, Target: target, SessionID: sessionID, FlowID: flowID,
+		Result: result, ErrorClass: class, Err: err,
 	})
 }
 
