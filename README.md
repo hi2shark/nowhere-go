@@ -204,10 +204,23 @@ On success the Upstream owns the wrapped connection lifecycle. Closing the wrapp
 | Inbound Handler + pairing + UoT | Router / firewall / detour |
 | QUIC *interfaces* | QUIC *implementations* |
 
-Local development against a monorepo checkout:
+Local development against a monorepo checkout: use a **gitignored**
+`go.work` at the workspace root (do **not** put `replace` in host `go.mod`):
 
-```go
-replace github.com/hi2shark/nowhere-go => ../nowhere-go
+```bash
+# from mihomo-nowhere/
+go work init ./nowhere-go ./sing-box ./sing-box/test ./mihomo ./mihomo/test
+# or: go work use ./nowhere-go ./sing-box ...
+```
+
+Host `go.mod` keeps only the published version, e.g.
+`require github.com/hi2shark/nowhere-go v0.3.0-rc.3`. Push/CI resolve that
+module; local edits to `nowhere-go/` are picked up via `go.work`.
+
+Temporarily ignore the workspace:
+
+```bash
+GOWORK=off go test ./...
 ```
 
 ---
