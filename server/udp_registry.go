@@ -175,14 +175,6 @@ func (s *portalSession) detachLegacyFlow(key legacyUDPKey, flow *legacyUDPFlow) 
 	return true
 }
 
-func (s *portalSession) getFlow(flowID uint64) *compactUDPFlow {
-	entry := s.getCompactEntry(flowID)
-	if entry == nil {
-		return nil
-	}
-	return entry.symmetric
-}
-
 func (s *portalSession) putFlow(flowID uint64, flow *compactUDPFlow) bool {
 	if flow == nil || flowID != flow.flowID {
 		return false
