@@ -6,36 +6,82 @@ import (
 	"time"
 )
 
-type deadlineSignal struct {
-	mu    sync.Mutex
-	timer *time.Timer
-	ch    chan struct{}
+type deadlineState struct {
+	mu      sync.Mutex
+	value   time.Time
+	changed chan struct{}
 }
 
-func (d *deadlineSignal) set(deadline time.Time) {
+type deadlineReadWait struct {
+	state   *deadlineState
+	changed <-chan struct{}
+	timer   *time.Timer
+	timerC  <-chan time.Time
+}
+
+func (d *deadlineState) set(value time.Time) {
 	d.mu.Lock()
-	if d.timer != nil {
-		d.timer.Stop()
-		d.timer = nil
+	if d.changed == nil {
+		d.changed = make(chan struct{})
 	}
-	d.ch = nil
-	if !deadline.IsZero() {
-		d.ch = make(chan struct{})
-		delay := time.Until(deadline)
-		if delay <= 0 {
-			close(d.ch)
-		} else {
-			ch := d.ch
-			d.timer = time.AfterFunc(delay, func() { close(ch) })
-		}
-	}
+	previous := d.changed
+	d.value = value
+	d.changed = make(chan struct{})
+	close(previous)
 	d.mu.Unlock()
 }
 
-func (d *deadlineSignal) wait() <-chan struct{} {
+func (d *deadlineState) snapshot() (time.Time, <-chan struct{}) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.ch
+	if d.changed == nil {
+		d.changed = make(chan struct{})
+	}
+	return d.value, d.changed
+}
+
+func (d *deadlineState) expired(now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return deadlineExpired(d.value, now)
+}
+
+func (d *deadlineState) newReadWait(now time.Time) (deadlineReadWait, bool) {
+	value, changed := d.snapshot()
+	wait := deadlineReadWait{state: d, changed: changed}
+	if deadlineExpired(value, now) {
+		return wait, true
+	}
+	if !value.IsZero() {
+		wait.timer = time.NewTimer(value.Sub(now))
+		wait.timerC = wait.timer.C
+	}
+	return wait, false
+}
+
+func (d *deadlineState) generationExpired(generation <-chan struct{}, now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.changed == generation && deadlineExpired(d.value, now)
+}
+
+func (w deadlineReadWait) stop() {
+	if w.timer == nil {
+		return
+	}
+	// The read goroutine is the timer's only receiver, and stop is called only
+	// after select chose a non-timer case, so a failed Go 1.20 Stop must be drained.
+	if !w.timer.Stop() {
+		<-w.timer.C
+	}
+}
+
+func (w deadlineReadWait) timerExpired(now time.Time) bool {
+	return w.state.generationExpired(w.changed, now)
+}
+
+func deadlineExpired(value, now time.Time) bool {
+	return !value.IsZero() && !now.Before(value)
 }
 
 func deadlineError() error { return os.ErrDeadlineExceeded }

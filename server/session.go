@@ -97,20 +97,18 @@ type portalSession struct {
 	cancel context.CancelFunc
 
 	mu          sync.Mutex
-	flows       map[uint64]*compactUDPFlow
-	asymUplinks map[uint64]*quicUDPUplink
+	udp         udpRegistryState
 	queuedBytes int
 	closed      bool
 }
 
 func newPortalSession(id wire.SessionID, conn QuicConn, handler *Handler, source net.Addr) *portalSession {
 	return &portalSession{
-		ID:          id,
-		Conn:        conn,
-		Handler:     handler,
-		Source:      source,
-		flows:       make(map[uint64]*compactUDPFlow),
-		asymUplinks: make(map[uint64]*quicUDPUplink),
+		ID:      id,
+		Conn:    conn,
+		Handler: handler,
+		Source:  source,
+		udp:     newUDPRegistryState(),
 	}
 }
 
@@ -121,84 +119,43 @@ func (s *portalSession) Close() {
 		return
 	}
 	s.closed = true
-	flows := s.flows
-	s.flows = nil
-	uplinks := s.asymUplinks
-	s.asymUplinks = nil
+	compact := s.udp.compact
+	legacy := s.udp.legacy
+	s.udp.compact = nil
+	s.udp.legacy = nil
+	s.udp.activeFlows = 0
 	cancel := s.cancel
 	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	for _, f := range flows {
-		f.shutdown(net.ErrClosed)
-	}
-	for _, uplink := range uplinks {
-		_ = uplink.Close()
+
+	for _, entry := range compact {
+		if entry.lease != nil {
+			entry.lease.Abort(entry.generation)
+		}
 	}
 	if s.Conn != nil {
 		_ = s.Conn.CloseWithError(uint64(wire.CloseErrCodeOK), "")
+	}
+	if cancel != nil {
+		cancel()
+	}
+	for _, entry := range compact {
+		if entry.symmetric != nil {
+			entry.symmetric.shutdown(net.ErrClosed)
+		}
+		if entry.pair != nil && s.Handler != nil && s.Handler.pairing != nil {
+			s.Handler.pairing.finishUDP(entry.pair, net.ErrClosed)
+		}
+	}
+	for _, flow := range legacy {
+		flow.shutdown(net.ErrClosed)
+	}
+	if s.Handler != nil && s.Handler.pairing != nil {
+		s.Handler.pairing.cancelUDPSession(s.ID, net.ErrClosed)
 	}
 }
 
 func (s *portalSession) SendDatagram(b []byte) error {
 	return s.Conn.SendDatagram(b)
-}
-
-func (s *portalSession) getFlow(id uint64) *compactUDPFlow {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.flows[id]
-}
-
-func (s *portalSession) putFlow(id uint64, flow *compactUDPFlow) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return false
-	}
-	if _, exists := s.flows[id]; exists {
-		return false
-	}
-	if len(s.flows)+len(s.asymUplinks) >= s.Handler.config.limits.QUICFlowsPerSession {
-		return false
-	}
-	s.flows[id] = flow
-	return true
-}
-
-func (s *portalSession) removeFlow(id uint64) {
-	s.mu.Lock()
-	delete(s.flows, id)
-	s.mu.Unlock()
-}
-
-func (s *portalSession) getAsymUplink(id uint64) *quicUDPUplink {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.asymUplinks[id]
-}
-
-func (s *portalSession) putAsymUplink(id uint64, up *quicUDPUplink) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed || len(s.flows)+len(s.asymUplinks) >= s.Handler.config.limits.QUICFlowsPerSession {
-		return false
-	}
-	if s.asymUplinks == nil {
-		s.asymUplinks = make(map[uint64]*quicUDPUplink)
-	}
-	if _, exists := s.asymUplinks[id]; exists {
-		return false
-	}
-	s.asymUplinks[id] = up
-	return true
-}
-
-func (s *portalSession) removeAsymUplink(id uint64) {
-	s.mu.Lock()
-	delete(s.asymUplinks, id)
-	s.mu.Unlock()
 }
 
 func (s *portalSession) reserveQueueBytes(count int) bool {
@@ -232,6 +189,15 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 		return fmt.Errorf("%w: nil quic connection", ErrInvalidHandler)
 	}
 	source := conn.RemoteAddr()
+	guard, ok := h.admission.tryAcquire(source)
+	if !ok {
+		_ = conn.CloseWithError(uint64(wire.CloseErrCodeOK), "")
+		h.emitAdmissionLimited(parent, source)
+		return report(ErrAdmissionLimit)
+	}
+	releaseAdmission := guard.Release
+	defer releaseAdmission()
+
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -241,6 +207,7 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 		h.emit(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
 		return err
 	}
+	releaseAdmission()
 	session.cancel = cancel
 	if err := h.sessions.Register(session); err != nil {
 		_ = conn.CloseWithError(1, "access denied")
@@ -429,312 +396,6 @@ func (s *portalSession) handleAsymmetricStream(ctx context.Context, conn net.Con
 		_ = conn.Close()
 	}
 }
-
-func (s *portalSession) datagramLoop(ctx context.Context, pending [][]byte) {
-	for _, data := range pending {
-		s.handleDatagram(ctx, data)
-	}
-	for {
-		data, err := s.Conn.ReceiveDatagram(ctx)
-		if err != nil {
-			return
-		}
-		s.handleDatagram(ctx, data)
-	}
-}
-
-func (s *portalSession) handleDatagram(ctx context.Context, data []byte) {
-	if len(data) >= 2 && data[1] >= wire.UDPTypeOpenData && data[1] <= wire.UDPTypeCompactClose {
-		s.handleCompact(ctx, data)
-	}
-}
-
-func (s *portalSession) handleCompact(ctx context.Context, data []byte) {
-	frame, err := wire.DecodeUDPCompact(data)
-	if err != nil {
-		return
-	}
-	switch frame.Type {
-	case wire.UDPTypeOpenData:
-		s.handleOpenData(ctx, frame)
-	case wire.UDPTypeData:
-		if flow := s.getFlow(frame.FlowID); flow != nil {
-			flow.deliver(frame.Payload)
-		} else if up := s.getAsymUplink(frame.FlowID); up != nil {
-			up.Deliver(frame.Payload)
-		} else {
-			s.rejectFlow(frame.FlowID)
-		}
-	case wire.UDPTypeCompactClose:
-		if flow := s.getFlow(frame.FlowID); flow != nil {
-			flow.shutdown(io.EOF)
-		}
-	}
-}
-
-func (s *portalSession) handleOpenData(ctx context.Context, frame wire.CompactUDPFrame) {
-	if existing := s.getFlow(frame.FlowID); existing != nil {
-		if existing.target == frame.Target && existing.downlink == frame.Downlink {
-			existing.deliver(frame.Payload)
-			if existing.isAcked() {
-				existing.sendAck()
-			}
-			return
-		}
-		s.rejectFlow(frame.FlowID)
-		return
-	}
-	if up := s.getAsymUplink(frame.FlowID); up != nil {
-		up.Deliver(frame.Payload)
-		return
-	}
-
-	if frame.Downlink == wire.CarrierUDP {
-		flow := newCompactUDPFlow(s, frame.FlowID, frame.Target, frame.Downlink)
-		if !s.putFlow(frame.FlowID, flow) {
-			s.rejectFlow(frame.FlowID)
-			return
-		}
-		flow.deliver(frame.Payload)
-		flow.routedOnce.Do(func() {
-			flow.sendAck()
-			flowCtx := ContextWithCloseHandler(ctx, flow.shutdown)
-			go func() { _ = s.Handler.routePacket(flowCtx, flow, s.Source, frame.Target) }()
-		})
-		return
-	}
-
-	uplink := newQUICUDPUplink(s)
-	uplink.onClose = func() { s.removeAsymUplink(frame.FlowID) }
-	uplink.Deliver(frame.Payload)
-	if !s.putAsymUplink(frame.FlowID, uplink) {
-		_ = uplink.Close()
-		s.rejectFlow(frame.FlowID)
-		return
-	}
-	ack := newQUICCompactAck(s.SendDatagram, nil)
-	header := wire.FlowHeader{
-		Role:     wire.FlowRoleOpen,
-		FlowID:   frame.FlowID,
-		Kind:     wire.FlowKindUDP,
-		Uplink:   wire.CarrierUDP,
-		Downlink: frame.Downlink,
-	}
-	half := udpHalf{
-		Role:       wire.FlowRoleOpen,
-		Uplink:     uplink,
-		compactAck: ack,
-	}
-	go func() {
-		_ = s.Handler.submitAndRouteUDP(ctx, s.Source, s.ID, header, frame.Target, half)
-	}()
-}
-
-func (s *portalSession) rejectFlow(flowID uint64) {
-	if flow := s.getFlow(flowID); flow != nil {
-		flow.shutdown(errors.New("nowhere: compact flow rejected"))
-	}
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeCompactClose, flowID, nil)
-	if err == nil {
-		_ = s.SendDatagram(frame)
-	}
-}
-
-// --- compact UDP flow as net.PacketConn ---
-
-type compactUDPFlow struct {
-	session    *portalSession
-	flowID     uint64
-	target     string
-	downlink   wire.Carrier
-	dest       net.Addr
-	waiter     chan []byte
-	done       chan struct{}
-	acked      bool
-	mu         sync.Mutex
-	closed     bool
-	closeErr   error
-	closeOnce  sync.Once
-	routedOnce sync.Once
-	readDL     deadlineSignal
-	writeDL    deadlineSignal
-	idle       *time.Timer
-}
-
-func newCompactUDPFlow(session *portalSession, flowID uint64, target string, downlink wire.Carrier) *compactUDPFlow {
-	flow := &compactUDPFlow{
-		session:  session,
-		flowID:   flowID,
-		target:   target,
-		downlink: downlink,
-		dest:     parseTargetAddr(target),
-		waiter:   make(chan []byte, session.Handler.config.limits.QUICQueuePackets),
-		done:     make(chan struct{}),
-	}
-	flow.resetIdle()
-	return flow
-}
-
-func (f *compactUDPFlow) deliver(payload []byte) {
-	if !f.session.reserveQueueBytes(len(payload)) {
-		return
-	}
-	f.mu.Lock()
-	if f.closed {
-		f.mu.Unlock()
-		f.session.releaseQueueBytes(len(payload))
-		return
-	}
-	cp := make([]byte, len(payload))
-	copy(cp, payload)
-	select {
-	case f.waiter <- cp:
-		f.mu.Unlock()
-		f.resetIdle()
-	default:
-		f.mu.Unlock()
-		f.session.releaseQueueBytes(len(cp))
-	}
-}
-
-func (f *compactUDPFlow) markAcked() {
-	f.mu.Lock()
-	f.acked = true
-	f.mu.Unlock()
-}
-
-func (f *compactUDPFlow) isAcked() bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.acked
-}
-
-func (f *compactUDPFlow) shutdown(err error) {
-	f.closeOnce.Do(func() {
-		f.mu.Lock()
-		f.closed = true
-		f.closeErr = err
-		if f.idle != nil {
-			f.idle.Stop()
-		}
-		f.mu.Unlock()
-		close(f.done)
-		for {
-			select {
-			case payload := <-f.waiter:
-				f.session.releaseQueueBytes(len(payload))
-			default:
-				f.session.removeFlow(f.flowID)
-				return
-			}
-		}
-	})
-}
-
-func (f *compactUDPFlow) sendAck() {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeOpenAck, f.flowID, nil)
-	if err != nil {
-		return
-	}
-	if err := f.session.SendDatagram(frame); err == nil {
-		f.markAcked()
-	}
-}
-
-func (f *compactUDPFlow) sendClose() {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeCompactClose, f.flowID, nil)
-	if err == nil {
-		_ = f.session.SendDatagram(frame)
-	}
-}
-
-func (f *compactUDPFlow) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	select {
-	case payload := <-f.waiter:
-		f.session.releaseQueueBytes(len(payload))
-		f.resetIdle()
-		n = copy(p, payload)
-		return n, f.dest, nil
-	case <-f.done:
-		return 0, nil, f.err()
-	case <-f.readDL.wait():
-		return 0, nil, deadlineError()
-	}
-}
-
-func (f *compactUDPFlow) WriteTo(p []byte, _ net.Addr) (n int, err error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	select {
-	case <-f.done:
-		return 0, f.err()
-	case <-f.writeDL.wait():
-		return 0, deadlineError()
-	default:
-	}
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeData, f.flowID, p)
-	if err != nil {
-		return 0, err
-	}
-	if err := f.session.SendDatagram(frame); err != nil {
-		return 0, err
-	}
-	f.resetIdle()
-	return len(p), nil
-}
-
-func (f *compactUDPFlow) Close() error {
-	f.sendClose()
-	f.shutdown(net.ErrClosed)
-	return nil
-}
-
-func (f *compactUDPFlow) LocalAddr() net.Addr {
-	if s := f.session; s != nil && s.Conn != nil {
-		return s.Conn.LocalAddr()
-	}
-	return &net.UDPAddr{}
-}
-
-func (f *compactUDPFlow) SetDeadline(value time.Time) error {
-	f.readDL.set(value)
-	f.writeDL.set(value)
-	return nil
-}
-func (f *compactUDPFlow) SetReadDeadline(value time.Time) error {
-	f.readDL.set(value)
-	return nil
-}
-func (f *compactUDPFlow) SetWriteDeadline(value time.Time) error {
-	f.writeDL.set(value)
-	return nil
-}
-
-func (f *compactUDPFlow) resetIdle() {
-	f.mu.Lock()
-	if f.closed {
-		f.mu.Unlock()
-		return
-	}
-	if f.idle != nil {
-		f.idle.Stop()
-	}
-	timeout := f.session.Handler.config.timeouts.UDPIdle
-	f.idle = time.AfterFunc(timeout, func() { f.shutdown(context.DeadlineExceeded) })
-	f.mu.Unlock()
-}
-
-func (f *compactUDPFlow) err() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closeErr != nil {
-		return f.closeErr
-	}
-	return io.EOF
-}
-
-var _ net.PacketConn = (*compactUDPFlow)(nil)
 
 // --- stream helpers ---
 

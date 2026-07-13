@@ -45,7 +45,6 @@ type pendingFlow struct {
 	role      wire.FlowRole
 	transport string
 	tcp       net.Conn
-	udp       udpHalf
 	timer     *time.Timer
 	done      chan struct{}
 	state     pairState
@@ -63,6 +62,8 @@ type flowPairManager struct {
 
 	mu            sync.Mutex
 	pending       map[pairKey]*pendingFlow
+	udpRecords    map[pairKey]*udpPairRecord
+	udpWaiting    int
 	perSession    map[wire.SessionID]int
 	maxPerSession int
 	maxGlobal     int
@@ -77,6 +78,7 @@ func newFlowPairManager(timeout time.Duration) *flowPairManager {
 	return &flowPairManager{
 		timeout:       timeout,
 		pending:       make(map[pairKey]*pendingFlow),
+		udpRecords:    make(map[pairKey]*udpPairRecord),
 		perSession:    make(map[wire.SessionID]int),
 		maxPerSession: DefaultPendingPairsPerSession,
 		maxGlobal:     DefaultPendingPairsGlobal,
@@ -117,11 +119,27 @@ func (m *flowPairManager) Close() {
 		pending = append(pending, half)
 		delete(m.pending, key)
 	}
+	type udpClosure struct {
+		action  udpPairCloseAction
+		pending *pendingFlow
+	}
+	udpClosures := make([]udpClosure, 0, len(m.udpRecords))
+	for key, record := range m.udpRecords {
+		action, waiting := m.finishUDPRecordLocked(&udpPairHandle{manager: m, key: key, record: record}, ErrClosed)
+		if waiting != nil {
+			udpClosures = append(udpClosures, udpClosure{action: action, pending: waiting})
+		}
+	}
+	m.udpWaiting = 0
 	m.perSession = make(map[wire.SessionID]int)
 	m.mu.Unlock()
 	for _, half := range pending {
 		m.emitPair(context.Background(), half, "pair_cancel", ErrClosed)
 		closePendingFlowWithError(half, ErrClosed)
+	}
+	for _, closure := range udpClosures {
+		m.emitPair(context.Background(), closure.pending, "pair_cancel", ErrClosed)
+		closure.action.close(ErrClosed)
 	}
 }
 
@@ -172,6 +190,17 @@ func (m *flowPairManager) submit(ctx context.Context, key pairKey, current *pend
 		m.mu.Unlock()
 		return nil, ErrClosed
 	}
+	if record := m.udpRecords[key]; record != nil {
+		err := fmt.Errorf("%w: flow=%d", ErrCarrierMismatch, key.flowID)
+		action, waiting := m.finishUDPRecordLocked(&udpPairHandle{manager: m, key: key, record: record}, err)
+		m.mu.Unlock()
+		if waiting != nil {
+			m.emitPair(ctx, waiting, "pair_cancel", err)
+		}
+		action.close(err)
+		closePendingFlowWithError(current, err)
+		return nil, err
+	}
 	if existing, ok := m.pending[key]; ok {
 		if !existing.meta.equal(current.meta) {
 			err := fmt.Errorf("%w: flow=%d", ErrCarrierMismatch, key.flowID)
@@ -197,7 +226,7 @@ func (m *flowPairManager) submit(ctx context.Context, key pairKey, current *pend
 		m.emitPairSuccess(ctx, existing, current)
 		return existing, nil
 	}
-	if len(m.pending) >= m.maxGlobal || m.perSession[key.session] >= m.maxPerSession {
+	if len(m.pending)+m.udpWaiting >= m.maxGlobal || m.perSession[key.session] >= m.maxPerSession {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: session=%x", ErrPairLimit, key.session)
 	}
@@ -253,10 +282,10 @@ func (m *flowPairManager) timeoutFlow(key pairKey, pending *pendingFlow) {
 	err := fmt.Errorf("%w: flow=%d", ErrPairTimeout, key.flowID)
 	pending.state = pairFailed
 	pending.err = err
-	close(pending.done)
 	m.mu.Unlock()
 	m.emitPair(context.Background(), pending, "pair_timeout", err)
 	closePendingFlowWithError(pending, err)
+	close(pending.done)
 }
 
 func (m *flowPairManager) failExistingLocked(key pairKey, existing *pendingFlow, err error) {
@@ -431,7 +460,6 @@ func closePendingFlowWithError(pending *pendingFlow, err error) {
 	if pending.tcp != nil {
 		closeConnWithError(pending.tcp, err)
 	}
-	closeUDPHalfWithError(pending.udp, err)
 }
 
 type splicedConn struct {

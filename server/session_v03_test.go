@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"net"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -171,74 +168,3 @@ func TestPairGlobalLimit(t *testing.T) {
 		t.Fatalf("first pair close = %v, want ErrClosed", err)
 	}
 }
-
-type fakeQuicConn struct {
-	mu     sync.Mutex
-	stream QuicStream
-	closed atomic.Int32
-}
-
-func (c *fakeQuicConn) AcceptStream(ctx context.Context) (QuicStream, error) {
-	c.mu.Lock()
-	stream := c.stream
-	c.stream = nil
-	c.mu.Unlock()
-	if stream != nil {
-		return stream, nil
-	}
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
-func (c *fakeQuicConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-func (c *fakeQuicConn) SendDatagram([]byte) error { return nil }
-func (c *fakeQuicConn) CloseWithError(uint64, string) error {
-	c.closed.Add(1)
-	return nil
-}
-func (c *fakeQuicConn) Close() error {
-	c.closed.Add(1)
-	return nil
-}
-func (c *fakeQuicConn) Context() context.Context { return context.Background() }
-func (c *fakeQuicConn) LocalAddr() net.Addr      { return &net.UDPAddr{} }
-func (c *fakeQuicConn) RemoteAddr() net.Addr     { return &net.UDPAddr{} }
-
-type fakeQuicStream struct {
-	reader     *bytes.Reader
-	deadline   time.Time
-	missingFIN bool
-}
-
-func (s *fakeQuicStream) Read(buffer []byte) (int, error) {
-	n, err := s.reader.Read(buffer)
-	if n == 0 && errors.Is(err, io.EOF) && s.missingFIN {
-		if delay := time.Until(s.deadline); delay > 0 {
-			time.Sleep(delay)
-		}
-		return 0, deadlineError()
-	}
-	return n, err
-}
-func (s *fakeQuicStream) Write(buffer []byte) (int, error) { return len(buffer), nil }
-func (s *fakeQuicStream) Close() error                     { return nil }
-func (s *fakeQuicStream) SetDeadline(value time.Time) error {
-	s.deadline = value
-	return nil
-}
-func (s *fakeQuicStream) SetReadDeadline(value time.Time) error {
-	s.deadline = value
-	return nil
-}
-func (s *fakeQuicStream) SetWriteDeadline(time.Time) error { return nil }
-func (s *fakeQuicStream) CancelRead(uint64)                {}
-func (s *fakeQuicStream) CancelWrite(uint64)               {}
-
-var (
-	_ QuicConn   = (*fakeQuicConn)(nil)
-	_ QuicStream = (*fakeQuicStream)(nil)
-	_ io.Closer  = (*fakeQuicStream)(nil)
-)

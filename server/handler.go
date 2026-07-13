@@ -29,15 +29,15 @@ type HandlerOptions struct {
 
 // Handler authenticates carriers and hands decoded flows to Upstream.
 type Handler struct {
-	config     *Config
-	upstream   Upstream
-	observer   diagnostic.Observer
-	pairing    *flowPairManager
-	sessions   *sessionManager
-	admission  *unauthenticatedAdmission
-	handshake  *handshakeGate
-	now        func() time.Time
-	randRead   func([]byte) (int, error)
+	config    *Config
+	upstream  Upstream
+	observer  diagnostic.Observer
+	pairing   *flowPairManager
+	sessions  *sessionManager
+	admission *unauthenticatedAdmission
+	handshake *handshakeGate
+	now       func() time.Time
+	randRead  func([]byte) (int, error)
 
 	admissionLogMu   sync.Mutex
 	admissionLastLog time.Time
@@ -53,11 +53,11 @@ func NewHandler(options HandlerOptions) (*Handler, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidHandler, ErrUpstreamNotConfigured)
 	}
 	h := &Handler{
-		config:    options.Config,
-		upstream:  options.Upstream,
-		observer:  options.Observer,
-		pairing:   newFlowPairManager(options.Config.timeouts.FlowPair),
-		sessions:  newSessionManager(),
+		config:   options.Config,
+		upstream: options.Upstream,
+		observer: options.Observer,
+		pairing:  newFlowPairManager(options.Config.timeouts.FlowPair),
+		sessions: newSessionManager(),
 		admission: newUnauthenticatedAdmission(
 			options.Config.limits.MaxUnauthenticatedConnections,
 			options.Config.limits.MaxUnauthenticatedPerSource,
@@ -264,7 +264,7 @@ func (h *Handler) handleAsymmetricUDPStream(ctx context.Context, conn net.Conn, 
 }
 
 func (h *Handler) submitAndRouteUDP(ctx context.Context, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) error {
-	paired, err := h.pairing.SubmitUDPWithSource(ctx, sessionID, header, target, half, source, udpHalfTransport(header, half))
+	handle, paired, err := h.pairing.SubmitUDPWithSource(ctx, sessionID, header, target, half, source, udpHalfTransport(header, half))
 	if err != nil {
 		closeUDPHalfWithError(half, err)
 		return err
@@ -273,7 +273,15 @@ func (h *Handler) submitAndRouteUDP(ctx context.Context, source net.Addr, sessio
 		return nil
 	}
 	paired.IdleTimeout = h.config.timeouts.UDPIdle
-	return h.routePacket(ctx, newPairedUDPConn(paired), source, target)
+	conn := newPairedUDPConn(paired)
+	conn.setFinish(func(cause error) { h.pairing.finishUDP(handle, cause) })
+	if !h.pairing.bindUDP(handle, conn) {
+		if cause := handle.Err(); cause != nil {
+			return cause
+		}
+		return ErrClosed
+	}
+	return h.routePacket(ctx, conn, source, target)
 }
 
 func (h *Handler) handleStreamRequest(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, header *wire.FlowHeader, target string) error {
@@ -443,7 +451,7 @@ func closePacketConnWithError(pc net.PacketConn, err error) {
 		return
 	}
 	if compact, ok := pc.(*compactUDPFlow); ok {
-		compact.shutdown(err)
+		compact.closeWithError(err)
 		return
 	}
 	if pc != nil {
