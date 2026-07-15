@@ -392,20 +392,6 @@ func (s *portalSession) cancelPendingUDPControl(flowID uint64, pending *pendingU
 	s.mu.Unlock()
 }
 
-func (s *portalSession) takePendingUDPFrames(flowID uint64, pending *pendingUDPControl) []wire.UDPFrame {
-	if pending == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.pendingControls[flowID] != pending {
-		return nil
-	}
-	frames := pending.frames
-	s.removePendingControlLocked(flowID, pending)
-	return frames
-}
-
 func (s *portalSession) bufferPendingUDPData(frame wire.UDPFrame, size int) bool {
 	now := time.Now()
 	if s.Handler != nil && s.Handler.now != nil {
@@ -850,16 +836,6 @@ func (s *portalSession) handleNowu(ctx context.Context, data []byte) {
 	}
 }
 
-func (s *portalSession) rejectFlow(flowID uint64) {
-	if flow := s.getFlow(flowID); flow != nil {
-		flow.shutdown(errors.New("nowhere: flow rejected"))
-	}
-	frame, err := wire.EncodeUDPClose(flowID)
-	if err == nil {
-		_ = s.SendDatagram(frame)
-	}
-}
-
 // --- NOWU UDP flow as net.PacketConn ---
 
 type nowuFlow struct {
@@ -978,13 +954,6 @@ func (f *nowuFlow) shutdown(err error) {
 	})
 }
 
-func (f *nowuFlow) sendClose() {
-	frame, err := wire.EncodeUDPClose(f.flowID)
-	if err == nil {
-		_ = f.session.SendDatagram(frame)
-	}
-}
-
 func (f *nowuFlow) ReadPacket() ([]byte, error) {
 	select {
 	case packet := <-f.waiter:
@@ -1083,41 +1052,6 @@ func (f *nowuFlow) err() error {
 var _ net.PacketConn = (*nowuFlow)(nil)
 
 // --- stream helpers ---
-
-type peekReader struct {
-	r      io.Reader
-	buf    []byte
-	offset int
-}
-
-func newPeekReader(r io.Reader) *peekReader { return &peekReader{r: r} }
-
-func (p *peekReader) Peek(n int) ([]byte, error) {
-	if len(p.buf)-p.offset >= n {
-		return p.buf[p.offset : p.offset+n], nil
-	}
-	need := n - (len(p.buf) - p.offset)
-	tmp := make([]byte, need)
-	if _, err := io.ReadFull(p.r, tmp); err != nil {
-		return nil, err
-	}
-	p.buf = append(p.buf[p.offset:], tmp...)
-	p.offset = 0
-	return p.buf[:n], nil
-}
-
-func (p *peekReader) Read(b []byte) (int, error) {
-	if p.offset < len(p.buf) {
-		n := copy(b, p.buf[p.offset:])
-		p.offset += n
-		if p.offset == len(p.buf) {
-			p.buf = nil
-			p.offset = 0
-		}
-		return n, nil
-	}
-	return p.r.Read(b)
-}
 
 type bufferedStreamConn struct {
 	net.Conn

@@ -45,14 +45,6 @@ func (b *CarrierBundle) newDuplexSetup(kind wire.FlowKind, dest string) (flowSet
 	return b.newFlowSetup(kind, wire.FlowRoleDuplex, dest)
 }
 
-func (b *CarrierBundle) newOpenSetup(kind wire.FlowKind, dest string) (flowSetup, error) {
-	return b.newFlowSetup(kind, wire.FlowRoleOpen, dest)
-}
-
-func (b *CarrierBundle) newAttachSetup(kind wire.FlowKind) (flowSetup, error) {
-	return b.newFlowSetup(kind, wire.FlowRoleAttach, "")
-}
-
 // prepareTCPHalf acquires an authenticated TLS/TCP carrier for the given header.
 func (b *CarrierBundle) prepareTCPHalf(ctx context.Context, dest string, header wire.FlowHeader) (*tcptls.PreparedFlowHalf, error) {
 	pool, err := b.tcpPool()
@@ -266,15 +258,6 @@ func closeAll(closers ...io.Closer) error {
 		}
 	}
 	return first
-}
-
-// flowErrorCode extracts a wire.FlowErrorCode from an error if present.
-func flowErrorCode(err error) wire.FlowErrorCode {
-	var fe *wire.FlowError
-	if errors.As(err, &fe) {
-		return fe.Code
-	}
-	return 0
 }
 
 // fmtError wraps an error with context.

@@ -172,8 +172,3 @@ func (b *CarrierBundle) Close() {
 		pool.Close()
 	}
 }
-
-func (b *CarrierBundle) quicClientSync() carrier.QuicBackend {
-	client, _ := b.quicClient()
-	return client
-}

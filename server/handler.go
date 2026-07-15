@@ -385,10 +385,6 @@ func (h *Handler) handleUDPStreamFlowGeneration(ctx context.Context, conn net.Co
 	return h.submitAndRouteUDPGeneration(ctx, source, sessionID, generation, boundGeneration, header, target, half)
 }
 
-func (h *Handler) submitAndRouteUDP(ctx context.Context, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) error {
-	return h.submitAndRouteUDPGeneration(ctx, source, sessionID, h.claims.CurrentGeneration(sessionID), false, header, target, half)
-}
-
 func (h *Handler) submitAndRouteUDPGeneration(ctx context.Context, source net.Addr, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target string, half udpHalf) error {
 	paired, err := h.claims.SubmitUDPWithGeneration(ctx, sessionID, generation, boundGeneration, header, target, half, source, udpHalfTransport(header, half))
 	if err != nil || paired == nil {
@@ -687,10 +683,6 @@ func closePacketConnWithError(pc net.PacketConn, err error) {
 		paired.closeWithError(err)
 		return
 	}
-	if uot, ok := pc.(*uotPacketConn); ok {
-		uot.closeWithError(err)
-		return
-	}
 	if nowu, ok := pc.(*nowuFlow); ok {
 		nowu.shutdown(err)
 		return
@@ -713,9 +705,6 @@ func lifecycleFromConn(conn net.Conn) *lifecycle {
 func lifecycleFromPacketConn(pc net.PacketConn) *lifecycle {
 	if value, ok := pc.(*ownedPacketConn); ok {
 		return value.life
-	}
-	if value, ok := pc.(*uotPacketConn); ok {
-		return lifecycleFromConn(value.Conn)
 	}
 	return nil
 }

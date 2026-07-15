@@ -311,13 +311,6 @@ func relayNetwork(kind wire.FlowKind) string {
 	return "tcp"
 }
 
-func carrierIDOf(conn net.Conn) uint64 {
-	if tracked, ok := conn.(*trackedConn); ok && tracked.carrier != nil {
-		return tracked.carrier.id
-	}
-	return 0
-}
-
 func (p *TCPPool) Close() {
 	p.mu.Lock()
 	p.closed = true
