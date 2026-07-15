@@ -99,6 +99,111 @@ func TestQUICDatagramMuxConcurrentFlowsDoNotStealFrames(t *testing.T) {
 	}
 }
 
+func TestQUICDatagramMuxContinuesAfterCallerOwnedPollDeadlines(t *testing.T) {
+	raw := newMuxTestSession()
+	backend := &muxTestBackend{session: raw}
+	managed := newQUICMuxBackend(backend)
+	t.Cleanup(func() { _ = managed.Close() })
+
+	sessionValue, err := managed.AcquireSession(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireSession: %v", err)
+	}
+	session := sessionValue.(*quicSessionMux)
+	flow, err := session.register(17)
+	if err != nil {
+		t.Fatalf("register flow: %v", err)
+	}
+
+	deadline := time.Now().Add(4 * quicReassemblySweep)
+	for raw.pollDeadlines.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := raw.pollDeadlines.Load(); got < 2 {
+		t.Fatalf("caller-owned poll deadlines = %d, want at least 2", got)
+	}
+	select {
+	case <-session.loopDone:
+		t.Fatal("mux receive loop stopped after caller-owned poll deadlines")
+	default:
+	}
+	if got := backend.invalidations.Load(); got != 0 {
+		t.Fatalf("session invalidations after poll deadlines = %d, want 0", got)
+	}
+
+	result := make(chan muxReadResult, 1)
+	go readMuxPacket(flow, result)
+	for _, frame := range mustMuxFrames(t, 17, 1, []byte("after-deadlines"), nowuDataHeaderLen+64) {
+		raw.push(frame, nil)
+	}
+	assertMuxPayload(t, result, "after-deadlines")
+	if got := backend.invalidations.Load(); got != 0 {
+		t.Fatalf("session invalidations after valid datagram = %d, want 0", got)
+	}
+}
+
+func TestQUICDatagramMuxTerminalErrorInvalidatesOnceAndClearsFlows(t *testing.T) {
+	raw := newMuxTestSession()
+	backend := &muxTestBackend{session: raw}
+	managed := newQUICMuxBackend(backend)
+	t.Cleanup(func() { _ = managed.Close() })
+
+	sessionValue, err := managed.AcquireSession(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireSession: %v", err)
+	}
+	session := sessionValue.(*quicSessionMux)
+	flow1, err := session.register(21)
+	if err != nil {
+		t.Fatalf("register flow 21: %v", err)
+	}
+	flow2, err := session.register(22)
+	if err != nil {
+		t.Fatalf("register flow 22: %v", err)
+	}
+
+	partial := mustMuxFrames(t, 21, 1, []byte("partial"), nowuDataHeaderLen+3)
+	if len(partial) < 2 {
+		t.Fatalf("partial packet frames = %d, want at least 2", len(partial))
+	}
+	raw.push(partial[0], nil)
+	terminalErr := errors.New("test: terminal datagram receive failure")
+	raw.push(nil, terminalErr)
+
+	select {
+	case <-session.loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("mux receive loop did not stop after terminal error")
+	}
+	if got := backend.invalidations.Load(); got != 1 {
+		t.Fatalf("session invalidations after terminal error = %d, want 1", got)
+	}
+	session.mu.Lock()
+	flowCount := len(session.flows)
+	assemblyCount := len(session.assemblies)
+	session.mu.Unlock()
+	if flowCount != 0 || assemblyCount != 0 {
+		t.Fatalf("terminal cleanup left flows=%d assemblies=%d, want 0/0", flowCount, assemblyCount)
+	}
+	for flowID, flow := range map[uint64]*quicDatagramFlow{21: flow1, 22: flow2} {
+		if _, err := flow.readPacket(context.Background(), nil); !errors.Is(err, terminalErr) {
+			t.Fatalf("flow %d terminal error = %v, want %v", flowID, err, terminalErr)
+		}
+	}
+
+	managed.InvalidateSession(session)
+	managed.InvalidateSession(session)
+	if got := backend.invalidations.Load(); got != 1 {
+		t.Fatalf("session invalidations after repeated invalidation = %d, want 1", got)
+	}
+	managed.mu.Lock()
+	_, oldRegistered := managed.sessions[raw]
+	managed.mu.Unlock()
+	if oldRegistered {
+		t.Fatal("terminally failed raw session remains registered")
+	}
+}
+
 func TestQUICUDPIdenticalDuplicateBeforeLengthCheckIsIgnored(t *testing.T) {
 	raw := newMuxTestSession()
 	managed := newQUICMuxBackend(&muxTestBackend{session: raw})
@@ -235,6 +340,7 @@ type muxTestSession struct {
 	startedOnce    sync.Once
 	active         atomic.Int32
 	maxConcurrent  atomic.Int32
+	pollDeadlines  atomic.Int32
 }
 
 func newMuxTestSession() *muxTestSession {
@@ -262,7 +368,11 @@ func (s *muxTestSession) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	case result := <-s.receives:
 		return result.data, result.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		err := ctx.Err()
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.pollDeadlines.Add(1)
+		}
+		return nil, err
 	}
 }
 
@@ -276,8 +386,9 @@ func (s *muxTestSession) push(data []byte, err error) {
 var _ carrier.QuicSession = (*muxTestSession)(nil)
 
 type muxTestBackend struct {
-	session carrier.QuicSession
-	closed  atomic.Bool
+	session       carrier.QuicSession
+	closed        atomic.Bool
+	invalidations atomic.Int32
 }
 
 func (b *muxTestBackend) SetSessionID(wire.SessionID) {}
@@ -287,7 +398,9 @@ func (b *muxTestBackend) AcquireSession(context.Context) (carrier.QuicSession, e
 	}
 	return b.session, nil
 }
-func (b *muxTestBackend) InvalidateSession(carrier.QuicSession) {}
+func (b *muxTestBackend) InvalidateSession(carrier.QuicSession) {
+	b.invalidations.Add(1)
+}
 func (b *muxTestBackend) Close() error {
 	b.closed.Store(true)
 	return nil

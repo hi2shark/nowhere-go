@@ -93,8 +93,9 @@ type Gate struct {
 }
 
 type flight struct {
-	done chan struct{}
-	err  error
+	done        chan struct{}
+	err         error
+	callerLocal bool
 }
 
 // New builds a Gate with defaults for zero durations.
@@ -128,19 +129,21 @@ func (g *Gate) Attempts() uint64 {
 // Run executes fn. While the gate is healthy, callers dial in parallel.
 // After a retryable/auth failure the gate becomes degraded: concurrent callers
 // share one probe (or the last error inside the backoff window) so a down
-// portal cannot be hammered. Success clears degraded and restores parallelism.
+// portal cannot be hammered. AlwaysCoalesce also shares successful flights.
+// A leader's caller-local cancellation is private; live waiters retry.
 func (g *Gate) Run(ctx context.Context, fn func(context.Context) error) error {
 	if g == nil {
 		return fn(ctx)
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		g.mu.Lock()
 		degraded := g.degraded || g.alwaysCoalesce
 		if !degraded {
 			g.mu.Unlock()
-			g.attempts.Add(1)
-			err := fn(ctx)
-			g.note(err)
+			err, _ := g.runAttempt(ctx, fn)
 			return err
 		}
 
@@ -150,13 +153,21 @@ func (g *Gate) Run(ctx context.Context, fn func(context.Context) error) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-f.done:
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if f.callerLocal {
+					continue
+				}
 				if f.err != nil {
 					return f.err
 				}
-				// Probe succeeded: mint our own carrier outside the flight.
-				g.attempts.Add(1)
-				err := fn(ctx)
-				g.note(err)
+				if g.alwaysCoalesce {
+					return nil
+				}
+				// A successful degraded probe only proves portal health. Mint a
+				// separate carrier for this caller to preserve the TCP pool contract.
+				err, _ := g.runAttempt(ctx, fn)
 				return err
 			}
 		}
@@ -182,17 +193,27 @@ func (g *Gate) Run(ctx context.Context, fn func(context.Context) error) error {
 		g.flight = f
 		g.mu.Unlock()
 
-		g.attempts.Add(1)
-		err := fn(ctx)
-		g.note(err)
+		err, callerLocal := g.runAttempt(ctx, fn)
 
 		g.mu.Lock()
 		f.err = err
+		f.callerLocal = callerLocal
 		g.flight = nil
 		close(f.done)
 		g.mu.Unlock()
 		return err
 	}
+}
+
+func (g *Gate) runAttempt(ctx context.Context, fn func(context.Context) error) (error, bool) {
+	g.attempts.Add(1)
+	err := fn(ctx)
+	ctxErr := ctx.Err()
+	callerLocal := ctxErr != nil && errors.Is(err, ctxErr)
+	if !callerLocal {
+		g.note(err)
+	}
+	return err, callerLocal
 }
 
 func (g *Gate) note(err error) {

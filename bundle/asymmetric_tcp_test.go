@@ -320,17 +320,23 @@ func TestOpenTCPClosesTCPOnQUICCommitFailure(t *testing.T) {
 
 func TestOpenTCPNoFLOWBeforeBothPrepared(t *testing.T) {
 	spec := mustNowhereSpec(t)
+	authProbe, err := wire.MakeAuthFrameWithSession("k", spec, wire.SessionID{})
+	if err != nil {
+		t.Fatalf("MakeAuthFrameWithSession: %v", err)
+	}
 	var mu sync.Mutex
 	var sawRequest bool
-	tcpDialer := &hookPipeDialer{onWrite: func(p []byte) {
-		mu.Lock()
-		defer mu.Unlock()
-		if len(p) > 0 && p[0] == wire.FlowFrameMagic {
-			sawRequest = true
+	tcpDialer := &hookPipeDialer{authLen: len(authProbe), onWrite: func(p []byte) {
+		if len(p) == 0 {
+			return
 		}
+		mu.Lock()
+		sawRequest = true
+		mu.Unlock()
 	}}
 	quicReady := make(chan struct{})
-	quic := &gatePrepareQuic{ready: quicReady}
+	quicStarted := make(chan struct{})
+	quic := &gatePrepareQuic{ready: quicReady, started: quicStarted}
 	tcpConfig, err := tcptls.NewConfig(tcptls.TCPOptions{
 		Address: "127.0.0.1:1", Spec: spec, Key: "k", Dialer: tcpDialer, TLSDialer: passthroughTLSDialer{},
 	})
@@ -354,11 +360,16 @@ func TestOpenTCPNoFLOWBeforeBothPrepared(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if tcpDialer.prepared.Load() {
-			break
-		}
+	for time.Now().Before(deadline) && !tcpDialer.prepared.Load() {
 		time.Sleep(time.Millisecond)
+	}
+	if !tcpDialer.prepared.Load() {
+		t.Fatal("TCP auth did not complete")
+	}
+	select {
+	case <-quicStarted:
+	case <-time.After(time.Second):
+		t.Fatal("QUIC prepare did not start")
 	}
 	mu.Lock()
 	leaked := sawRequest
@@ -378,36 +389,68 @@ func TestOpenTCPNoFLOWBeforeBothPrepared(t *testing.T) {
 }
 
 type hookPipeDialer struct {
+	authLen  int
 	prepared atomic.Bool
 	onWrite  func([]byte)
 }
 
 func (d *hookPipeDialer) DialContext(context.Context, string, string) (net.Conn, error) {
-	c1, c2 := net.Pipe()
+	client, server := net.Pipe()
 	go func() {
-		defer c2.Close()
-		buf := make([]byte, 4096)
-		for {
-			n, err := c2.Read(buf)
-			if n > 0 && d.onWrite != nil {
-				d.onWrite(buf[:n])
-			}
-			if err != nil {
-				return
-			}
-			d.prepared.Store(true)
-		}
+		defer server.Close()
+		_, _ = io.Copy(io.Discard, server)
 	}()
-	return c1, nil
+	return &hookPipeConn{Conn: client, dialer: d}, nil
+}
+
+type hookPipeConn struct {
+	net.Conn
+	dialer  *hookPipeDialer
+	mu      sync.Mutex
+	written int
+}
+
+func (c *hookPipeConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n <= 0 {
+		return n, err
+	}
+
+	c.mu.Lock()
+	start := c.written
+	c.written += n
+	postStart := n
+	if c.written >= c.dialer.authLen {
+		c.dialer.prepared.Store(true)
+	}
+	if start >= c.dialer.authLen {
+		postStart = 0
+	} else if c.written > c.dialer.authLen {
+		postStart = c.dialer.authLen - start
+	}
+	hook := c.dialer.onWrite
+	c.mu.Unlock()
+
+	if postStart < n && hook != nil {
+		hook(p[postStart:n])
+	}
+	return n, err
 }
 
 type gatePrepareQuic struct {
-	ready <-chan struct{}
-	id    wire.SessionID
+	ready       <-chan struct{}
+	started     chan struct{}
+	startedOnce sync.Once
+	id          wire.SessionID
 }
 
 func (q *gatePrepareQuic) SetSessionID(id wire.SessionID) { q.id = id }
 func (q *gatePrepareQuic) AcquireSession(ctx context.Context) (carrier.QuicSession, error) {
+	q.startedOnce.Do(func() {
+		if q.started != nil {
+			close(q.started)
+		}
+	})
 	select {
 	case <-q.ready:
 		return &fakeQuicSession{prep: &recordingPreparedStream{committed: make(chan struct{}), closed: make(chan struct{})}}, nil

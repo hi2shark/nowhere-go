@@ -502,6 +502,15 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 	}
 	defer finish()
 	source := conn.RemoteAddr()
+	guard, ok := h.admission.tryAcquire(source)
+	if !ok {
+		_ = conn.CloseWithError(1, "access denied")
+		h.emitAdmissionLimited(taskCtx, source)
+		return report(ErrAdmissionLimit)
+	}
+	releaseAdmission := guard.Release
+	defer releaseAdmission()
+
 	ctx, cancel := context.WithCancelCause(taskCtx)
 	defer cancel(nil)
 
@@ -511,6 +520,7 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 		h.emit(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
 		return err
 	}
+	releaseAdmission()
 	session.cancel = cancel
 	if err := h.sessions.Register(session); err != nil {
 		_ = conn.CloseWithError(1, "access denied")
