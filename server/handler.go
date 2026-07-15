@@ -29,19 +29,23 @@ type HandlerOptions struct {
 
 // Handler authenticates carriers and hands decoded flows to Upstream.
 type Handler struct {
-	config     *Config
-	upstream   Upstream
-	observer   diagnostic.Observer
-	pairing    *flowPairManager
-	sessions   *sessionManager
-	admission  *unauthenticatedAdmission
-	handshake  *handshakeGate
-	now        func() time.Time
-	randRead   func([]byte) (int, error)
+	config              *Config
+	upstream            Upstream
+	observer            diagnostic.Observer
+	claims              *claimRegistry
+	tasks               *taskTracker
+	sessions            *sessionManager
+	admission           *unauthenticatedAdmission
+	handshake           *handshakeGate
+	now                 func() time.Time
+	newReassemblyTicker func(time.Duration) reassemblyTicker
+	randRead            func([]byte) (int, error)
 
 	admissionLogMu   sync.Mutex
 	admissionLastLog time.Time
 	admissionSkipped int
+
+	shutdown cleanupCoordinator
 }
 
 // NewHandler constructs a handler whose internal state is always initialized.
@@ -52,39 +56,126 @@ func NewHandler(options HandlerOptions) (*Handler, error) {
 	if options.Upstream == nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidHandler, ErrUpstreamNotConfigured)
 	}
+	upstream := options.Upstream
+	if dialUpstream, ok := upstream.(*DialUpstream); ok {
+		upstream = dialUpstream.withTCPReadGrace(options.Config.timeouts.TCPReadGrace)
+	}
+	claims := newClaimRegistry(options.Config.timeouts.FlowPair, options.Config.limits)
+	claims.setObserver(options.Observer)
 	h := &Handler{
-		config:    options.Config,
-		upstream:  options.Upstream,
-		observer:  options.Observer,
-		pairing:   newFlowPairManager(options.Config.timeouts.FlowPair),
-		sessions:  newSessionManager(),
+		config: options.Config, upstream: upstream, observer: options.Observer,
+		claims: claims, tasks: newTaskTracker(), sessions: newSessionManager(claims),
 		admission: newUnauthenticatedAdmission(
 			options.Config.limits.MaxUnauthenticatedConnections,
 			options.Config.limits.MaxUnauthenticatedPerSource,
 		),
 		handshake: newHandshakeGate(options.Config.limits.MaxConcurrentHandshakes),
 		now:       time.Now,
-		randRead:  rand.Read,
+		newReassemblyTicker: func(interval time.Duration) reassemblyTicker {
+			return &realReassemblyTicker{Ticker: time.NewTicker(interval)}
+		},
+		randRead: rand.Read,
 	}
-	h.pairing.configureLimits(options.Config.limits)
-	h.pairing.setObserver(options.Observer)
 	h.sessions.configureLimit(options.Config.limits.ActiveQUICSessions)
 	return h, nil
 }
 
-// Close releases all pending pairs and authenticated sessions.
-// It is safe to call more than once.
-func (h *Handler) Close() error {
+// Shutdown releases all pending claims, authenticated sessions, and tracked flows.
+// The initiating context is the single cleanup deadline; every caller may stop
+// waiting at its own deadline while the shared cleanup continues to completion.
+func (h *Handler) Shutdown(ctx context.Context) error {
 	if h == nil {
 		return nil
 	}
-	if h.pairing != nil {
-		h.pairing.Close()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done, started := h.beginShutdown(ctx)
+	err := h.shutdown.wait(ctx, done)
+	if started && ctx.Err() != nil {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = ctx.Err()
+		}
+		forcedCause := markForcedTermination(cause)
+		if h.claims != nil {
+			h.claims.AbortClosing(forcedCause)
+		}
+		if h.tasks != nil {
+			h.tasks.ForceDetach(forcedCause)
+		}
+	}
+	return err
+}
+
+func (h *Handler) beginShutdown(ctx context.Context) (<-chan struct{}, bool) {
+	return h.shutdown.start(ctx, func() {
+		if h.tasks != nil {
+			h.tasks.BeginClose()
+		}
+	}, h.shutdownCleanup)
+}
+
+func (h *Handler) shutdownCleanup(ctx context.Context) error {
+	forcedClosed := markForcedTermination(ErrClosed)
+	stopDeadlineClose := func() bool { return true }
+	if h.tasks != nil && ctx.Done() != nil {
+		stopDeadlineClose = afterContextFunc(ctx, func() {
+			cause := context.Cause(ctx)
+			if cause == nil {
+				cause = ctx.Err()
+			}
+			forcedCause := markForcedTermination(cause)
+			h.tasks.CancelAll(forcedCause)
+			h.tasks.CloseAll(forcedCause)
+		})
+	}
+	var claimsErr error
+	if h.claims != nil {
+		claimsErr = h.claims.CloseContextCause(ctx, forcedClosed)
+	}
+	stopDeadlineClose()
+	if h.tasks != nil {
+		h.tasks.CancelAll(forcedClosed)
+		h.tasks.CloseAll(forcedClosed)
 	}
 	if h.sessions != nil {
 		h.sessions.Close()
 	}
+	if h.tasks == nil {
+		return claimsErr
+	}
+	if ctx.Err() != nil {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = ctx.Err()
+		}
+		h.tasks.ForceClose(markForcedTermination(cause))
+		return cause
+	}
+	if err := h.tasks.Wait(ctx); err != nil {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = err
+		}
+		h.tasks.ForceClose(markForcedTermination(cause))
+		return cause
+	}
+	if claimsErr != nil {
+		return claimsErr
+	}
 	return nil
+}
+
+// Close applies this handler's normalized shutdown timeout.
+func (h *Handler) Close() error {
+	if h == nil {
+		return nil
+	}
+	timeout := h.config.timeouts.Shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return h.Shutdown(ctx)
 }
 
 // ServeTCP performs the host TLS handshake on a raw TCP carrier, authenticates,
@@ -100,10 +191,25 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 		return fmt.Errorf("%w: nil tcp connection", ErrInvalidHandler)
 	}
 	life := newLifecycle(ctx, raw, onClose, h.observer)
+	var transportMu sync.Mutex
+	transport := raw
+	taskCtx, ownership, err := h.tasks.StartTransferableTransport(ctx, func(cause error) {
+		transportMu.Lock()
+		current := transport
+		transportMu.Unlock()
+		closeConnWithError(current, cause)
+		life.Close(cause)
+	})
+	if err != nil {
+		life.Close(err)
+		return err
+	}
+	defer ownership.finishCarrier()
+
 	guard, ok := h.admission.tryAcquire(source)
 	if !ok {
 		life.Close(ErrAdmissionLimit)
-		h.emitAdmissionLimited(ctx, source)
+		h.emitAdmissionLimited(taskCtx, source)
 		return report(ErrAdmissionLimit)
 	}
 	releaseAdmission := guard.Release
@@ -113,19 +219,19 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 		life.Close(ErrTLSNotConfigured)
 		return ErrTLSNotConfigured
 	}
-	releaseHandshake, err := h.handshake.acquire(ctx)
+	releaseHandshake, err := h.handshake.acquire(taskCtx)
 	if err != nil {
 		life.Close(err)
 		return report(err)
 	}
 
-	handshakeCtx, cancel := context.WithTimeout(ctx, h.config.timeouts.TLSHandshake)
+	handshakeCtx, cancel := context.WithTimeout(taskCtx, h.config.timeouts.TLSHandshake)
 	conn, err := handshake(handshakeCtx, raw)
 	cancel()
 	releaseHandshake()
 	if err != nil {
 		life.Close(err)
-		h.emit(ctx, classifyTLSHandshake(err), "tls_handshake_failed", source, "", wire.SessionID{}, 0, err)
+		h.emit(taskCtx, classifyTLSHandshake(err), "tls_handshake_failed", source, "", wire.SessionID{}, 0, err)
 		return report(err)
 	}
 	if conn == nil {
@@ -133,8 +239,11 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 		life.Close(err)
 		return err
 	}
+	transportMu.Lock()
+	transport = conn
+	transportMu.Unlock()
 	owned := &ownedConn{Conn: conn, life: life}
-	return h.handleTCPConn(ctx, owned, source, releaseAdmission)
+	return h.handleTCPConn(withTaskOwnership(taskCtx, ownership), owned, source, releaseAdmission)
 }
 
 // HandleConn handles an already handshaked carrier. Hosts should prefer ServeTCP
@@ -164,7 +273,7 @@ func (h *Handler) handleTCPConn(ctx context.Context, conn *ownedConn, source net
 	_ = conn.SetDeadline(time.Time{})
 	_ = conn.SetReadDeadline(h.now().Add(h.config.timeouts.RequestIdle))
 
-	peek, err := br.Peek(1)
+	header, err := wire.ReadFlowHeader(stream)
 	if err != nil {
 		conn.closeWithError(err)
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
@@ -173,51 +282,55 @@ func (h *Handler) handleTCPConn(ctx context.Context, conn *ownedConn, source net
 		}
 		return err
 	}
-
-	var header *wire.FlowHeader
-	if peek[0] == wire.FlowFrameMagic {
-		fh, readErr := wire.ReadFlowHeader(stream)
-		if readErr != nil {
-			conn.closeWithError(readErr)
-			return readErr
-		}
-		header = &fh
-	}
-	target, err := wire.DecodeTCPRequest(stream, h.config.spec)
+	target, err := h.readFlowTarget(stream, header)
 	if err != nil {
+		h.rejectFlowSetup(stream, sessionID, header, wire.FlowErrorCodeInvalidRequest)
 		conn.closeWithError(err)
 		return err
 	}
 	_ = conn.SetDeadline(time.Time{})
-
-	if header != nil {
-		return h.handleAsymmetric(ctx, stream, source, sessionID, *header, target)
-	}
-	if target == wire.UOTMagicTarget {
-		return h.handleUOT(ctx, stream, source)
-	}
-	return h.routeStream(ctx, stream, source, target)
+	return h.handleFlow(ctx, stream, source, sessionID, header, target, wire.CarrierTCP)
 }
 
-func (h *Handler) handleUOT(ctx context.Context, conn net.Conn, source net.Addr) error {
-	_ = conn.SetReadDeadline(h.now().Add(h.config.timeouts.UOTSetup))
-	target, err := wire.ReadUOTSetupTarget(conn)
-	if err != nil {
+func (h *Handler) readFlowTarget(reader io.Reader, header wire.FlowHeader) (string, error) {
+	if header.Role == wire.FlowRoleAttach {
+		return "", nil
+	}
+	return wire.DecodeTCPRequest(reader, h.config.spec)
+}
+
+func (h *Handler) rejectFlowSetup(conn net.Conn, sessionID wire.SessionID, header wire.FlowHeader, code wire.FlowErrorCode) {
+	h.rejectFlowSetupGeneration(conn, sessionID, h.claims.CurrentGeneration(sessionID), false, header, code)
+}
+
+func (h *Handler) rejectFlowSetupGeneration(conn net.Conn, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, code wire.FlowErrorCode) {
+	carrier := header.Uplink
+	if header.Role == wire.FlowRoleAttach || header.Role == wire.FlowRoleDuplex {
+		carrier = header.Downlink
+	}
+	h.claims.RejectClaim(flowClaim{
+		SessionID: sessionID, FlowID: header.FlowID, Generation: generation, BoundGeneration: boundGeneration,
+		Role: header.Role, Carrier: carrier,
+		Metadata: claimMetadata{Kind: header.Kind, Uplink: header.Uplink, Downlink: header.Downlink},
+		Stream:   conn,
+	}, &wire.FlowError{Code: code})
+}
+
+func (h *Handler) handleFlow(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string, physical wire.Carrier) error {
+	return h.handleFlowGeneration(ctx, conn, source, sessionID, h.claims.CurrentGeneration(sessionID), false, header, target, physical)
+}
+
+func (h *Handler) handleFlowGeneration(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target string, physical wire.Carrier) error {
+	if err := validateFlowTransport(header, physical); err != nil {
+		h.rejectFlowSetupGeneration(conn, sessionID, generation, boundGeneration, header, wire.FlowErrorCodeMetadataConflict)
 		closeConnWithError(conn, err)
 		return err
 	}
-	_ = conn.SetDeadline(time.Time{})
-	pc := newUOTPacketConn(conn, parseTargetAddr(target))
-	pc.SetIdleTimeout(h.config.timeouts.UDPIdle)
-	return h.routePacket(ctx, pc, source, target)
-}
-
-func (h *Handler) handleAsymmetric(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string) error {
 	switch header.Kind {
 	case wire.FlowKindTCP:
-		return h.handleAsymmetricTCP(ctx, conn, source, sessionID, header, target)
+		return h.handleTCPFlowGeneration(ctx, conn, source, sessionID, generation, boundGeneration, header, target, physical)
 	case wire.FlowKindUDP:
-		return h.handleAsymmetricUDPStream(ctx, conn, source, sessionID, header, target)
+		return h.handleUDPStreamFlowGeneration(ctx, conn, source, sessionID, generation, boundGeneration, header, target)
 	default:
 		err := fmt.Errorf("%w: invalid flow kind", ErrUnsupportedFlow)
 		closeConnWithError(conn, err)
@@ -225,101 +338,229 @@ func (h *Handler) handleAsymmetric(ctx context.Context, conn net.Conn, source ne
 	}
 }
 
-func (h *Handler) handleAsymmetricTCP(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string) error {
-	paired, err := h.pairing.SubmitTCPWithSource(ctx, sessionID, header, target, conn, source)
-	if err != nil {
-		closeConnWithError(conn, err)
+func (h *Handler) handleTCPFlowGeneration(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target string, physical wire.Carrier) error {
+	active, err := h.claims.Submit(ctx, flowClaim{
+		SessionID: sessionID, FlowID: header.FlowID, Generation: generation, BoundGeneration: boundGeneration,
+		Role: header.Role, Carrier: physical,
+		Metadata: claimMetadata{Kind: header.Kind, Uplink: header.Uplink, Downlink: header.Downlink},
+		Target:   target, Stream: conn, Source: source,
+	})
+	if err != nil || active == nil {
 		return err
 	}
-	if paired == nil {
-		return nil
+
+	var routed net.Conn
+	if active.Duplex != nil {
+		routed = active.Duplex.Stream
+	} else {
+		if active.Open == nil || active.Attach == nil {
+			active.Release()
+			return fmt.Errorf("%w: incomplete TCP pair", ErrInvalidHandler)
+		}
+		routed = &splicedConn{
+			reader: active.Open.Stream, writer: active.Attach.Stream,
+			closer: []io.Closer{active.Open.Stream, active.Attach.Stream},
+			remote: active.Open.Stream.RemoteAddr(), local: active.Open.Stream.LocalAddr(),
+			target: active.Target, resultWriter: active.Selected.Stream, onClose: active.Release,
+		}
 	}
-	return h.routeStream(ctx, paired, source, target)
+	return h.routeStream(withClaimContext(ctx, active.Context), routed, source, active.Target, active.Readiness, active.Release)
 }
 
-func (h *Handler) handleAsymmetricUDPStream(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string) error {
-	var half udpHalf
-	half.Role = header.Role
+func (h *Handler) handleUDPStreamFlowGeneration(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target string) error {
+	half := udpHalf{Role: header.Role}
 	switch header.Role {
 	case wire.FlowRoleOpen:
-		if header.Uplink != wire.CarrierTCP {
-			err := fmt.Errorf("%w: UDP OPEN on TLS requires tcp uplink", ErrCarrierMismatch)
-			closeConnWithError(conn, err)
-			return err
-		}
 		half.Uplink = newTCPUDPUplink(conn)
 	case wire.FlowRoleAttach:
-		if header.Downlink != wire.CarrierTCP {
-			err := fmt.Errorf("%w: UDP ATTACH on TLS requires tcp downlink", ErrCarrierMismatch)
-			closeConnWithError(conn, err)
-			return err
-		}
+		half.Downlink = newTCPUDPDownlink(conn)
+	case wire.FlowRoleDuplex:
+		half.Uplink = newTCPUDPUplink(conn)
 		half.Downlink = newTCPUDPDownlink(conn)
 	default:
 		err := fmt.Errorf("%w: invalid flow role", ErrUnsupportedFlow)
 		closeConnWithError(conn, err)
 		return err
 	}
-	return h.submitAndRouteUDP(ctx, source, sessionID, header, target, half)
+	return h.submitAndRouteUDPGeneration(ctx, source, sessionID, generation, boundGeneration, header, target, half)
 }
 
 func (h *Handler) submitAndRouteUDP(ctx context.Context, source net.Addr, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) error {
-	paired, err := h.pairing.SubmitUDPWithSource(ctx, sessionID, header, target, half, source, udpHalfTransport(header, half))
-	if err != nil {
-		closeUDPHalfWithError(half, err)
+	return h.submitAndRouteUDPGeneration(ctx, source, sessionID, h.claims.CurrentGeneration(sessionID), false, header, target, half)
+}
+
+func (h *Handler) submitAndRouteUDPGeneration(ctx context.Context, source net.Addr, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target string, half udpHalf) error {
+	paired, err := h.claims.SubmitUDPWithGeneration(ctx, sessionID, generation, boundGeneration, header, target, half, source, udpHalfTransport(header, half))
+	if err != nil || paired == nil {
 		return err
 	}
-	if paired == nil {
-		return nil
-	}
+	return h.routeCompletedUDP(ctx, source, paired)
+}
+
+func (h *Handler) routeCompletedUDP(ctx context.Context, source net.Addr, paired *pairedUDP) error {
 	paired.IdleTimeout = h.config.timeouts.UDPIdle
-	return h.routePacket(ctx, newPairedUDPConn(paired), source, target)
+	packetConn := newPairedUDPConn(paired)
+	if conn, ok := packetConn.(*pairedUDPConn); ok && paired.Readiness != nil {
+		paired.Readiness.setOnReady(conn.markReady)
+	}
+	return h.routePacket(withClaimContext(ctx, paired.Context), packetConn, source, paired.Target, paired.Readiness, paired.Release)
 }
 
-func (h *Handler) handleStreamRequest(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, header *wire.FlowHeader, target string) error {
-	if header != nil {
-		return h.handleAsymmetric(ctx, conn, source, sessionID, *header, target)
+func validateFlowTransport(header wire.FlowHeader, physical wire.Carrier) error {
+	valid := false
+	switch header.Role {
+	case wire.FlowRoleOpen:
+		valid = header.Uplink == physical
+	case wire.FlowRoleAttach:
+		valid = header.Downlink == physical
+	case wire.FlowRoleDuplex:
+		valid = header.Uplink == physical && header.Downlink == physical
 	}
-	if target == wire.UOTMagicTarget {
-		return h.handleUOT(ctx, conn, source)
+	if !valid {
+		return fmt.Errorf("%w: role=%d carrier=%d", ErrCarrierMismatch, header.Role, physical)
 	}
-	return h.routeStream(ctx, conn, source, target)
+	return nil
 }
 
-func (h *Handler) routeStream(ctx context.Context, conn net.Conn, source net.Addr, target string) error {
-	if h == nil || h.upstream == nil {
+func (h *Handler) startRouteTask(ctx context.Context) (context.Context, func(), error) {
+	if ownership := taskOwnershipFrom(ctx); ownership != nil {
+		return ownership.claim()
+	}
+	return h.tasks.Start(ctx)
+}
+
+func (h *Handler) routeStream(ctx context.Context, conn net.Conn, source net.Addr, target string, readiness *flowReadiness, release func()) error {
+	if h == nil || h.upstream == nil || h.tasks == nil {
+		if readiness != nil {
+			_ = readiness.Reject(ErrUpstreamNotConfigured)
+		}
 		closeConnWithError(conn, ErrUpstreamNotConfigured)
+		if release != nil {
+			release()
+		}
 		return ErrUpstreamNotConfigured
 	}
-	if closeHandler := closeHandlerForConn(conn); closeHandler != nil {
-		ctx = ContextWithCloseHandler(ctx, closeHandler)
+	if readiness == nil {
+		readiness = newFlowReadiness(nil, nil)
 	}
-	if err := h.upstream.HandleStream(ctx, conn, source, target); err != nil {
+	claimCtx := claimContextFrom(ctx)
+	taskCtx, finish, err := h.startRouteTask(ctx)
+	if err != nil {
+		_ = readiness.Reject(err)
 		closeConnWithError(conn, err)
-		h.emit(ctx, diagnostic.LevelWarn, "upstream_stream_failed", source, target, wire.SessionID{}, 0, err)
+		if release != nil {
+			release()
+		}
+		return err
+	}
+	baseRouteCtx, cancel := context.WithCancelCause(taskCtx)
+	life := &routeLifetime{cancel: cancel, finish: finish, release: release}
+	tracked := &trackedFlowConn{Conn: conn, life: life}
+	if claimCtx != nil {
+		go func() {
+			select {
+			case <-claimCtx.Done():
+				cause := context.Cause(claimCtx)
+				if cause == nil {
+					cause = claimCtx.Err()
+				}
+				cancel(cause)
+			case <-baseRouteCtx.Done():
+			}
+		}()
+	}
+	go func() {
+		<-baseRouteCtx.Done()
+		cause := context.Cause(baseRouteCtx)
+		if cause == nil {
+			cause = baseRouteCtx.Err()
+		}
+		_ = readiness.Reject(cause)
+		tracked.closeWithError(cause)
+	}()
+	upstreamCtx := baseRouteCtx
+	if closeHandler := closeHandlerForConn(conn); closeHandler != nil {
+		upstreamCtx = ContextWithCloseHandler(upstreamCtx, func(cause error) {
+			closeHandler(cause)
+			life.end(cause)
+		})
+	}
+	if err := h.upstream.HandleStream(upstreamCtx, tracked, source, target, readiness); err != nil {
+		_ = readiness.Reject(err)
+		tracked.closeWithError(err)
+		h.emit(upstreamCtx, diagnostic.LevelWarn, "upstream_stream_failed", source, target, wire.SessionID{}, 0, err)
 		return report(err)
 	}
 	return nil
 }
 
-func (h *Handler) routePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string) error {
-	if h == nil || h.upstream == nil {
-		_ = pc.Close()
+func (h *Handler) routePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string, readiness *flowReadiness, release func()) error {
+	if h == nil || h.upstream == nil || h.tasks == nil {
+		if readiness != nil {
+			_ = readiness.Reject(ErrUpstreamNotConfigured)
+		}
+		closePacketConnWithError(pc, ErrUpstreamNotConfigured)
+		if release != nil {
+			release()
+		}
 		return ErrUpstreamNotConfigured
 	}
-	if closeHandler := closeHandlerForPacketConn(pc); closeHandler != nil {
-		ctx = ContextWithCloseHandler(ctx, closeHandler)
+	if readiness == nil {
+		readiness = newFlowReadiness(nil, nil)
 	}
-	if err := h.upstream.HandlePacket(ctx, pc, source, target); err != nil {
+	claimCtx := claimContextFrom(ctx)
+	taskCtx, finish, err := h.startRouteTask(ctx)
+	if err != nil {
+		_ = readiness.Reject(err)
 		closePacketConnWithError(pc, err)
-		h.emit(ctx, diagnostic.LevelWarn, "upstream_packet_failed", source, target, wire.SessionID{}, 0, err)
+		if release != nil {
+			release()
+		}
+		return err
+	}
+	baseRouteCtx, cancel := context.WithCancelCause(taskCtx)
+	life := &routeLifetime{cancel: cancel, finish: finish, release: release}
+	tracked := &trackedFlowPacketConn{PacketConn: pc, life: life}
+	if claimCtx != nil {
+		go func() {
+			select {
+			case <-claimCtx.Done():
+				cause := context.Cause(claimCtx)
+				if cause == nil {
+					cause = claimCtx.Err()
+				}
+				cancel(cause)
+			case <-baseRouteCtx.Done():
+			}
+		}()
+	}
+	go func() {
+		<-baseRouteCtx.Done()
+		cause := context.Cause(baseRouteCtx)
+		if cause == nil {
+			cause = baseRouteCtx.Err()
+		}
+		_ = readiness.Reject(cause)
+		tracked.closeWithError(cause)
+	}()
+	upstreamCtx := baseRouteCtx
+	if closeHandler := closeHandlerForPacketConn(pc); closeHandler != nil {
+		upstreamCtx = ContextWithCloseHandler(upstreamCtx, func(cause error) {
+			closeHandler(cause)
+			life.end(cause)
+		})
+	}
+	if err := h.upstream.HandlePacket(upstreamCtx, tracked, source, target, readiness); err != nil {
+		_ = readiness.Reject(err)
+		tracked.closeWithError(err)
+		h.emit(upstreamCtx, diagnostic.LevelWarn, "upstream_packet_failed", source, target, wire.SessionID{}, 0, err)
 		return report(err)
 	}
 	return nil
 }
 
 func (h *Handler) validate() error {
-	if h == nil || h.config == nil || h.config.spec == nil || h.pairing == nil || h.sessions == nil {
+	if h == nil || h.config == nil || h.config.spec == nil || h.claims == nil || h.tasks == nil || h.sessions == nil {
 		return ErrInvalidHandler
 	}
 	if h.upstream == nil {
@@ -412,6 +653,10 @@ func classifyTLSHandshake(err error) diagnostic.Level {
 }
 
 func closeConnWithError(conn net.Conn, err error) {
+	if tracked, ok := conn.(*trackedFlowConn); ok {
+		tracked.closeWithError(err)
+		return
+	}
 	if owned, ok := conn.(*ownedConn); ok {
 		owned.closeWithError(err)
 		return
@@ -430,6 +675,10 @@ func closeConnWithError(conn net.Conn, err error) {
 }
 
 func closePacketConnWithError(pc net.PacketConn, err error) {
+	if tracked, ok := pc.(*trackedFlowPacketConn); ok {
+		tracked.closeWithError(err)
+		return
+	}
 	if owned, ok := pc.(*ownedPacketConn); ok {
 		owned.closeWithError(err)
 		return
@@ -442,8 +691,8 @@ func closePacketConnWithError(pc net.PacketConn, err error) {
 		uot.closeWithError(err)
 		return
 	}
-	if compact, ok := pc.(*compactUDPFlow); ok {
-		compact.shutdown(err)
+	if nowu, ok := pc.(*nowuFlow); ok {
+		nowu.shutdown(err)
 		return
 	}
 	if pc != nil {
@@ -475,8 +724,9 @@ func closeHandlerForConn(conn net.Conn) CloseHandler {
 	if life := lifecycleFromConn(conn); life != nil {
 		return life.Close
 	}
-	if spliced, ok := conn.(*splicedConn); ok {
-		return spliced.closeWithError
+	switch value := conn.(type) {
+	case *splicedConn:
+		return value.closeWithError
 	}
 	return nil
 }
@@ -488,7 +738,7 @@ func closeHandlerForPacketConn(pc net.PacketConn) CloseHandler {
 	switch value := pc.(type) {
 	case *pairedUDPConn:
 		return value.closeWithError
-	case *compactUDPFlow:
+	case *nowuFlow:
 		return value.shutdown
 	}
 	return nil

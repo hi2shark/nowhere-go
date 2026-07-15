@@ -1,9 +1,9 @@
 package tests_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"io"
 	"net"
 	"testing"
 
@@ -100,27 +100,29 @@ func mustTCPConfig(t *testing.T, spec *wire.EffectiveSpec) *tcptls.Config {
 
 func TestMatrixUoTFramingRoundTrip(t *testing.T) {
 	payload := []byte("hello-uot")
-	frame, err := wire.WriteUOTPacketFrame(payload)
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameData, Payload: payload})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, consumed, err := wire.ReadUOTPacketFrame(frame)
+	got, err := wire.ReadUOTFrame(bytes.NewReader(frame))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if consumed != len(frame) || string(got) != string(payload) {
-		t.Fatalf("uot round-trip failed: consumed=%d got=%q", consumed, got)
+	if got.Kind != wire.UOTFrameData || string(got.Payload) != string(payload) {
+		t.Fatalf("uot round-trip failed: kind=%d got=%q", got.Kind, got.Payload)
 	}
-	setup, err := wire.EncodeUOTSetupTarget("1.2.3.4:53")
+
+	// Control frames round-trip as well.
+	ready, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameReady})
 	if err != nil {
 		t.Fatal(err)
 	}
-	target, err := wire.ReadUOTSetupTarget(bytesReader(setup))
+	readyFrame, err := wire.ReadUOTFrame(bytes.NewReader(ready))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target != "1.2.3.4:53" {
-		t.Fatalf("target=%q", target)
+	if readyFrame.Kind != wire.UOTFrameReady || len(readyFrame.Payload) != 0 {
+		t.Fatalf("ready frame round-trip failed: kind=%d payload=%q", readyFrame.Kind, readyFrame.Payload)
 	}
 }
 
@@ -153,33 +155,10 @@ func (failingDialer) DialContext(context.Context, string, string) (net.Conn, err
 type recordingQuic struct{ id wire.SessionID }
 
 func (q *recordingQuic) SetSessionID(id wire.SessionID) { q.id = id }
-func (q *recordingQuic) OpenTCP(context.Context, string) (net.Conn, error) {
-	return nil, errors.New("stub")
-}
-func (q *recordingQuic) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
-	return nil, errors.New("stub")
-}
-func (q *recordingQuic) PrepareFlowStream(context.Context) (quic.PreparedFlowStream, error) {
-	return nil, errors.New("stub")
-}
-func (q *recordingQuic) OpenUDP(context.Context, string) (net.PacketConn, error) {
-	return nil, errors.New("stub")
-}
 func (q *recordingQuic) AcquireSession(context.Context) (carrier.QuicSession, error) {
 	return nil, errors.New("stub")
 }
 func (q *recordingQuic) InvalidateSession(carrier.QuicSession) {}
-func (q *recordingQuic) Close()                                {}
+func (q *recordingQuic) Close() error                          { return nil }
 
-func bytesReader(b []byte) io.Reader { return &sliceReader{b: b} }
-
-type sliceReader struct{ b []byte }
-
-func (r *sliceReader) Read(p []byte) (int, error) {
-	if len(r.b) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b)
-	r.b = r.b[n:]
-	return n, nil
-}
+var _ quic.Backend = (*recordingQuic)(nil)

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"runtime/debug"
 
+	"github.com/hi2shark/nowhere-go/internal/veccheck"
 	"github.com/hi2shark/nowhere-go/internal/vectors"
 	"github.com/hi2shark/nowhere-go/wire"
 )
@@ -17,8 +18,8 @@ import (
 var Version = "dev"
 
 const (
-	UpstreamVersion = "v1.3.3"
-	UpstreamCommit  = "962408bd702591587ff5ed7e2f638d23b996834f"
+	UpstreamVersion = "v1.4.0"
+	UpstreamCommit  = "3e20354ebfe70b1639a94055810581d966dbe44e"
 )
 
 func main() {
@@ -112,7 +113,7 @@ func runVectors(dirFlag string) error {
 			return err
 		}
 	}
-	n, err := vectors.CheckDir(dir)
+	n, err := veccheck.CheckDir(dir)
 	if err != nil {
 		return err
 	}

@@ -15,7 +15,6 @@ const (
 	ProxyFrameVersion uint8  = 1
 	DefaultALPN              = "now/1"
 	DefaultSpec              = "auto"
-	UOTMagicTarget           = "uot.nowhere.invalid:0" // switches TLS/TCP lane into UoT mode
 	CloseErrCodeOK    uint64 = 0x100
 
 	maxInputLength  = 255
@@ -35,8 +34,6 @@ const (
 	tcpPaddingKeyLength     = 32
 	tcpPaddingLengthSeedLen = 1
 	tcpPaddingLengthMax     = 64
-
-	datagramHeaderFixedLen = 1 + 1 + 8 + 2
 
 	// SessionIDLen is appended to every auth frame; one bundle shares one id for asymmetric pairing.
 	SessionIDLen = 16
@@ -75,8 +72,6 @@ type EffectiveSpec struct {
 	tcpFrameOrder []TcpFrameElement
 	tcpPaddingLen uint8
 	tcpPaddingKey []byte
-
-	udpFrameOrder []UdpFrameElement
 }
 
 // Spec returns the normalized protocol spec string.
@@ -157,7 +152,7 @@ func BuildEffectiveSpec(key, spec, alpn string) (*EffectiveSpec, error) {
 	tcpPaddingLen := tcpPaddingLenSeed[0] % tcpPaddingLengthMax
 
 	authFrameOrder := authFrameOrderFromSeed(hkdfExpand(specPRK, authFrameLayoutLabel, 8))
-	tcpFrameOrder, udpFrameOrder := frameLayoutFromSeed(hkdfExpand(specPRK, proxyFrameLayoutLabel, 8))
+	tcpFrameOrder := frameLayoutFromSeed(hkdfExpand(specPRK, proxyFrameLayoutLabel, 8))
 
 	specIDRaw := hkdfExpand(specPRK, specIDLabel, specIDLength)
 
@@ -176,8 +171,6 @@ func BuildEffectiveSpec(key, spec, alpn string) (*EffectiveSpec, error) {
 		tcpFrameOrder: tcpFrameOrder,
 		tcpPaddingLen: tcpPaddingLen,
 		tcpPaddingKey: tcpPaddingKey,
-
-		udpFrameOrder: udpFrameOrder,
 	}, nil
 }
 

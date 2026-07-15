@@ -3,20 +3,20 @@ package bundle
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"time"
 
-	"github.com/hi2shark/nowhere-go/carrier/quic"
-	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net.Conn, error) {
-	up, down := b.UpCarrier(), b.DownCarrier()
-	flowID := b.allocFlowID()
+func (b *CarrierBundle) openAsymmetricTCP(ctx context.Context, dest string) (net.Conn, error) {
+	up, down := b.cfg.up, b.cfg.down
+	flowID, err := b.allocFlowID()
+	if err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -41,7 +41,7 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 	tcpHalf, err := b.prepareTCPHalf(ctx, dest, tcpHeader)
 	if err != nil {
 		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, 0, 0, started, err)
-		return nil, fmt.Errorf("nowhere: prepare tcp half: %w", err)
+		return nil, fmtError("prepare tcp half", err)
 	}
 	tcpCarrierID := tcpHalf.CarrierID()
 	defer func() {
@@ -50,11 +50,11 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 		}
 	}()
 
-	quicPrep, err := b.prepareQUICHalf(ctx)
+	quicPrep, err := b.prepareQUICStream(ctx, quicHeader.FlowID)
 	if err != nil {
 		cancel()
 		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
-		return nil, fmt.Errorf("nowhere: prepare quic half: %w", err)
+		return nil, fmtError("prepare quic half", err)
 	}
 	defer func() {
 		if quicPrep != nil {
@@ -66,16 +66,26 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 	if err != nil {
 		cancel()
 		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
-		return nil, fmt.Errorf("nowhere: commit tcp half: %w", err)
+		return nil, fmtError("commit tcp half", err)
 	}
 	tcpHalf = nil
 
-	quicConn, err := quicPrep.Commit(ctx, dest, quicHeader)
+	quicTarget := ""
+	if quicHeader.Role == wire.FlowRoleOpen {
+		quicTarget = dest
+	}
+	setupBytes, err := wire.EncodeFlowSetup(quicHeader, quicTarget, b.cfg.tcp.Spec())
+	if err != nil {
+		_ = tcpConn.Close()
+		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
+		return nil, fmtError("encode quic half", err)
+	}
+	quicConn, err := commitQUICHalf(ctx, quicPrep, setupBytes, quicHeader.Role == wire.FlowRoleAttach)
 	if err != nil {
 		cancel()
 		_ = tcpConn.Close()
 		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
-		return nil, fmt.Errorf("nowhere: commit quic half: %w", err)
+		return nil, fmtError("commit quic half", err)
 	}
 	quicPrep = nil
 
@@ -84,6 +94,12 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 		openConn, attachConn = tcpConn, quicConn
 	} else {
 		openConn, attachConn = quicConn, tcpConn
+	}
+	if err := readFlowResult(attachConn); err != nil {
+		cancel()
+		_ = closeAll(openConn, attachConn)
+		b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
+		return nil, fmtError("read downlink flow result", err)
 	}
 	upCarrierID, downCarrierID := asymmetricCarrierIDs(up, down, tcpIsOpen, tcpCarrierID)
 	b.emitAsymmetric(ctx, "asymmetric_flow_open", flowID, dest, up, down, upCarrierID, downCarrierID, started, nil)
@@ -94,17 +110,6 @@ func (b *CarrierBundle) AsymmetricOpenTCP(ctx context.Context, dest string) (net
 		remote: openConn.RemoteAddr(),
 		local:  openConn.LocalAddr(),
 	}, nil
-}
-
-func asymmetricCarrierIDs(up, down wire.Carrier, tcpIsOpen bool, tcpCarrierID uint64) (upID, downID uint64) {
-	if up == wire.CarrierTCP {
-		upID = tcpCarrierID
-	}
-	if down == wire.CarrierTCP {
-		downID = tcpCarrierID
-	}
-	_ = tcpIsOpen
-	return upID, downID
 }
 
 func (b *CarrierBundle) emitAsymmetric(
@@ -147,75 +152,3 @@ func (b *CarrierBundle) emitAsymmetric(
 		Err:               err,
 	})
 }
-
-func carrierTransportName(c wire.Carrier) string {
-	switch c {
-	case wire.CarrierUDP:
-		return "quic"
-	default:
-		return "tcp"
-	}
-}
-
-func (b *CarrierBundle) prepareTCPHalf(ctx context.Context, dest string, header wire.FlowHeader) (*tcptls.PreparedFlowHalf, error) {
-	pool, err := b.tcpPool()
-	if err != nil {
-		return nil, err
-	}
-	if pool == nil {
-		return nil, errors.New("nowhere: tcp carrier unavailable")
-	}
-	return pool.PrepareFlowHalf(ctx, dest, header)
-}
-
-func (b *CarrierBundle) prepareQUICHalf(ctx context.Context) (quic.PreparedFlowStream, error) {
-	client, err := b.quicClient()
-	if err != nil {
-		return nil, err
-	}
-	if client == nil {
-		return nil, errors.New("nowhere: udp carrier unavailable")
-	}
-	return client.PrepareFlowStream(ctx)
-}
-
-type splicedConn struct {
-	reader io.Reader
-	writer io.Writer
-	closer []io.Closer
-	remote net.Addr
-	local  net.Addr
-}
-
-func (c *splicedConn) Read(p []byte) (int, error)  { return c.reader.Read(p) }
-func (c *splicedConn) Write(p []byte) (int, error) { return c.writer.Write(p) }
-func (c *splicedConn) Close() (err error) {
-	for _, cl := range c.closer {
-		if e := cl.Close(); e != nil {
-			err = e
-		}
-	}
-	return
-}
-func (c *splicedConn) LocalAddr() net.Addr  { return c.local }
-func (c *splicedConn) RemoteAddr() net.Addr { return c.remote }
-func (c *splicedConn) SetDeadline(t time.Time) error {
-	if err := c.SetReadDeadline(t); err != nil {
-		return err
-	}
-	return c.SetWriteDeadline(t)
-}
-func (c *splicedConn) SetReadDeadline(t time.Time) error {
-	if d, ok := c.reader.(interface{ SetReadDeadline(time.Time) error }); ok {
-		return d.SetReadDeadline(t)
-	}
-	return nil
-}
-func (c *splicedConn) SetWriteDeadline(t time.Time) error {
-	if d, ok := c.writer.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		return d.SetWriteDeadline(t)
-	}
-	return nil
-}
-
-var _ net.Conn = (*splicedConn)(nil)

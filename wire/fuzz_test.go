@@ -39,22 +39,16 @@ func FuzzReadFlowHeader(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) { _, _ = ReadFlowHeader(bytes.NewReader(data)) })
 }
 
-func FuzzDecodeUDPFrames(f *testing.F) {
-	spec := fuzzSpec(f)
-	derived, _ := EncodeUDPDatagram(UDPTypeRequest, 1, "example.com:53", []byte("x"), spec)
-	compact, _ := EncodeUDPOpenData(1, CarrierUDP, "example.com:53", []byte("x"))
-	f.Add(derived)
-	f.Add(compact)
-	f.Fuzz(func(t *testing.T, data []byte) {
-		_, _ = DecodeUDPDatagram(data, spec)
-		_, _ = DecodeUDPCompact(data)
-	})
+func FuzzDecodeUDPFrame(f *testing.F) {
+	frames, _ := EncodeUDPDataFragments(1, 1, []byte("x"), 1200)
+	f.Add(frames[0])
+	f.Fuzz(func(t *testing.T, data []byte) { _, _ = DecodeUDPFrame(data) })
 }
 
-func FuzzReadUOTPacketFrame(f *testing.F) {
-	valid, _ := WriteUOTPacketFrame([]byte("packet"))
+func FuzzReadUOTFrame(f *testing.F) {
+	valid, _ := EncodeUOTFrame(UOTFrame{Kind: UOTFrameData, Payload: []byte("packet")})
 	f.Add(valid)
-	f.Fuzz(func(t *testing.T, data []byte) { _, _, _ = ReadUOTPacketFrame(data) })
+	f.Fuzz(func(t *testing.T, data []byte) { _, _ = ReadUOTFrame(bytes.NewReader(data)) })
 }
 
 func FuzzBuildEffectiveSpec(f *testing.F) {

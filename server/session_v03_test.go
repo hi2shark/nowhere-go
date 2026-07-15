@@ -38,7 +38,7 @@ func TestSessionManagerLimitAndReplacement(t *testing.T) {
 func TestCompactQueueDropsNewAndReleasesBudget(t *testing.T) {
 	config, err := NewConfig(ConfigOptions{
 		Password: "secret",
-		Limits:   Limits{QUICQueuePackets: 1, QUICQueueBytes: 64, QUICFlowsPerSession: 1},
+		Limits:   Limits{UDPQueuePackets: 1, UDPQueueBytes: 64, UDPFlowsPerSession: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +48,7 @@ func TestCompactQueueDropsNewAndReleasesBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := newPortalSession(wire.SessionID{1}, &fakeQuicConn{}, handler, nil)
-	flow := newCompactUDPFlow(session, 1, "example.com:53", wire.CarrierUDP)
+	flow := newNowuFlow(session, 1, "example.com:53")
 	if !session.putFlow(1, flow) {
 		t.Fatal("putFlow failed")
 	}
@@ -75,7 +75,7 @@ func TestCompactPacketDeadline(t *testing.T) {
 	config, _ := NewConfig(ConfigOptions{Password: "secret"})
 	handler, _ := NewHandler(HandlerOptions{Config: config, Upstream: noopUpstream{}})
 	session := newPortalSession(wire.SessionID{1}, &fakeQuicConn{}, handler, nil)
-	flow := newCompactUDPFlow(session, 1, "example.com:53", wire.CarrierUDP)
+	flow := newNowuFlow(session, 1, "example.com:53")
 	_ = flow.SetReadDeadline(time.Now().Add(-time.Millisecond))
 	if _, _, err := flow.ReadFrom(make([]byte, 1)); !errors.Is(err, deadlineError()) {
 		t.Fatalf("ReadFrom deadline = %v", err)
@@ -136,9 +136,9 @@ func TestQUICAuthRejectsMissingFIN(t *testing.T) {
 	}
 }
 
-func TestPairGlobalLimit(t *testing.T) {
+func TestAuthenticatedTCPIdleConnectionLimit(t *testing.T) {
 	manager := newFlowPairManager(time.Second)
-	manager.configureLimits(Limits{PendingPairsPerSession: 1, PendingPairsGlobal: 1})
+	manager.configureLimits(Limits{PendingFlowsPerSession: 1, AuthenticatedTCPIdleConnections: 1})
 	header := wire.FlowHeader{
 		Role: wire.FlowRoleOpen, FlowID: 1, Kind: wire.FlowKindTCP,
 		Uplink: wire.CarrierTCP, Downlink: wire.CarrierUDP,

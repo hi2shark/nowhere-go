@@ -59,15 +59,12 @@ func TestFrameOrderDeterministic(t *testing.T) {
 	if equalAuthOrder(spec.authFrameOrder, canonical) {
 		t.Fatalf("auth frame order is canonical (must be rotated)")
 	}
-	if len(spec.authFrameOrder) != 4 || len(spec.tcpFrameOrder) != 3 || len(spec.udpFrameOrder) != 4 {
+	if len(spec.authFrameOrder) != 4 || len(spec.tcpFrameOrder) != 3 {
 		t.Fatalf("frame order lengths wrong")
 	}
-	// Each TCP/UDP element must appear exactly once.
+	// Each TCP element must appear exactly once.
 	if !isPerutation(spec.tcpFrameOrder) {
 		t.Fatalf("tcp frame order not a permutation: %v", spec.tcpFrameOrder)
-	}
-	if !isPermutationUdp(spec.udpFrameOrder) {
-		t.Fatalf("udp frame order not a permutation: %v", spec.udpFrameOrder)
 	}
 
 	// Different specs produce different orders (extremely likely; pick a spec
@@ -152,17 +149,6 @@ func isPerutation(order []TcpFrameElement) bool {
 	seen := [3]bool{}
 	for _, e := range order {
 		if int(e) < 0 || int(e) >= 3 || seen[int(e)] {
-			return false
-		}
-		seen[int(e)] = true
-	}
-	return true
-}
-
-func isPermutationUdp(order []UdpFrameElement) bool {
-	seen := [4]bool{}
-	for _, e := range order {
-		if int(e) < 0 || int(e) >= 4 || seen[int(e)] {
 			return false
 		}
 		seen[int(e)] = true

@@ -43,16 +43,6 @@ type TLSDialer interface {
 	DialTLSConn(ctx context.Context, conn net.Conn) (net.Conn, error)
 }
 
-// TCPRelayMode selects stream or UDP-over-TCP framing.
-type TCPRelayMode int
-
-const (
-	// TCPRelayTCP selects ordinary stream framing.
-	TCPRelayTCP TCPRelayMode = iota
-	// TCPRelayUoT selects UDP-over-TCP packet framing.
-	TCPRelayUoT
-)
-
 // TCPOptions builds an immutable TLS/TCP carrier Config.
 type TCPOptions struct {
 	Address        string
@@ -226,6 +216,14 @@ func (c *Config) Observer() diagnostic.Observer {
 		return nil
 	}
 	return c.observer
+}
+
+// Spec returns the configured effective spec.
+func (c *Config) Spec() *wire.EffectiveSpec {
+	if c == nil {
+		return nil
+	}
+	return c.spec
 }
 
 type observerLogger struct{ observer diagnostic.Observer }

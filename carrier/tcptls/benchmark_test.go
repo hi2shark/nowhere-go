@@ -20,7 +20,7 @@ func BenchmarkTCPPoolFreshAcquire(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+		conn, err := acquireTestTCPConn(context.Background(), b, pool, "example.com:443")
 		if err != nil {
 			b.Fatal(err)
 		}

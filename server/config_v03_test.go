@@ -32,7 +32,7 @@ func TestConfigDefaultsAndDefensiveNetworksCopy(t *testing.T) {
 	if !config.TCPEnabled() || !config.UDPEnabled() {
 		t.Fatalf("default networks: tcp=%v udp=%v", config.TCPEnabled(), config.UDPEnabled())
 	}
-	if config.Timeouts().Auth != DefaultAuthTimeout || config.Limits().PendingPairsGlobal != DefaultPendingPairsGlobal {
+	if config.Timeouts().Auth != DefaultAuthTimeout || config.Limits().PendingFlowsPerSession != DefaultPendingFlowsPerSession {
 		t.Fatalf("defaults not normalized: %+v %+v", config.Timeouts(), config.Limits())
 	}
 	networks := config.Networks()
@@ -71,7 +71,7 @@ func TestUpstreamHandoffPreservesCloseCause(t *testing.T) {
 	wantErr := errors.New("route failed")
 	handler, err := NewHandler(HandlerOptions{
 		Config: config,
-		Upstream: upstreamFuncs{stream: func(context.Context, net.Conn, net.Addr, string) error {
+		Upstream: upstreamFuncs{stream: func(context.Context, net.Conn, net.Addr, string, FlowReadiness) error {
 			return wantErr
 		}},
 	})
@@ -83,7 +83,7 @@ func TestUpstreamHandoffPreservesCloseCause(t *testing.T) {
 	callback := make(chan error, 1)
 	life := newLifecycle(context.Background(), left, func(err error) { callback <- err }, nil)
 	owned := &ownedConn{Conn: left, life: life}
-	if err := handler.routeStream(context.Background(), owned, nil, "example.com:443"); !errors.Is(err, wantErr) {
+	if err := handler.routeStream(context.Background(), owned, nil, "example.com:443", newFlowReadiness(nil, nil), nil); !errors.Is(err, wantErr) {
 		t.Fatalf("routeStream=%v want %v", err, wantErr)
 	}
 	if err := <-callback; !errors.Is(err, wantErr) {
@@ -148,7 +148,9 @@ func TestPairMetadataMismatchFailsOriginalHalf(t *testing.T) {
 	}()
 	time.Sleep(10 * time.Millisecond)
 	header.Role = wire.FlowRoleAttach
-	_, err := manager.SubmitTCP(context.Background(), wire.SessionID{1}, header, "b.example:443", second)
+	header.Uplink = wire.CarrierUDP
+	header.Downlink = wire.CarrierTCP
+	_, err := manager.SubmitTCP(context.Background(), wire.SessionID{1}, header, "", second)
 	if !errors.Is(err, ErrCarrierMismatch) {
 		t.Fatalf("second half: %v, want ErrCarrierMismatch", err)
 	}
@@ -257,23 +259,28 @@ func TestTCPAuthFailureWaitsForDeadlineAndClosesOnce(t *testing.T) {
 
 type noopUpstream struct{}
 
-func (noopUpstream) HandleStream(context.Context, net.Conn, net.Addr, string) error { return nil }
-func (noopUpstream) HandlePacket(context.Context, net.PacketConn, net.Addr, string) error {
+func (noopUpstream) HandleStream(context.Context, net.Conn, net.Addr, string, FlowReadiness) error {
+	return nil
+}
+func (noopUpstream) HandlePacket(context.Context, net.PacketConn, net.Addr, string, FlowReadiness) error {
 	return nil
 }
 
 type upstreamFuncs struct {
-	stream func(context.Context, net.Conn, net.Addr, string) error
-	packet func(context.Context, net.PacketConn, net.Addr, string) error
+	stream func(context.Context, net.Conn, net.Addr, string, FlowReadiness) error
+	packet func(context.Context, net.PacketConn, net.Addr, string, FlowReadiness) error
 }
 
-func (u upstreamFuncs) HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string) error {
-	return u.stream(ctx, conn, source, target)
+func (u upstreamFuncs) HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string, readiness FlowReadiness) error {
+	if u.stream == nil {
+		return nil
+	}
+	return u.stream(ctx, conn, source, target, readiness)
 }
 
-func (u upstreamFuncs) HandlePacket(ctx context.Context, conn net.PacketConn, source net.Addr, target string) error {
+func (u upstreamFuncs) HandlePacket(ctx context.Context, conn net.PacketConn, source net.Addr, target string, readiness FlowReadiness) error {
 	if u.packet == nil {
 		return nil
 	}
-	return u.packet(ctx, conn, source, target)
+	return u.packet(ctx, conn, source, target, readiness)
 }

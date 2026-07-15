@@ -2,11 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, test]
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * *"
 
 jobs:
   test:
@@ -68,6 +66,6 @@ jobs:
       - run: go test ./wire -run=^$ -fuzz=FuzzValidateAuthFrame -fuzztime=30s
       - run: go test ./wire -run=^$ -fuzz=FuzzDecodeTCPRequest -fuzztime=30s
       - run: go test ./wire -run=^$ -fuzz=FuzzReadFlowHeader -fuzztime=30s
-      - run: go test ./wire -run=^$ -fuzz=FuzzDecodeUDPFrames -fuzztime=30s
-      - run: go test ./wire -run=^$ -fuzz=FuzzReadUOTPacketFrame -fuzztime=30s
+      - run: go test ./wire -run=^$ -fuzz=^FuzzDecodeUDPFrame$ -fuzztime=30s
+      - run: go test ./wire -run=^$ -fuzz=^FuzzReadUOTFrame$ -fuzztime=30s
       - run: go test ./wire -run=^$ -fuzz=FuzzBuildEffectiveSpec -fuzztime=30s

@@ -1,8 +1,7 @@
 {
   "protocol": "nowhere-v1",
   "source": {
-    "rust": "Nowhere/src/tests/protocol/request.rs::tcp_request_fixed_vectors",
-    "go": "wire/frame_test.go::TestProtocolVectorsTCPRequest"
+    "rust": "Nowhere/src/tests/protocol/request.rs::tcp_request_fixed_vectors"
   },
   "cases": [
     {

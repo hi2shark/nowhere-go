@@ -35,6 +35,19 @@ func (l *capturingLogger) Warnf(format string, args ...any) {
 	l.Debugf(format, args...)
 }
 
+func acquireTestTCPConn(ctx context.Context, t testing.TB, pool *TCPPool, dest string) (net.Conn, error) {
+	t.Helper()
+	header := wire.FlowHeader{
+		Role: wire.FlowRoleDuplex, FlowID: 1, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierTCP,
+	}
+	half, err := pool.PrepareFlowHalf(ctx, dest, header)
+	if err != nil {
+		return nil, err
+	}
+	return half.Commit()
+}
+
 func TestTCPPoolWarmBorrowConsumesCarrier(t *testing.T) {
 	dialer := &recordingTCPDialer{}
 	pool := NewTCPPool(testTCPConfig(t, dialer), 1)
@@ -44,7 +57,7 @@ func TestTCPPoolWarmBorrowConsumesCarrier(t *testing.T) {
 	waitPoolIdle(t, pool, 1)
 	warm := dialer.connAt(0)
 
-	conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+	conn, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 	if err != nil {
 		t.Fatalf("Acquire warm: %v", err)
 	}
@@ -55,7 +68,8 @@ func TestTCPPoolWarmBorrowConsumesCarrier(t *testing.T) {
 
 	waitPoolIdle(t, pool, 1)
 	pool.mu.Lock()
-	idle := append([]*warmConn(nil), pool.idle...)
+	var idle []*warmConn
+	idle = append(idle, pool.idle...)
 	pool.mu.Unlock()
 	for _, wc := range idle {
 		if wc.conn == warm {
@@ -67,7 +81,7 @@ func TestTCPPoolWarmBorrowConsumesCarrier(t *testing.T) {
 	}
 }
 
-func TestTCPPoolFallsBackFreshWhenWarmActivationFails(t *testing.T) {
+func TestTCPPoolCommitFailsAndClosesWarmWhenActivationFails(t *testing.T) {
 	failingWarm := newRecordingNetConn("warm")
 	failingWarm.failWriteAt = 2 // auth write succeeds during prepare; request write fails during activation.
 	dialer := &recordingTCPDialer{queued: []*recordingNetConn{failingWarm}}
@@ -77,25 +91,19 @@ func TestTCPPoolFallsBackFreshWhenWarmActivationFails(t *testing.T) {
 	pool.prepareOne()
 	waitPoolIdle(t, pool, 1)
 
-	conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+	half, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", wire.FlowHeader{
+		Role: wire.FlowRoleDuplex, FlowID: 1, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierTCP,
+	})
 	if err != nil {
-		t.Fatalf("Acquire fallback: %v", err)
+		t.Fatalf("PrepareFlowHalf: %v", err)
 	}
-	defer conn.Close()
-	if got := trackedRecordingConn(t, conn); got == failingWarm {
-		t.Fatalf("Acquire returned the failed warm carrier")
+	_, err = half.Commit()
+	if err == nil {
+		t.Fatal("Commit succeeded; want warm activation failure")
 	}
 	if !failingWarm.closed() {
 		t.Fatalf("failed warm carrier was not closed")
-	}
-	waitPoolIdle(t, pool, 1)
-	pool.mu.Lock()
-	idle := len(pool.idle)
-	preparing := pool.preparing
-	target := pool.target
-	pool.mu.Unlock()
-	if idle+preparing > target {
-		t.Fatalf("pool overfilled after warm fallback: idle=%d preparing=%d target=%d", idle, preparing, target)
 	}
 }
 
@@ -118,7 +126,7 @@ func TestTCPPoolConcurrentAcquireUsesDistinctWarmCarriers(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+			conn, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 			if err != nil {
 				errs <- err
 				return
@@ -183,7 +191,7 @@ func TestTCPPoolZeroTargetConcurrentAcquireUsesParallelFreshDials(t *testing.T) 
 		go func() {
 			defer wg.Done()
 			<-start
-			conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+			conn, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 			if err != nil {
 				errs <- err
 				return
@@ -222,7 +230,7 @@ func TestTCPPoolEmptyPoolAcquireDoesNotWaitForBlockedWarmPrepare(t *testing.T) {
 	ctx := context.WithValue(context.Background(), freshDialContextKey{}, true)
 	done := make(chan error, 1)
 	go func() {
-		conn, err := pool.Acquire(ctx, "example.com:443", TCPRelayTCP)
+		conn, err := acquireTestTCPConn(ctx, t, pool, "example.com:443")
 		if err == nil {
 			_ = conn.Close()
 		}
@@ -286,7 +294,7 @@ func TestTCPPoolAcquireLogsOutcomeAndPoolSnapshot(t *testing.T) {
 	pool := NewTCPPool(testTCPConfig(t, dialer, logger), 0)
 	defer pool.Close()
 
-	conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+	conn, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -308,19 +316,19 @@ func TestTCPPoolAcquireLogsOutcomeAndPoolSnapshot(t *testing.T) {
 	}
 }
 
-func TestTCPPoolOpenTimingLogsFreshWarmAndFallbackPaths(t *testing.T) {
+func TestTCPPoolOpenTimingLogsFreshWarmAndCommitPaths(t *testing.T) {
 	logger := newCapturingLogger()
 	sub := logger.ch
 
 	freshPool := NewTCPPool(testTCPConfig(t, &recordingTCPDialer{}, logger), 0)
 	defer freshPool.Close()
-	freshConn, err := freshPool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+	freshConn, err := acquireTestTCPConn(context.Background(), t, freshPool, "example.com:443")
 	if err != nil {
 		t.Fatalf("Acquire fresh: %v", err)
 	}
 	_ = freshConn.Close()
 
-	payload := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh", "stage=fresh_tls")
+	payload := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh", "stage=flow_commit")
 	assertOpenTimingFields(t, payload, "network=tcp", "target=example.com:443", "server=127.0.0.1:1")
 
 	warmDialer := &recordingTCPDialer{}
@@ -335,7 +343,7 @@ func TestTCPPoolOpenTimingLogsFreshWarmAndFallbackPaths(t *testing.T) {
 		t.Fatalf("warm_prepare should use server= not target=: %q", preparePayload)
 	}
 
-	warmConn, err := warmPool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+	warmConn, err := acquireTestTCPConn(context.Background(), t, warmPool, "example.com:443")
 	if err != nil {
 		t.Fatalf("Acquire warm: %v", err)
 	}
@@ -346,23 +354,27 @@ func TestTCPPoolOpenTimingLogsFreshWarmAndFallbackPaths(t *testing.T) {
 
 	failingWarm := newRecordingNetConn("warm")
 	failingWarm.failWriteAt = 2
-	fallbackDialer := &recordingTCPDialer{queued: []*recordingNetConn{failingWarm}}
-	fallbackPool := NewTCPPool(testTCPConfig(t, fallbackDialer, logger), 1)
-	defer fallbackPool.Close()
-	fallbackPool.prepareOne()
-	waitPoolIdle(t, fallbackPool, 1)
+	failedDialer := &recordingTCPDialer{queued: []*recordingNetConn{failingWarm}}
+	failedPool := NewTCPPool(testTCPConfig(t, failedDialer, logger), 1)
+	defer failedPool.Close()
+	failedPool.prepareOne()
+	waitPoolIdle(t, failedPool, 1)
 	_ = waitForLogPayloads(t, sub, "open_timing", "outcome=warm_prepare", "stage=tls")
 
-	fallbackConn, err := fallbackPool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+	failedHalf, err := failedPool.PrepareFlowHalf(context.Background(), "example.com:443", wire.FlowHeader{
+		Role: wire.FlowRoleDuplex, FlowID: 2, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierTCP,
+	})
 	if err != nil {
-		t.Fatalf("Acquire fallback: %v", err)
+		t.Fatalf("Prepare warm half: %v", err)
 	}
-	_ = fallbackConn.Close()
+	_, err = failedHalf.Commit()
+	if err == nil {
+		t.Fatal("Commit succeeded; want warm activation failure")
+	}
 
 	failedWarmPayload := waitForLogPayloads(t, sub, "open_timing", "outcome=warm_failed", "stage=warm_activate")
 	assertOpenTimingFields(t, failedWarmPayload, "network=tcp", "target=example.com:443")
-	fallbackPayload := waitForLogPayloads(t, sub, "open_timing", "outcome=warm_failed_fresh", "stage=fresh_tls")
-	assertOpenTimingFields(t, fallbackPayload, "network=tcp", "target=example.com:443")
 }
 
 func TestTCPPoolOpenTimingLogsAsymmetricLanes(t *testing.T) {
@@ -379,11 +391,15 @@ func TestTCPPoolOpenTimingLogsAsymmetricLanes(t *testing.T) {
 		Uplink:   wire.CarrierTCP,
 		Downlink: wire.CarrierUDP,
 	}
-	flowConn, err := pool.AcquireFlowHalf(context.Background(), "example.com:443", header)
+	tcpHalf, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", header)
 	if err != nil {
 		t.Fatalf("AcquireFlowHalf: %v", err)
 	}
-	_ = flowConn.Close()
+	tcpConn, err := tcpHalf.Commit()
+	if err != nil {
+		t.Fatalf("Commit TCP half: %v", err)
+	}
+	_ = tcpConn.Close()
 
 	tcpPrepare := waitForLogPayloads(t, sub, "open_timing", "outcome=fresh_prepare", "stage=flow_prepare")
 	assertOpenTimingFields(t, tcpPrepare, "network=tcp", "target=example.com:443", "flow_id=42")
@@ -397,9 +413,13 @@ func TestTCPPoolOpenTimingLogsAsymmetricLanes(t *testing.T) {
 		Uplink:   wire.CarrierUDP,
 		Downlink: wire.CarrierTCP,
 	}
-	uotConn, err := pool.AcquireUDPFlowHalf(context.Background(), "example.com:443", uotHeader)
+	uotHalf, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", uotHeader)
 	if err != nil {
 		t.Fatalf("AcquireUDPFlowHalf: %v", err)
+	}
+	uotConn, err := uotHalf.Commit()
+	if err != nil {
+		t.Fatalf("Commit UDP half: %v", err)
 	}
 	_ = uotConn.Close()
 
@@ -561,7 +581,7 @@ func TestTCPPoolFreshAndAsymmetricLanesDoNotWarnIllegalTransition(t *testing.T) 
 	pool := NewTCPPool(cfg, 0)
 	defer pool.Close()
 
-	conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+	conn, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 	if err != nil {
 		t.Fatalf("Acquire fresh: %v", err)
 	}
@@ -574,7 +594,7 @@ func TestTCPPoolFreshAndAsymmetricLanesDoNotWarnIllegalTransition(t *testing.T) 
 		Uplink:   wire.CarrierTCP,
 		Downlink: wire.CarrierUDP,
 	}
-	flowConn, err := pool.AcquireFlowHalf(context.Background(), "example.com:443", header)
+	flowConn, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", header)
 	if err != nil {
 		t.Fatalf("AcquireFlowHalf: %v", err)
 	}
@@ -587,7 +607,7 @@ func TestTCPPoolFreshAndAsymmetricLanesDoNotWarnIllegalTransition(t *testing.T) 
 		Uplink:   wire.CarrierUDP,
 		Downlink: wire.CarrierTCP,
 	}
-	uotConn, err := pool.AcquireUDPFlowHalf(context.Background(), "example.com:443", uotHeader)
+	uotConn, err := pool.PrepareFlowHalf(context.Background(), "example.com:443", uotHeader)
 	if err != nil {
 		t.Fatalf("AcquireUDPFlowHalf: %v", err)
 	}
@@ -1053,7 +1073,7 @@ func TestTCPPoolUnreachableDoesNotAmplifyWarmPrepare(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+			_, _ = acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 		}()
 	}
 	wg.Wait()
@@ -1119,7 +1139,7 @@ func TestTCPPoolMaxConcurrentDialsCapsParallelFresh(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			conn, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+			conn, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 			if err == nil {
 				_ = conn.Close()
 			}
@@ -1330,7 +1350,7 @@ func TestTCPPoolPortalDialCoalescesRefused(t *testing.T) {
 	defer pool.Close()
 
 	// Seed degraded state.
-	if _, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP); err == nil {
+	if _, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443"); err == nil {
 		t.Fatal("expected refused")
 	}
 	seed := dialer.dials.Load()
@@ -1343,7 +1363,7 @@ func TestTCPPoolPortalDialCoalescesRefused(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := pool.Acquire(context.Background(), "example.com:443", TCPRelayTCP)
+			_, err := acquireTestTCPConn(context.Background(), t, pool, "example.com:443")
 			errs <- err
 		}()
 	}

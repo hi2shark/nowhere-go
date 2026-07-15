@@ -1,6 +1,6 @@
 # Nowhere-Go
 
-Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). The v0.3 line targets upstream **v1.3.3** (`962408bd`) and remains an integration preview.
+Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). This tree targets upstream **v1.4.0** at commit `3e20354ebfe70b1639a94055810581d966dbe44e`.
 
 This is a library, not a standalone proxy. Hosts such as [sing-box](https://github.com/SagerNet/sing-box) or [mihomo](https://github.com/MetaCubeX/mihomo) import it and supply platform pieces: TLS material, dialers, QUIC stacks, and routing.
 
@@ -16,15 +16,17 @@ go 1.20
 
 License: **GPL-3.0** (same family as upstream Nowhere).
 
+> **Lockstep upgrade required:** Nowhere 1.4 keeps ALPN `now/1`; it does not negotiate the 1.3/1.4 data-plane format. Upgrade the Rust Portal and every client together. Mixed 1.3.x/1.4.0 deployments can authenticate and then fail when opening flows.
+
 ---
 
 ## What you get
 
 | Side | Packages | Responsibility |
 |---|---|---|
-| Shared wire | `wire` | Spec derivation, auth frames, TCP request, UDP compact, UoT, flow headers |
+| Shared wire | `wire` | Spec derivation, auth, FLOW/FLOW_RESULT, NOWU fragmentation, typed UoT |
 | Outbound | `carrier/tcptls`, `carrier/quic`, `bundle` | Connection pool, injected QUIC dial backend, four-matrix session orchestration |
-| Inbound | `server` | Listen / accept orchestration, auth, asymmetric pairing, UoT, QUIC session loop, upstream handoff |
+| Inbound | `server` | Listen / accept orchestration, auth, flow pairing, NOWU/UoT state, QUIC session loop, upstream handoff |
 
 Hosts keep:
 
@@ -38,14 +40,14 @@ Hosts keep:
 
 ```text
 nowhere-go/
-├── wire/              # codec + EffectiveSpec
+├── wire/                       # shared 1.4 codec + EffectiveSpec
 ├── carrier/
-│   ├── tcptls/        # TLS/TCP pool (TCPDialer / TlsDialer injected)
-│   └── quic/          # outbound QuicBackend interfaces (no implementation)
-├── bundle/            # outbound CarrierBundle (up/down = tcp|udp)
-├── server/            # inbound Server / Handler / Upstream
-├── cmd/nowhere-check/ # CI helper (vectors / version) — not a proxy
-├── testdata/vectors/
+│   ├── tcptls/                 # TLS/TCP pool (TCPDialer / TLSDialer injected)
+│   └── quic/                   # outbound QuicBackend interfaces (no implementation)
+├── bundle/                     # outbound CarrierBundle (up/down = tcp|udp)
+├── server/                     # inbound Server / Handler / Upstream
+├── testdata/vectors/           # byte copy of harness/vectors for standalone CI
+├── cmd/nowhere-check/          # CI helper (vectors / version) — not a proxy
 └── tests/
 ```
 
@@ -99,16 +101,16 @@ if err != nil {
 }
 defer b.Close()
 
-conn, err := b.AsymmetricOpenTCP(ctx, "example.com:443")
+conn, err := b.OpenTCP(ctx, "example.com:443")
 ```
 
-Supported `Up`/`Down` pairs: `tcp/tcp`, `udp/udp`, `tcp/udp`, `udp/tcp`.
+Supported `Up`/`Down` pairs: `tcp/tcp`, `udp/udp`, `tcp/udp`, `udp/tcp`. In Nowhere 1.4 every logical TCP or UDP flow starts with a FLOW envelope; symmetric flows use `DUPLEX`, while mixed-carrier flows use `OPEN` plus `ATTACH`.
 
 ---
 
 ## Inbound (server)
 
-The `server` package is a full inbound implementation: auth, request decode, symmetric relay handoff, UoT, asymmetric FLOW_OPEN/ATTACH pairing, and QUIC session handling.
+The `server` package is a full inbound implementation: auth, FLOW/FLOW_RESULT handling, typed UoT, mixed-carrier pairing, NOWU reassembly, QUIC session replacement, and upstream handoff.
 
 Two integration styles:
 
@@ -171,10 +173,12 @@ QUIC: adapt your connection to `server.QuicConn` / `server.QuicListener`, then c
 
 ```go
 type Upstream interface {
-    HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string) error
-    HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string) error
+    HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string, readiness FlowReadiness) error
+    HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string, readiness FlowReadiness) error
 }
 ```
+
+The Upstream calls `readiness.Ready()` only after the target route is established, or `readiness.Reject(err)` when setup fails. The selected downlink carries the resulting FLOW_RESULT (or typed UoT result for TCP-carried UDP).
 
 On success the Upstream owns the wrapped connection lifecycle. Closing the wrapper or invoking the context `CloseHandler` closes every physical carrier and invokes each host callback exactly once. Normal close passes `nil`; terminal failures pass their cause. Callbacks run synchronously after close, must not block, and panics are isolated and reported to the Observer.
 
@@ -182,15 +186,16 @@ On success the Upstream owns the wrapped connection lifecycle. Closing the wrapp
 
 - Authentication: 5 seconds with `[0.8, 1.2]` jitter; request idle: 40 seconds
 - Pre-auth admission: 256 global, 32 per source (IPv4 `/32`, IPv6 `/64`)
-- Pending asymmetric pairs: 1024 per session, 4096 global; timeout: 5 seconds
-- QUIC UDP: 256 flows/session, 64 packets/flow, 4 MiB queued/session, 120 second idle
-- Active QUIC sessions: 1024; a matching session ID replaces the previous carrier
+- Pending mixed-carrier flows: 1024 per session; pair timeout: 15 seconds
+- UDP: 256 flows/session, 64 queued packets/flow, 4 MiB queued/session, 120 second idle
+- Authenticated idle TCP halves: 4096; active QUIC sessions: 1024
+- A matching QUIC session ID replaces the previous carrier and cancels its pending/active flows
 
 ### Default outbound TCP guardrails
 
 - Warm pool only for `tcp/tcp` (default target 5, max 9); consumed carriers never return
 - Fresh-first replenish: warm prepare starts only after a successful business dial
-- Max concurrent physical dials per outbound: 32
+- Max concurrent physical dials per outbound: 16
 - Warm-prepare failure backoff: 1s → 30s with jitter
 
 ---
@@ -199,10 +204,10 @@ On success the Upstream owns the wrapped connection lifecycle. Closing the wrapp
 
 | In nowhere-go | In the host |
 |---|---|
-| Wire codecs and session/flow state machines | Listen addresses, certs, ALPN product policy |
+| FLOW/NOWU/typed-UoT codecs and session/flow state machines | Listen addresses, certs, ALPN product policy |
 | TLS/TCP pool logic (dialers injected) | Actual `net.Dial` / TLS stacks |
-| Inbound Handler + pairing + UoT | Router / firewall / detour |
-| QUIC *interfaces* | QUIC *implementations* |
+| Inbound Handler, pairing, fragmentation and reassembly | Router / firewall / detour |
+| QUIC *interfaces* | QUIC *implementations*; no host-side wire codec or flow registry |
 
 Local development against a monorepo checkout: use a **gitignored**
 `go.work` at the workspace root (do **not** put `replace` in host `go.mod`):
@@ -213,9 +218,7 @@ go work init ./nowhere-go ./sing-box ./sing-box/test ./mihomo ./mihomo/test
 # or: go work use ./nowhere-go ./sing-box ...
 ```
 
-Host `go.mod` keeps only the published version, e.g.
-`require github.com/hi2shark/nowhere-go v0.3.0-rc.3`. Push/CI resolve that
-module; local edits to `nowhere-go/` are picked up via `go.work`.
+Host `go.mod` keeps only a published `nowhere-go` version that targets the same Nowhere 1.4 protocol baseline. Push/CI resolve that module; local edits to `nowhere-go/` are picked up via `go.work`.
 
 Temporarily ignore the workspace:
 

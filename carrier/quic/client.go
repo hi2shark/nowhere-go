@@ -8,22 +8,27 @@ import (
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-// PreparedFlowStream is an opened QUIC stream that has not yet written a FLOW frame.
+// PreparedStream is an opened QUIC stream that has not yet written setup bytes.
 // Exactly one of Commit or Close must run; both are idempotent via host Once.
-type PreparedFlowStream interface {
-	Commit(ctx context.Context, dest string, header wire.FlowHeader) (net.Conn, error)
+type PreparedStream interface {
+	// Commit writes opaque setup bytes, optionally finishes the write side, and returns the resulting net.Conn.
+	Commit(ctx context.Context, setup []byte, finishWrite bool) (net.Conn, error)
 	Close() error
 }
 
 // Backend is injected via bundle.BundleOptions.QUIC.
 type Backend interface {
 	SetSessionID(id wire.SessionID)
-	OpenTCP(ctx context.Context, dest string) (net.Conn, error)
-	OpenFlowStream(ctx context.Context, dest string, header wire.FlowHeader) (net.Conn, error)
-	// PrepareFlowStream opens a bidirectional stream without writing FLOW/request bytes.
-	PrepareFlowStream(ctx context.Context) (PreparedFlowStream, error)
-	OpenUDP(ctx context.Context, dest string) (net.PacketConn, error)
 	AcquireSession(ctx context.Context) (Session, error)
 	InvalidateSession(session Session)
-	Close()
+	Close() error
+}
+
+// Session is one authenticated QUIC connection.
+type Session interface {
+	PrepareStream(ctx context.Context) (PreparedStream, error)
+	ReceiveDatagram(ctx context.Context) ([]byte, error)
+	CurrentMaxDatagramSize() int
+	SendDatagram([]byte) error
+	LocalAddr() net.Addr
 }

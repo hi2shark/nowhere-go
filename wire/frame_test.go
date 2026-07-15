@@ -113,62 +113,55 @@ func TestProtocolVectorsTCPRequest(t *testing.T) {
 func TestUDPFrameRoundTrip(t *testing.T) {
 	cases := []struct {
 		name    string
-		key     string
-		spec    string
-		alpn    string
 		flowID  uint64
-		target  string
 		payload []byte
-		ftype   uint8
+		maxSize int
 	}{
-		{"req-auto", "secret", "auto", "now/1", 1, "1.2.3.4:53", []byte("hello"), UDPTypeRequest},
-		{"resp-custom", "key", "custom-spec", "", 0xdeadbeef, "[2001:db8::1]:443", []byte("world!"), UDPTypeResponse},
-		{"close-empty", "k", "", "h3", 0xffffffffffffffff, "example.org:80", nil, UDPTypeClose},
+		{"single", 1, []byte("hello"), 1200},
+		{"multi", 11, bytes.Repeat([]byte{0x5a}, 2500), 1200},
+		{"empty", 5, []byte{}, 64},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			spec, err := BuildEffectiveSpec(tc.key, tc.spec, tc.alpn)
+			frames, err := EncodeUDPDataFragments(tc.flowID, 1, tc.payload, tc.maxSize)
 			if err != nil {
-				t.Fatalf("BuildEffectiveSpec: %v", err)
+				t.Fatalf("EncodeUDPDataFragments: %v", err)
 			}
-			frame, err := EncodeUDPDatagram(tc.ftype, tc.flowID, tc.target, tc.payload, spec)
-			if err != nil {
-				t.Fatalf("EncodeUDPDatagram: %v", err)
+			var assembled []byte
+			for i, frame := range frames {
+				if len(frame) > tc.maxSize {
+					t.Fatalf("frame %d len %d exceeds max", i, len(frame))
+				}
+				decoded, err := DecodeUDPFrame(frame)
+				if err != nil {
+					t.Fatalf("DecodeUDPFrame frame %d: %v", i, err)
+				}
+				if decoded.Type != UDPFrameData {
+					t.Fatalf("frame %d type = %d", i, decoded.Type)
+				}
+				if decoded.FlowID != tc.flowID {
+					t.Fatalf("frame %d flow id = %d", i, decoded.FlowID)
+				}
+				assembled = append(assembled, decoded.Fragment.Payload...)
 			}
-			// Payload aliases buf; compare before reuse.
-			msg, err := DecodeUDPDatagram(frame, spec)
-			if err != nil {
-				t.Fatalf("DecodeUDPDatagram: %v", err)
-			}
-			if msg.Type != tc.ftype || msg.FlowID != tc.flowID || msg.Target != tc.target {
-				t.Fatalf("header mismatch: type=%d flow=%d target=%q", msg.Type, msg.FlowID, msg.Target)
-			}
-			if !bytes.Equal(msg.Payload, tc.payload) {
-				t.Fatalf("payload mismatch: got %x want %x", msg.Payload, tc.payload)
+			if !bytes.Equal(assembled, tc.payload) {
+				t.Fatalf("payload mismatch: got %x want %x", assembled, tc.payload)
 			}
 		})
 	}
 }
 
 func TestUDPFrameRejects(t *testing.T) {
-	spec, err := BuildEffectiveSpec("secret", "auto", "now/1")
-	if err != nil {
-		t.Fatalf("BuildEffectiveSpec: %v", err)
+	if _, err := EncodeUDPDataFragments(0, 1, []byte("x"), 64); err == nil {
+		t.Fatalf("EncodeUDPDataFragments accepted zero flow id")
 	}
-	if _, err := EncodeUDPDatagram(9, 1, "h:1", nil, spec); err == nil {
-		t.Fatalf("EncodeUDPDatagram accepted bad type")
+	if _, err := DecodeUDPFrame([]byte{0x01, 0x02}); err == nil {
+		t.Fatalf("DecodeUDPFrame accepted short buffer")
 	}
-	if _, err := DecodeUDPDatagram([]byte{0x01, 0x02}, spec); err == nil {
-		t.Fatalf("DecodeUDPDatagram accepted short buffer")
-	}
-	frame, err := EncodeUDPDatagram(UDPTypeResponse, 7, "h:1", []byte("x"), spec)
-	if err != nil {
-		t.Fatalf("EncodeUDPDatagram: %v", err)
-	}
-	corrupt := append([]byte(nil), frame...)
-	corrupt[0] ^= 0xff
-	if _, err := DecodeUDPDatagram(corrupt, spec); err == nil {
-		t.Fatalf("DecodeUDPDatagram accepted corrupt version")
+	closeFrame, _ := EncodeUDPClose(7)
+	closeFrame = append(closeFrame, 0)
+	if _, err := DecodeUDPFrame(closeFrame); err == nil {
+		t.Fatalf("DecodeUDPFrame accepted close with payload")
 	}
 }
 
@@ -205,30 +198,25 @@ func TestTCPRequestRejects(t *testing.T) {
 }
 
 func TestUOTFraming(t *testing.T) {
-	setup, err := EncodeUOTSetupTarget("[::1]:443")
-	if err != nil {
-		t.Fatalf("EncodeUOTSetupTarget: %v", err)
-	}
-	if int(setup[0])<<8|int(setup[1]) != len("[::1]:443") {
-		t.Fatalf("setup length prefix wrong: %x", setup[:2])
-	}
-
 	pkt := []byte("payload bytes")
-	frame, err := WriteUOTPacketFrame(pkt)
+	frame, err := EncodeUOTFrame(UOTFrame{Kind: UOTFrameData, Payload: pkt})
 	if err != nil {
-		t.Fatalf("WriteUOTPacketFrame: %v", err)
+		t.Fatalf("EncodeUOTFrame: %v", err)
 	}
-	got, consumed, err := ReadUOTPacketFrame(frame)
+	got, err := ReadUOTFrame(bytes.NewReader(frame))
 	if err != nil {
-		t.Fatalf("ReadUOTPacketFrame: %v", err)
+		t.Fatalf("ReadUOTFrame: %v", err)
 	}
-	if consumed != len(frame) || !bytes.Equal(got, pkt) {
-		t.Fatalf("packet mismatch: got %x consumed %d", got, consumed)
+	if got.Kind != UOTFrameData || !bytes.Equal(got.Payload, pkt) {
+		t.Fatalf("packet mismatch: got %+v", got)
 	}
 
 	big := make([]byte, 0x10000)
-	if _, err := WriteUOTPacketFrame(big); err == nil {
-		t.Fatalf("WriteUOTPacketFrame accepted oversized payload")
+	if _, err := EncodeUOTFrame(UOTFrame{Kind: UOTFrameData, Payload: big}); err == nil {
+		t.Fatalf("EncodeUOTFrame accepted oversized payload")
+	}
+	if _, err := EncodeUOTFrame(UOTFrame{Kind: UOTFrameReady, Payload: []byte{1}}); err == nil {
+		t.Fatal("EncodeUOTFrame accepted READY with payload")
 	}
 }
 
@@ -268,70 +256,6 @@ func TestAuthFrameValidation(t *testing.T) {
 	short := frame[:len(frame)-1]
 	if _, err := ValidateAuthFrame(short, "secret", spec); err == nil {
 		t.Fatalf("ValidateAuthFrame accepted short frame")
-	}
-}
-
-func TestCompactUDPFrameRoundTrip(t *testing.T) {
-	// OPEN_DATA downlink carrier byte must round-trip (Portal pairing key).
-	enc, err := EncodeUDPOpenData(0xdeadbeef, CarrierTCP, "1.2.3.4:53", []byte("payload"))
-	if err != nil {
-		t.Fatalf("EncodeUDPOpenData: %v", err)
-	}
-	dec, err := DecodeUDPCompact(enc)
-	if err != nil {
-		t.Fatalf("DecodeUDPCompact: %v", err)
-	}
-	if dec.Type != UDPTypeOpenData || dec.FlowID != 0xdeadbeef || dec.Downlink != CarrierTCP ||
-		dec.Target != "1.2.3.4:53" || string(dec.Payload) != "payload" {
-		t.Fatalf("open data mismatch: %+v", dec)
-	}
-
-	ack, err := EncodeUDPCompact(UDPTypeOpenAck, 7, nil)
-	if err != nil {
-		t.Fatalf("EncodeUDPCompact ack: %v", err)
-	}
-	if got, err := DecodeUDPCompact(ack); err != nil || got.Type != UDPTypeOpenAck || got.FlowID != 7 {
-		t.Fatalf("ack round-trip: got %+v err %v", got, err)
-	}
-
-	data, err := EncodeUDPCompact(UDPTypeData, 7, []byte("xx"))
-	if err != nil {
-		t.Fatalf("EncodeUDPCompact data: %v", err)
-	}
-	if got, err := DecodeUDPCompact(data); err != nil || got.Type != UDPTypeData ||
-		got.FlowID != 7 || string(got.Payload) != "xx" {
-		t.Fatalf("data round-trip: got %+v err %v", got, err)
-	}
-
-	cl, err := EncodeUDPCompact(UDPTypeCompactClose, 7, nil)
-	if err != nil {
-		t.Fatalf("EncodeUDPCompact close: %v", err)
-	}
-	if got, err := DecodeUDPCompact(cl); err != nil || got.Type != UDPTypeCompactClose || got.FlowID != 7 {
-		t.Fatalf("close round-trip: got %+v err %v", got, err)
-	}
-}
-
-func TestCompactUDPFrameRejects(t *testing.T) {
-	if _, err := EncodeUDPOpenData(0, CarrierUDP, "h:1", nil); err == nil {
-		t.Fatalf("EncodeUDPOpenData accepted zero flow id")
-	}
-	if _, err := EncodeUDPCompact(UDPTypeData, 0, nil); err == nil {
-		t.Fatalf("EncodeUDPCompact accepted zero flow id")
-	}
-	if _, err := EncodeUDPCompact(UDPTypeOpenAck, 1, []byte("x")); err == nil {
-		t.Fatalf("EncodeUDPCompact accepted payload on control frame")
-	}
-	if _, err := EncodeUDPCompact(0x99, 1, nil); err == nil {
-		t.Fatalf("EncodeUDPCompact accepted bad type")
-	}
-	short := []byte{ProxyFrameVersion, UDPTypeOpenData, 0, 0, 0, 0, 0, 0, 0, 1, 1}
-	if _, err := DecodeUDPCompact(short); err == nil {
-		t.Fatalf("DecodeUDPCompact accepted short OPEN_DATA")
-	}
-	bad := []byte{0x02, UDPTypeData, 0, 0, 0, 0, 0, 0, 0, 1}
-	if _, err := DecodeUDPCompact(bad); err == nil {
-		t.Fatalf("DecodeUDPCompact accepted wrong version")
 	}
 }
 

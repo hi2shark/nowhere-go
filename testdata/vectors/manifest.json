@@ -1,25 +1,28 @@
 {
   "protocol": "nowhere-v1",
-  "upstream_version": "v1.3.3",
-  "upstream_commit": "962408bd702591587ff5ed7e2f638d23b996834f",
-  "exported_at": "2026-07-09",
+  "upstream_version": "1.4.0",
+  "upstream_commit": "3e20354ebfe70b1639a94055810581d966dbe44e",
+  "exporter_version": "nowhere-vector-export/1",
   "sources": {
     "protocol_md": "Nowhere/docs/protocol.md",
     "rust_auth": "Nowhere/src/tests/protocol/crypto.rs::auth_frame_fixed_nonce_vectors",
-    "rust_tcp": "Nowhere/src/tests/protocol/request.rs::tcp_request_fixed_vectors",
-    "rust_compact_udp": "Nowhere/src/tests/protocol/datagram.rs::compact_udp_open_data_and_data_round_trip",
+    "rust_flow": "Nowhere/src/tests/protocol/flow.rs::duplex_and_result_vectors_match_the_swift_codec",
     "rust_target": "Nowhere/src/tests/protocol/util.rs::validates_host_port_forms",
-    "go": "wire/frame_test.go"
+    "rust_tcp": "Nowhere/src/tests/protocol/request.rs::tcp_request_fixed_vectors",
+    "rust_udp": "Nowhere/src/tests/protocol/datagram.rs::fixed_vectors_match_the_swift_codec",
+    "rust_uot": "Nowhere/src/tests/protocol/uot.rs::typed_frames_distinguish_empty_data_ready_reject_close_and_eof"
   },
   "files": [
     "auth.json",
     "tcp_request.json",
-    "udp_compact.json",
-    "target_addr.json"
+    "target_addr.json",
+    "flow.json",
+    "udp_nowu.json",
+    "uot_typed.json"
   ],
   "notes": [
-    "auth.auto is 94 bytes; auth.edge-a is longer due to derived padding layout",
-    "Implementations must not hand-write a second divergent hex set",
-    "flow_envelope.json may be added when H1/H2 needs fixed envelope vectors"
+    "harness/vectors is the authoritative Nowhere 1.4.0 corpus",
+    "nowhere-go/testdata/vectors is a byte-for-byte module-local copy written by export-rust-vectors.sh",
+    "complete wire hex tables must not be maintained by hand"
   ]
 }

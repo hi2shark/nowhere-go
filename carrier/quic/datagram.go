@@ -1,11 +1,23 @@
 package quic
 
-import "net"
+import "fmt"
 
-// UDPFlow is a DATAGRAM-backed UDP flow on an authenticated Session.
-type UDPFlow interface {
-	FlowID() uint64
-	IsAcked() bool
-	WaitReadFrom() (data []byte, put func(), addr net.Addr, err error)
-	Shutdown(err error)
+// DatagramTooLargeError is returned when a DATAGRAM exceeds the current path limit.
+type DatagramTooLargeError struct {
+	MaxDatagramSize int
+	Cause           error
+}
+
+func (e *DatagramTooLargeError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("nowhere: datagram too large (max %d): %v", e.MaxDatagramSize, e.Cause)
+}
+
+func (e *DatagramTooLargeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }

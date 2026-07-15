@@ -67,7 +67,7 @@ func NewCarrierBundle(options BundleOptions) (*CarrierBundle, error) {
 	bundle := &CarrierBundle{cfg: bundleConfig{
 		quic: options.QUIC, tcp: options.TCP, poolSize: options.PoolSize,
 		prewarmOnStart: options.PrewarmOnStart,
-		up: options.Up, down: options.Down,
+		up:             options.Up, down: options.Down,
 	}}
 	bundle.nextFlowID.Store(1)
 	if _, err := bundle.SessionID(); err != nil {
@@ -112,11 +112,17 @@ func (b *CarrierBundle) Asymmetric() bool { return b.cfg.up != b.cfg.down }
 // PoolTarget returns the configured TLS/TCP idle-pool target.
 func (b *CarrierBundle) PoolTarget() int { return b.cfg.poolSize }
 
-func (b *CarrierBundle) allocFlowID() uint64 {
+// ErrFlowIDExhausted is returned after a bundle has allocated every nonzero flow ID.
+var ErrFlowIDExhausted = errors.New("nowhere: flow id space exhausted")
+
+func (b *CarrierBundle) allocFlowID() (uint64, error) {
 	for {
-		id := b.nextFlowID.Add(1) - 1
-		if id != 0 {
-			return id
+		next := b.nextFlowID.Load()
+		if next == 0 {
+			return 0, ErrFlowIDExhausted
+		}
+		if b.nextFlowID.CompareAndSwap(next, next+1) {
+			return next, nil
 		}
 	}
 }
@@ -130,7 +136,7 @@ func (b *CarrierBundle) quicClient() (carrier.QuicBackend, error) {
 			b.quicErr = err
 			return
 		}
-		b.quic = b.cfg.quic
+		b.quic = newQUICMuxBackend(b.cfg.quic)
 	})
 	return b.quic, b.quicErr
 }
@@ -170,10 +176,4 @@ func (b *CarrierBundle) Close() {
 func (b *CarrierBundle) quicClientSync() carrier.QuicBackend {
 	client, _ := b.quicClient()
 	return client
-}
-
-func (b *CarrierBundle) releaseQUICFlow(session carrier.QuicSession, flow carrier.QuicUDPFlow) {
-	if session != nil && flow != nil {
-		session.ReleaseUDPAsymmetricFlow(flow.FlowID())
-	}
 }

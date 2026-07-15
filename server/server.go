@@ -11,6 +11,16 @@ import (
 	"github.com/hi2shark/nowhere-go/diagnostic"
 )
 
+var errTCPListenerConflict = errors.New("nowhere: TCP listener already installed")
+
+type tcpListenerInstall uint8
+
+const (
+	tcpListenerInstalled tcpListenerInstall = iota
+	tcpListenerReused
+	tcpListenerRejected
+)
+
 // ServerOptions configures the standalone Portal-like listener orchestrator.
 type ServerOptions struct {
 	Config       *Config
@@ -32,6 +42,7 @@ type Server struct {
 	mu       sync.Mutex
 	listener net.Listener
 	closed   bool
+	shutdown cleanupCoordinator
 }
 
 // NewServer validates all required standalone dependencies.
@@ -78,24 +89,33 @@ func (s *Server) ListenAndServe(ctx context.Context, tcpAddr string) error {
 		if err != nil {
 			return err
 		}
-		s.mu.Lock()
-		s.listener = listener
-		s.mu.Unlock()
+		installed, err := s.installTCPListener(listener)
+		if err != nil {
+			return err
+		}
+		if installed != tcpListenerInstalled {
+			return nil
+		}
 		errCh := make(chan error, 2)
-		go func() { errCh <- s.Serve(ctx, listener) }()
+		go func() { errCh <- s.serveTCP(ctx, listener) }()
 		if s.config.UDPEnabled() {
 			go func() { errCh <- s.ServeQUIC(ctx) }()
 		}
 		select {
 		case <-ctx.Done():
-			_ = s.Close()
+			_ = s.shutdownAndWait(ctx)
 			return ctx.Err()
 		case err := <-errCh:
-			_ = s.Close()
+			_ = s.shutdownAndWait(ctx)
 			return err
 		}
 	}
-	return s.ServeQUIC(ctx)
+	err := s.ServeQUIC(ctx)
+	_ = s.shutdownAndWait(ctx)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // Serve accepts raw TCP connections and delegates TLS plus protocol handling.
@@ -106,9 +126,17 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if listener == nil {
 		return fmt.Errorf("%w: nil listener", ErrInvalidConfig)
 	}
-	s.mu.Lock()
-	s.listener = listener
-	s.mu.Unlock()
+	installed, err := s.installTCPListener(listener)
+	if err != nil {
+		return err
+	}
+	if installed != tcpListenerInstalled {
+		return nil
+	}
+	return s.serveTCP(ctx, listener)
+}
+
+func (s *Server) serveTCP(ctx context.Context, listener net.Listener) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -131,18 +159,51 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	}
 }
 
+func (s *Server) installTCPListener(listener net.Listener) (tcpListenerInstall, error) {
+	s.mu.Lock()
+	current := s.listener
+	closed := s.closed
+	switch {
+	case current == listener:
+		s.mu.Unlock()
+		return tcpListenerReused, nil
+	case closed:
+		s.mu.Unlock()
+		_ = listener.Close()
+		return tcpListenerRejected, nil
+	case current != nil:
+		s.mu.Unlock()
+		_ = listener.Close()
+		return tcpListenerRejected, errTCPListenerConflict
+	default:
+		s.listener = listener
+		s.mu.Unlock()
+		return tcpListenerInstalled, nil
+	}
+}
+
 // ServeQUIC accepts QUIC connections from the injected listener.
 func (s *Server) ServeQUIC(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
-	if s.quicListener == nil {
+	s.mu.Lock()
+	listener := s.quicListener
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return nil
+	}
+	if listener == nil {
 		return ErrQUICNotConfigured
 	}
 	for {
-		conn, err := s.quicListener.Accept(ctx)
+		conn, err := listener.Accept(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+			s.mu.Lock()
+			closed = s.closed
+			s.mu.Unlock()
+			if closed || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			select {
@@ -159,33 +220,84 @@ func (s *Server) ServeQUIC(ctx context.Context) error {
 	}
 }
 
-// Close shuts down listeners and all manager-owned state.
+func (s *Server) shutdownAndWait(ctx context.Context) error {
+	_ = s.Shutdown(ctx)
+	if done := s.shutdown.Done(); done != nil {
+		return s.shutdown.waitDone(done)
+	}
+	return nil
+}
+
+// Shutdown stops new work and releases listeners and handler-owned resources.
+// The initiating context is the single cleanup deadline; every caller may stop
+// waiting at its own deadline while the shared cleanup continues to completion.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var listener net.Listener
+	var quicListener QuicListener
+	done, started := s.shutdown.start(ctx, func() {
+		s.mu.Lock()
+		s.closed = true
+		listener = s.listener
+		quicListener = s.quicListener
+		s.quicListener = nil
+		s.mu.Unlock()
+		if s.handler != nil && s.handler.tasks != nil {
+			s.handler.tasks.BeginClose()
+		}
+	}, func(cleanupCtx context.Context) error {
+		return s.shutdownCleanup(cleanupCtx, listener, quicListener)
+	})
+	err := s.shutdown.wait(ctx, done)
+	if started && ctx.Err() != nil && s.handler != nil {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = ctx.Err()
+		}
+		forcedCause := markForcedTermination(cause)
+		if s.handler.claims != nil {
+			s.handler.claims.AbortClosing(forcedCause)
+		}
+		if s.handler.tasks != nil {
+			s.handler.tasks.ForceDetach(forcedCause)
+		}
+	}
+	return err
+}
+
+func (s *Server) shutdownCleanup(ctx context.Context, listener net.Listener, quicListener QuicListener) error {
+	var shutdownErr error
+	if listener != nil {
+		shutdownErr = listener.Close()
+	}
+	if quicListener != nil {
+		if err := quicListener.Close(); err != nil && shutdownErr == nil {
+			shutdownErr = err
+		}
+	}
+	if s.handler != nil {
+		done, _ := s.handler.beginShutdown(ctx)
+		if err := s.handler.shutdown.waitDone(done); err != nil {
+			shutdownErr = err
+		}
+	}
+	return shutdownErr
+}
+
+// Close applies this server's normalized shutdown timeout.
 func (s *Server) Close() error {
 	if s == nil {
 		return nil
 	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
-	}
-	s.closed = true
-	listener := s.listener
-	s.listener = nil
-	s.mu.Unlock()
-	var closeErr error
-	if listener != nil {
-		closeErr = listener.Close()
-	}
-	if s.handler != nil {
-		_ = s.handler.Close()
-	}
-	if s.quicListener != nil {
-		if err := s.quicListener.Close(); err != nil && closeErr == nil {
-			closeErr = err
-		}
-	}
-	return closeErr
+	timeout := s.config.timeouts.Shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return s.Shutdown(ctx)
 }
 
 func (s *Server) validate() error {

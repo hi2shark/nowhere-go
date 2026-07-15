@@ -5,15 +5,14 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 	"time"
 )
 
 // Upstream receives decoded Nowhere streams / packet flows after auth + framing.
 // On success the Upstream owns conn/pc lifecycle (including any CloseHandler in ctx).
 type Upstream interface {
-	HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string) error
-	HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string) error
+	HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string, readiness FlowReadiness) error
+	HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string, readiness FlowReadiness) error
 }
 
 type ctxKeyClose struct{}
@@ -39,7 +38,8 @@ type Dialer interface {
 
 // DialUpstream is a simple Portal-like upstream that dials the target and copies.
 type DialUpstream struct {
-	Dialer Dialer
+	Dialer       Dialer
+	tcpReadGrace time.Duration
 }
 
 // NewDialUpstream returns a DialUpstream using d, or net.Dialer if d is nil.
@@ -47,84 +47,112 @@ func NewDialUpstream(d Dialer) *DialUpstream {
 	if d == nil {
 		d = &net.Dialer{}
 	}
-	return &DialUpstream{Dialer: d}
+	return &DialUpstream{Dialer: d, tcpReadGrace: DefaultTCPReadGrace}
 }
 
-func (u *DialUpstream) HandleStream(ctx context.Context, conn net.Conn, _ net.Addr, target string) error {
+func (u *DialUpstream) withTCPReadGrace(grace time.Duration) *DialUpstream {
+	clone := *u
+	clone.tcpReadGrace = grace
+	return &clone
+}
+
+func (u *DialUpstream) HandleStream(ctx context.Context, conn net.Conn, _ net.Addr, target string, readiness FlowReadiness) error {
 	remote, err := u.Dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
-		return err // caller still owns conn / onClose
+		if readiness != nil {
+			return errors.Join(err, readiness.Reject(err))
+		}
+		return err
 	}
 	defer remote.Close()
-	err = relay(conn, remote)
+	if readiness != nil {
+		if err := readiness.Ready(); err != nil {
+			return err
+		}
+	}
+	err = relay(conn, remote, u.tcpReadGrace)
 	if onClose := CloseHandlerFromContext(ctx); onClose != nil {
 		onClose(err)
 	}
-	return nil // ownership taken
+	return nil
 }
 
-func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ net.Addr, target string) error {
-	udpAddr, err := net.ResolveUDPAddr("udp", target)
+func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ net.Addr, target string, readiness FlowReadiness) error {
+	remote, err := u.Dialer.DialContext(ctx, "udp", target)
 	if err != nil {
+		if readiness != nil {
+			return errors.Join(err, readiness.Reject(err))
+		}
 		return err
 	}
-	remote, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		return err
+	if readiness != nil {
+		if err := readiness.Ready(); err != nil {
+			_ = remote.Close()
+			return err
+		}
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	destination := remote.RemoteAddr()
+	if destination == nil {
+		destination = parseTargetAddr(target)
+	}
+	done := make(chan error, 2)
 	go func() {
-		defer wg.Done()
 		buf := make([]byte, 65535)
 		for {
 			n, _, err := pc.ReadFrom(buf)
 			if err != nil {
+				done <- err
 				return
 			}
-			if _, err := remote.WriteTo(buf[:n], udpAddr); err != nil {
+			if _, err := remote.Write(buf[:n]); err != nil {
+				done <- err
 				return
 			}
 		}
 	}()
 	go func() {
-		defer wg.Done()
 		buf := make([]byte, 65535)
 		for {
-			n, _, err := remote.ReadFrom(buf)
+			n, err := remote.Read(buf)
 			if err != nil {
+				done <- err
 				return
 			}
-			if _, err := pc.WriteTo(buf[:n], udpAddr); err != nil {
+			if _, err := pc.WriteTo(buf[:n], destination); err != nil {
+				done <- err
 				return
 			}
 		}
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
 	}()
 
 	var retErr error
+	completed := 0
 	select {
 	case <-ctx.Done():
-		retErr = ctx.Err()
-	case <-done:
-		retErr = nil
+		retErr = context.Cause(ctx)
+		if retErr == nil {
+			retErr = ctx.Err()
+		}
+	case retErr = <-done:
+		completed = 1
 	}
 	closePacketConnWithError(pc, retErr)
 	_ = remote.Close()
-	<-done
+	for completed < 2 {
+		<-done
+		completed++
+	}
 	if onClose := CloseHandlerFromContext(ctx); onClose != nil {
 		onClose(retErr)
 	}
-	return nil // ownership taken
+	return nil
 }
 
-func relay(a, b net.Conn) error {
+func relay(a, b net.Conn, readGrace time.Duration) error {
+	if readGrace <= 0 {
+		readGrace = DefaultTCPReadGrace
+	}
 	type result struct {
 		direction int
 		err       error
@@ -146,7 +174,7 @@ func relay(a, b net.Conn) error {
 	} else if closer, ok := b.(interface{ CloseWrite() error }); ok {
 		_ = closer.CloseWrite()
 	}
-	timer := time.NewTimer(DefaultTCPReadGrace)
+	timer := time.NewTimer(readGrace)
 	var second result
 	select {
 	case second = <-done:

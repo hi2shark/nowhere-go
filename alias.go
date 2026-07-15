@@ -5,10 +5,9 @@ import "github.com/hi2shark/nowhere-go/wire"
 // Convenience re-exports; prefer importing wire directly in new code.
 
 const (
-	DefaultALPN    = wire.DefaultALPN
-	DefaultSpec    = wire.DefaultSpec
-	UOTMagicTarget = wire.UOTMagicTarget
-	SessionIDLen   = wire.SessionIDLen
+	DefaultALPN  = wire.DefaultALPN
+	DefaultSpec  = wire.DefaultSpec
+	SessionIDLen = wire.SessionIDLen
 )
 
 type SessionID = wire.SessionID

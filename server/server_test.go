@@ -103,12 +103,22 @@ func TestServerTCPEchoDialUpstream(t *testing.T) {
 	}
 
 	target := echoLn.Addr().String()
-	req, err := wire.EncodeTCPRequest(target, cfg.EffectiveSpec())
+	setup, err := wire.EncodeFlowSetup(wire.FlowHeader{
+		Role: wire.FlowRoleDuplex, FlowID: 1, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierTCP,
+	}, target, cfg.EffectiveSpec())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tlsConn.Write(req); err != nil {
+	if _, err := tlsConn.Write(setup); err != nil {
 		t.Fatal(err)
+	}
+	result, err := wire.ReadFlowResult(tlsConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.FlowStatusReady {
+		t.Fatalf("flow result = %+v", result)
 	}
 
 	payload := []byte("hello-nowhere")

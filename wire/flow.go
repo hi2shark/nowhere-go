@@ -6,9 +6,9 @@ import (
 	"io"
 )
 
-// Asymmetric-flow envelope prepended to request frames when up != down.
+// Flow envelope prepended to every Nowhere 1.4 logical flow.
 const (
-	FlowFrameMagic   byte = 0xf1 // distinguishes envelope from ordinary request (version byte)
+	FlowFrameMagic   byte = 0xf1
 	FlowFrameVersion byte = 1
 	FlowHeaderLen         = 14
 )
@@ -18,6 +18,7 @@ type FlowRole uint8
 const (
 	FlowRoleOpen   FlowRole = 1 // uplink: client->target
 	FlowRoleAttach FlowRole = 2 // downlink: target->client
+	FlowRoleDuplex FlowRole = 3 // one carrier owns both directions
 )
 
 type FlowKind uint8
@@ -45,24 +46,8 @@ type FlowHeader struct {
 var ErrInvalidFlowHeader = errors.New("nowhere: invalid flow header")
 
 func WriteFlowHeader(h FlowHeader) ([FlowHeaderLen]byte, error) {
-	if h.FlowID == 0 {
-		return [FlowHeaderLen]byte{}, errors.New("nowhere: zero flow id")
-	}
-	if h.Role != FlowRoleOpen && h.Role != FlowRoleAttach {
-		return [FlowHeaderLen]byte{}, errors.New("nowhere: invalid flow role")
-	}
-	if h.Kind != FlowKindTCP && h.Kind != FlowKindUDP {
-		return [FlowHeaderLen]byte{}, errors.New("nowhere: invalid flow kind")
-	}
-	if h.Uplink != CarrierTCP && h.Uplink != CarrierUDP {
-		return [FlowHeaderLen]byte{}, errors.New("nowhere: invalid uplink carrier")
-	}
-	if h.Downlink != CarrierTCP && h.Downlink != CarrierUDP {
-		return [FlowHeaderLen]byte{}, errors.New("nowhere: invalid downlink carrier")
-	}
-	// Symmetric carriers must not use the envelope.
-	if h.Uplink == h.Downlink {
-		return [FlowHeaderLen]byte{}, errors.New("nowhere: uplink must differ from downlink")
+	if err := validateFlowHeader(h); err != nil {
+		return [FlowHeaderLen]byte{}, err
 	}
 	var out [FlowHeaderLen]byte
 	out[0] = FlowFrameMagic
@@ -83,34 +68,57 @@ func ReadFlowHeader(r io.Reader) (FlowHeader, error) {
 	if buf[0] != FlowFrameMagic || buf[1] != FlowFrameVersion {
 		return FlowHeader{}, ErrInvalidFlowHeader
 	}
-	role := FlowRole(buf[2])
-	if role != FlowRoleOpen && role != FlowRoleAttach {
+	header := FlowHeader{
+		Role:     FlowRole(buf[2]),
+		FlowID:   binary.BigEndian.Uint64(buf[3:11]),
+		Kind:     FlowKind(buf[11]),
+		Uplink:   Carrier(buf[12]),
+		Downlink: Carrier(buf[13]),
+	}
+	if err := validateFlowHeader(header); err != nil {
 		return FlowHeader{}, ErrInvalidFlowHeader
 	}
-	flowID := binary.BigEndian.Uint64(buf[3:11])
-	if flowID == 0 {
-		return FlowHeader{}, ErrInvalidFlowHeader
+	return header, nil
+}
+
+// EncodeFlowSetup writes the common header and, except for Attach, one target request.
+func EncodeFlowSetup(header FlowHeader, target string, spec *EffectiveSpec) ([]byte, error) {
+	encodedHeader, err := WriteFlowHeader(header)
+	if err != nil {
+		return nil, err
 	}
-	kind := FlowKind(buf[11])
-	if kind != FlowKindTCP && kind != FlowKindUDP {
-		return FlowHeader{}, ErrInvalidFlowHeader
+	setup := append([]byte(nil), encodedHeader[:]...)
+	if header.Role == FlowRoleAttach {
+		return setup, nil
 	}
-	uplink := Carrier(buf[12])
-	downlink := Carrier(buf[13])
-	if uplink != CarrierTCP && uplink != CarrierUDP {
-		return FlowHeader{}, ErrInvalidFlowHeader
+	request, err := EncodeTCPRequest(target, spec)
+	if err != nil {
+		return nil, err
 	}
-	if downlink != CarrierTCP && downlink != CarrierUDP {
-		return FlowHeader{}, ErrInvalidFlowHeader
+	return append(setup, request...), nil
+}
+
+func validateFlowHeader(header FlowHeader) error {
+	if header.FlowID == 0 {
+		return errors.New("nowhere: zero flow id")
 	}
-	if uplink == downlink {
-		return FlowHeader{}, ErrInvalidFlowHeader
+	if header.Role != FlowRoleOpen && header.Role != FlowRoleAttach && header.Role != FlowRoleDuplex {
+		return errors.New("nowhere: invalid flow role")
 	}
-	return FlowHeader{
-		Role:     role,
-		FlowID:   flowID,
-		Kind:     kind,
-		Uplink:   uplink,
-		Downlink: downlink,
-	}, nil
+	if header.Kind != FlowKindTCP && header.Kind != FlowKindUDP {
+		return errors.New("nowhere: invalid flow kind")
+	}
+	if header.Uplink != CarrierTCP && header.Uplink != CarrierUDP {
+		return errors.New("nowhere: invalid uplink carrier")
+	}
+	if header.Downlink != CarrierTCP && header.Downlink != CarrierUDP {
+		return errors.New("nowhere: invalid downlink carrier")
+	}
+	if header.Role == FlowRoleDuplex && header.Uplink != header.Downlink {
+		return errors.New("nowhere: duplex carriers must match")
+	}
+	if header.Role != FlowRoleDuplex && header.Uplink == header.Downlink {
+		return errors.New("nowhere: split carriers must differ")
+	}
+	return nil
 }

@@ -19,6 +19,13 @@ type QuicStream interface {
 
 // QuicConn is one authenticated (or pre-auth) QUIC connection.
 // Hosts adapt quic-go / sing-quic to this interface; nowhere-go never imports quic-go.
+//
+// CloseWithError is the physical abort boundary used by server cleanup. It must
+// return promptly without waiting for concurrent SendDatagram, ReceiveDatagram,
+// or AcceptStream calls, and it must promptly cause all such blocked calls to
+// return. Core may then synchronously join those calls; implementations must not
+// create a CloseWithError <-> operation wait cycle. Host conformance is enforced
+// by adapters separately from this interface contract.
 type QuicConn interface {
 	AcceptStream(ctx context.Context) (QuicStream, error)
 	ReceiveDatagram(ctx context.Context) ([]byte, error)

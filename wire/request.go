@@ -119,7 +119,7 @@ func validateTCPPadding(spec *EffectiveSpec, target string, padding []byte) erro
 	return nil
 }
 
-// ReadUOTSetupTarget reads u16-be length || target bytes.
+// validateTarget verifies a non-empty UTF-8 host:port target.
 func validateTarget(target string) error {
 	if len(target) == 0 || len(target) > maxTargetLength {
 		return fmt.Errorf("%w: length %d", ErrInvalidTarget, len(target))

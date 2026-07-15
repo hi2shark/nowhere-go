@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"os"
@@ -116,75 +115,6 @@ func (p *TCPPool) Resize(target int) {
 		p.logger().Debugf("[Nowhere] [carrier] pool_resize_drop carrier_id=%d new_target=%d", wc.carrier.id, target)
 		_ = wc.conn.Close()
 	}
-}
-
-func (p *TCPPool) Acquire(ctx context.Context, dest string, mode TCPRelayMode) (net.Conn, error) {
-	conn, err := p.acquire(ctx, dest, mode)
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
-}
-
-func (p *TCPPool) acquire(ctx context.Context, dest string, mode TCPRelayMode) (net.Conn, error) {
-	start := time.Now()
-	flowID := allocFlowID()
-	network := "tcp"
-	if mode == TCPRelayUoT {
-		network = "udp"
-	}
-	p.logger().Debugf("[Nowhere] [carrier] flow_start flow_id=%d network=%s target=%s", flowID, network, dest)
-
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, errors.New("nowhere: tcp pool closed")
-	}
-	var selected *warmConn
-	if len(p.idle) > 0 {
-		wc := p.idle[len(p.idle)-1]
-		p.idle = p.idle[:len(p.idle)-1]
-		if wc.expiry != nil {
-			wc.expiry.Stop()
-		}
-		selected = wc
-	}
-	snapshot := p.snapshotLocked()
-	p.mu.Unlock()
-
-	if selected != nil {
-		selected.carrier.transition(stateBorrowed)
-		p.logger().Debugf("[Nowhere] [carrier] borrow_warm flow_id=%d carrier_id=%d pool_remaining=%d",
-			flowID, selected.carrier.id, func() int { p.mu.Lock(); n := len(p.idle); p.mu.Unlock(); return n }())
-		conn, err := activatePrepared(selected.conn, selected.carrier, flowID, p.cfg, dest, mode)
-		if err != nil {
-			p.logger().Debugf("[Nowhere] [carrier] activate_warm_failed flow_id=%d carrier_id=%d err=%v (falling back to fresh)",
-				flowID, selected.carrier.id, err)
-			selected.carrier.transition(stateClosed)
-			_ = selected.conn.Close()
-			p.mu.Lock()
-			snapshot = p.snapshotLocked()
-			p.mu.Unlock()
-		} else {
-			p.maybeStartPrepare(p.replenishBudget(true))
-			logPoolAcquire(p.cfg, "warm", flowID, selected.carrier.id, snapshot, start)
-			return conn, nil
-		}
-	}
-
-	// Fresh-first: never start warm prepare before a successful business dial.
-	// This avoids ~2x amplification when the portal is unreachable.
-	outcome := "fresh"
-	if selected != nil {
-		outcome = "warm_failed_fresh"
-	}
-	conn, err := p.openFresh(ctx, flowID, dest, mode, outcome)
-	if err != nil {
-		return nil, err
-	}
-	p.maybeStartPrepare(p.replenishBudget(false))
-	logPoolAcquire(p.cfg, outcome, flowID, carrierIDOf(conn), snapshot, start)
-	return conn, nil
 }
 
 func (p *TCPPool) snapshotLocked() poolSnapshot {
@@ -354,24 +284,6 @@ func (p *TCPPool) tryAcquireDialSlot() (func(), bool) {
 	}
 }
 
-func (p *TCPPool) openFresh(ctx context.Context, flowID uint64, dest string, mode TCPRelayMode, outcome string) (net.Conn, error) {
-	var conn net.Conn
-	err := p.runPortalDial(ctx, func(ctx context.Context) error {
-		release, err := p.acquireDialSlot(ctx)
-		if err != nil {
-			return err
-		}
-		defer release()
-		c, err := openFresh(ctx, p.cfg, flowID, dest, mode, outcome)
-		if err != nil {
-			return err
-		}
-		conn = c
-		return nil
-	})
-	return conn, err
-}
-
 // DialAttempts returns portal establish attempts observed by the dial gate (tests).
 func (p *TCPPool) DialAttempts() uint64 {
 	if p == nil || p.dialGate == nil {
@@ -390,6 +302,13 @@ func (p *TCPPool) runPortalDial(ctx context.Context, fn func(context.Context) er
 func logPoolAcquire(cfg *Config, outcome string, flowID uint64, carrierID uint64, snapshot poolSnapshot, start time.Time) {
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] pool_acquire outcome=%s flow_id=%d carrier_id=%d pool_idle=%d pool_preparing=%d pool_target=%d acquire_wait_ms=%d",
 		outcome, flowID, carrierID, snapshot.idle, snapshot.preparing, snapshot.target, time.Since(start).Milliseconds())
+}
+
+func relayNetwork(kind wire.FlowKind) string {
+	if kind == wire.FlowKindUDP {
+		return "udp"
+	}
+	return "tcp"
 }
 
 func carrierIDOf(conn net.Conn) uint64 {
@@ -666,113 +585,3 @@ func tcpAuthFrame(cfg *Config) ([]byte, error) {
 	frame, _, err := wire.MakeAuthFrame(cfg.key, cfg.spec)
 	return frame, err
 }
-
-// activatePrepared sends the request on a warm connection; carrier must not return to the pool.
-func activatePrepared(conn net.Conn, ci *carrierInfo, flowID uint64, cfg *Config, dest string, mode TCPRelayMode) (net.Conn, error) {
-	timing := newOpenTiming()
-	network := relayNetwork(mode)
-	req, err := requestPayload(cfg.spec, dest, mode)
-	if err != nil {
-		logOpenTiming(cfg, "warm_failed", flowID, ci.id, "warm_activate", network, dest, timing)
-		return nil, err
-	}
-	timing.requestWrite, err = writeFullTimed(conn, req)
-	if err != nil {
-		logOpenTiming(cfg, "warm_failed", flowID, ci.id, "warm_activate", network, dest, timing)
-		return nil, err
-	}
-	ci.transition(stateRequestSent)
-	ci.transition(stateConsumed)
-	logOpenTiming(cfg, "warm", flowID, ci.id, "warm_activate", network, dest, timing)
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] request_sent flow_id=%d carrier_id=%d target=%s consumed=true",
-		flowID, ci.id, dest)
-	return wrapRelay(conn, ci, flowID, mode, dest), nil
-}
-
-// openFresh dials, authenticates, and sends the request on a new connection (pool miss / disabled).
-func openFresh(ctx context.Context, cfg *Config, flowID uint64, dest string, mode TCPRelayMode, outcome string) (net.Conn, error) {
-	ci := newCarrierInfo(loggerFrom(cfg))
-	timing := newOpenTiming()
-	stage := "fresh_tls"
-	network := relayNetwork(mode)
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] dial_start carrier_id=%d flow_id=%d stage=%s", ci.id, flowID, stage)
-	ci.transition(stateBorrowed)
-	rawDialStart := time.Now()
-	raw, err := cfg.dialer.DialContext(ctx, "tcp", dialAddr(cfg))
-	timing.rawDial = time.Since(rawDialStart)
-	if err != nil {
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, outcome+"_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-	tuneNowhereTCPConn(cfg, raw, ci.id, stage)
-	tlsStart := time.Now()
-	tlsConn, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
-	timing.tlsHandshake = time.Since(tlsStart)
-	if err != nil {
-		_ = raw.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, outcome+"_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-	auth, err := tcpAuthFrame(cfg)
-	if err != nil {
-		_ = tlsConn.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, outcome+"_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-	req, err := requestPayload(cfg.spec, dest, mode)
-	if err != nil {
-		_ = tlsConn.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, outcome+"_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-	timing.authWrite, err = writeFullTimed(tlsConn, auth)
-	if err != nil {
-		_ = tlsConn.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, outcome+"_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-	timing.requestWrite, err = writeFullTimed(tlsConn, req)
-	if err != nil {
-		_ = tlsConn.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, outcome+"_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-	ci.transition(stateRequestSent)
-	ci.transition(stateConsumed)
-	logOpenTiming(cfg, outcome, flowID, ci.id, stage, network, dest, timing)
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] auth_ok carrier_id=%d flow_id=%d", ci.id, flowID)
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] request_sent flow_id=%d carrier_id=%d target=%s consumed=true",
-		flowID, ci.id, dest)
-	return wrapRelay(tlsConn, ci, flowID, mode, dest), nil
-}
-
-func relayNetwork(mode TCPRelayMode) string {
-	if mode == TCPRelayUoT {
-		return "udp"
-	}
-	return "tcp"
-}
-
-func requestPayload(spec *wire.EffectiveSpec, dest string, mode TCPRelayMode) ([]byte, error) {
-	switch mode {
-	case TCPRelayUoT:
-		magic, err := wire.EncodeTCPRequest(wire.UOTMagicTarget, spec)
-		if err != nil {
-			return nil, err
-		}
-		setup, err := wire.EncodeUOTSetupTarget(dest)
-		if err != nil {
-			return nil, err
-		}
-		return append(magic, setup...), nil
-	default:
-		return wire.EncodeTCPRequest(dest, spec)
-	}
-}
-

@@ -49,18 +49,8 @@ func (s carrierState) String() string {
 	}
 }
 
-// Local log-correlation ids only; not sent on the wire (symmetric matrix).
+// Local log-correlation ids only; not sent on the wire.
 var nextCarrierID atomic.Uint64
-var nextFlowID atomic.Uint64
-
-func allocFlowID() uint64 {
-	for {
-		id := nextFlowID.Add(1)
-		if id != 0 {
-			return id
-		}
-	}
-}
 
 type carrierInfo struct {
 	id        uint64

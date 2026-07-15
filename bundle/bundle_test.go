@@ -84,20 +84,10 @@ type stubQuicBackend struct {
 }
 
 func (s *stubQuicBackend) SetSessionID(id wire.SessionID) { s.id = id }
-func (s *stubQuicBackend) OpenTCP(context.Context, string) (net.Conn, error) {
-	return nil, errors.New("stub: OpenTCP")
-}
-func (s *stubQuicBackend) OpenFlowStream(context.Context, string, wire.FlowHeader) (net.Conn, error) {
-	return nil, errors.New("stub: OpenFlowStream")
-}
-func (s *stubQuicBackend) PrepareFlowStream(context.Context) (quic.PreparedFlowStream, error) {
-	return nil, errors.New("stub: PrepareFlowStream")
-}
-func (s *stubQuicBackend) OpenUDP(context.Context, string) (net.PacketConn, error) {
-	return nil, errors.New("stub: OpenUDP")
-}
 func (s *stubQuicBackend) AcquireSession(context.Context) (carrier.QuicSession, error) {
 	return nil, errors.New("stub: AcquireSession")
 }
 func (s *stubQuicBackend) InvalidateSession(carrier.QuicSession) {}
-func (s *stubQuicBackend) Close()                                {}
+func (s *stubQuicBackend) Close() error                          { return nil }
+
+var _ quic.Backend = (*stubQuicBackend)(nil)

@@ -2,60 +2,131 @@ package wire
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 )
 
-func EncodeUOTSetupTarget(target string) ([]byte, error) {
-	if err := validateTarget(target); err != nil {
+const (
+	UOTFrameData   UOTFrameKind = 1
+	UOTFrameReady  UOTFrameKind = 2
+	UOTFrameClose  UOTFrameKind = 3
+	UOTFrameReject UOTFrameKind = 4
+)
+
+type UOTFrameKind uint8
+
+type UOTFrame struct {
+	Kind    UOTFrameKind
+	Payload []byte
+	Code    FlowErrorCode
+}
+
+var ErrInvalidUOTFrame = errors.New("nowhere: invalid uot frame")
+
+// EncodeUOTFrame encodes one typed UoT frame.
+func EncodeUOTFrame(frame UOTFrame) ([]byte, error) {
+	frame = normalizeUOTFrame(frame)
+	if err := validateUOTFrame(frame); err != nil {
 		return nil, err
 	}
-	targetBytes := []byte(target)
-	frame := make([]byte, 2+len(targetBytes))
-	binary.BigEndian.PutUint16(frame[:2], uint16(len(targetBytes)))
-	copy(frame[2:], targetBytes)
-	return frame, nil
+	out := make([]byte, 0, 3+len(frame.Payload))
+	out = append(out, byte(frame.Kind))
+	out = append(out, uint16Length(frame.Payload)...)
+	out = append(out, frame.Payload...)
+	return out, nil
 }
 
-func WriteUOTPacketFrame(payload []byte) ([]byte, error) {
-	if len(payload) > 0xffff {
-		return nil, ErrPaddingTooLarge
+// WriteUOTFrame writes one typed UoT frame to w.
+func WriteUOTFrame(w io.Writer, frame UOTFrame) error {
+	frame = normalizeUOTFrame(frame)
+	if err := validateUOTFrame(frame); err != nil {
+		return err
 	}
-	frame := make([]byte, 2+len(payload))
-	binary.BigEndian.PutUint16(frame[:2], uint16(len(payload)))
-	copy(frame[2:], payload)
-	return frame, nil
+	if _, err := w.Write([]byte{byte(frame.Kind)}); err != nil {
+		return err
+	}
+	if _, err := w.Write(uint16Length(frame.Payload)); err != nil {
+		return err
+	}
+	if len(frame.Payload) > 0 {
+		if _, err := w.Write(frame.Payload); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func ReadUOTPacketFrame(buf []byte) (payload []byte, consumed int, err error) {
-	if len(buf) == 0 {
-		return nil, 0, errUOTEOF
+// ReadUOTFrame reads one typed UoT frame. Clean EOF before any frame returns io.EOF.
+func ReadUOTFrame(r io.Reader) (UOTFrame, error) {
+	var kindBuf [1]byte
+	if _, err := io.ReadFull(r, kindBuf[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return UOTFrame{}, io.EOF
+		}
+		return UOTFrame{}, err
 	}
-	if len(buf) < 2 {
-		return nil, 0, ErrInvalidFrame
-	}
-	length := int(binary.BigEndian.Uint16(buf[:2]))
-	if len(buf) < 2+length {
-		return nil, 0, ErrInvalidFrame
-	}
-	return buf[2 : 2+length], 2 + length, nil
-}
-
-func ReadUOTSetupTarget(r io.Reader) (string, error) {
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		return "", err
+		if errors.Is(err, io.EOF) {
+			return UOTFrame{}, io.ErrUnexpectedEOF
+		}
+		return UOTFrame{}, err
 	}
-	n := int(binary.BigEndian.Uint16(lenBuf[:]))
-	if n == 0 || n > maxTargetLength {
-		return "", ErrInvalidTarget
+	length := binary.BigEndian.Uint16(lenBuf[:])
+	var payload []byte
+	if length > 0 {
+		payload = make([]byte, length)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			if errors.Is(err, io.EOF) {
+				return UOTFrame{}, io.ErrUnexpectedEOF
+			}
+			return UOTFrame{}, err
+		}
 	}
-	raw := make([]byte, n)
-	if _, err := io.ReadFull(r, raw); err != nil {
-		return "", err
+	frame := UOTFrame{Kind: UOTFrameKind(kindBuf[0]), Payload: payload}
+	if frame.Kind == UOTFrameReject && length == 1 {
+		frame.Code = FlowErrorCode(payload[0])
 	}
-	target := string(raw)
-	if err := validateTarget(target); err != nil {
-		return "", err
+	frame = normalizeUOTFrame(frame)
+	if err := validateUOTFrame(frame); err != nil {
+		return UOTFrame{}, err
 	}
-	return target, nil
+	return frame, nil
+}
+
+func normalizeUOTFrame(frame UOTFrame) UOTFrame {
+	if frame.Kind == UOTFrameReject && len(frame.Payload) == 0 && validFlowErrorCode(frame.Code) {
+		frame.Payload = []byte{byte(frame.Code)}
+	}
+	return frame
+}
+
+func validateUOTFrame(frame UOTFrame) error {
+	if len(frame.Payload) > UDPMaxPacketSize {
+		return fmt.Errorf("nowhere: uot payload %d exceeds max %d", len(frame.Payload), UDPMaxPacketSize)
+	}
+	switch frame.Kind {
+	case UOTFrameData:
+	case UOTFrameReady, UOTFrameClose:
+		if len(frame.Payload) != 0 {
+			return ErrInvalidUOTFrame
+		}
+	case UOTFrameReject:
+		if len(frame.Payload) != 1 {
+			return ErrInvalidUOTFrame
+		}
+		if !validFlowErrorCode(FlowErrorCode(frame.Payload[0])) {
+			return ErrInvalidUOTFrame
+		}
+	default:
+		return ErrInvalidUOTFrame
+	}
+	return nil
+}
+
+func uint16Length(payload []byte) []byte {
+	var out [2]byte
+	binary.BigEndian.PutUint16(out[:], uint16(len(payload)))
+	return out[:]
 }

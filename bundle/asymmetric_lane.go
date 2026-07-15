@@ -1,79 +1,150 @@
 package bundle
 
 import (
-	"encoding/binary"
-	"fmt"
+	"context"
+	"errors"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/hi2shark/nowhere-go/carrier"
+	"github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-var (
-	_ net.PacketConn = (*asymmetricPacketConn)(nil)
-	_ udpUplink      = (*quicUDPUplink)(nil)
-	_ udpUplink      = (*uotLaneUplink)(nil)
-	_ udpDownlink    = (*quicUDPDownlink)(nil)
-	_ udpDownlink    = (*uotLaneDownlink)(nil)
-)
-
+// udpUplink is the write side of a UDP logical flow.
 type udpUplink interface {
 	WritePacket(p []byte) (int, error)
 	ClosePacket() error
 }
 
+// udpDownlink is the read side of a UDP logical flow.
 type udpDownlink interface {
 	ReadPacket(p []byte) (int, error)
 	ClosePacket() error
 }
 
-type asymmetricPacketConn struct {
-	dest     string
-	uplink   udpUplink
-	downlink udpDownlink
-	upCloser io.Closer
-	dnCloser io.Closer
-	quicSess carrier.QuicSession
-	quicFlow carrier.QuicUDPFlow
+// uotStreamWriter serializes DATA and the best-effort CLOSE attempt. Close
+// never waits behind a blocked DATA write; closing the conn releases that write.
+type uotStreamWriter struct {
+	conn      net.Conn
+	mu        sync.Mutex
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func (a *asymmetricPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, err := a.downlink.ReadPacket(p)
+func (w *uotStreamWriter) WritePacket(p []byte) (int, error) {
+	if w.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameData, Payload: p})
 	if err != nil {
-		return n, nil, err
+		return 0, err
 	}
-	return n, a.remoteAddr(), nil
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	if _, err := w.conn.Write(frame); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
-func (a *asymmetricPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return a.uplink.WritePacket(p)
+func (w *uotStreamWriter) Close() error {
+	w.closeOnce.Do(func() {
+		w.closed.Store(true)
+		if w.mu.TryLock() {
+			_ = w.conn.SetWriteDeadline(time.Now())
+			if closeFrame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameClose}); err == nil {
+				_, _ = w.conn.Write(closeFrame)
+			}
+			w.mu.Unlock()
+		}
+		w.closeErr = w.conn.Close()
+	})
+	return w.closeErr
 }
 
-func (a *asymmetricPacketConn) Close() error {
-	_ = a.uplink.ClosePacket()
-	if a.upCloser != nil {
-		_ = a.upCloser.Close()
-	}
-	_ = a.downlink.ClosePacket()
-	if a.dnCloser != nil {
-		_ = a.dnCloser.Close()
-	}
-	if a.quicSess != nil && a.quicFlow != nil {
-		a.quicSess.ReleaseUDPAsymmetricFlow(a.quicFlow.FlowID())
-	}
-	return nil
+// uotPacketConn adapts a typed UoT stream to net.PacketConn.
+type uotPacketConn struct {
+	conn        net.Conn
+	destination net.Addr
+	readMu      sync.Mutex
+	writerOnce  sync.Once
+	writer      *uotStreamWriter
 }
 
-func (a *asymmetricPacketConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
-
-// remoteAddr returns the flow target; empty UDPAddr is rejected by some hosts.
-func (a *asymmetricPacketConn) remoteAddr() net.Addr {
-	if a.dest == "" {
-		return &net.UDPAddr{}
+func newUOTPacketConn(conn net.Conn, destination net.Addr) *uotPacketConn {
+	if destination == nil {
+		destination = &net.UDPAddr{}
 	}
-	host, portStr, err := net.SplitHostPort(a.dest)
+	return &uotPacketConn{conn: conn, destination: destination}
+}
+
+func (c *uotPacketConn) streamWriter() *uotStreamWriter {
+	c.writerOnce.Do(func() {
+		c.writer = &uotStreamWriter{conn: c.conn}
+	})
+	return c.writer
+}
+
+func (c *uotPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	frame, err := wire.ReadUOTFrame(c.conn)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, nil, io.EOF
+		}
+		return 0, nil, err
+	}
+	switch frame.Kind {
+	case wire.UOTFrameData:
+		n = copy(p, frame.Payload)
+		return n, c.destination, nil
+	case wire.UOTFrameClose:
+		return 0, nil, io.EOF
+	default:
+		return 0, nil, wire.ErrInvalidUOTFrame
+	}
+}
+
+func (c *uotPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return c.streamWriter().WritePacket(p)
+}
+
+func (c *uotPacketConn) Close() error {
+	return c.streamWriter().Close()
+}
+
+func (c *uotPacketConn) LocalAddr() net.Addr {
+	if c.conn.LocalAddr() != nil {
+		return c.conn.LocalAddr()
+	}
+	return &net.UDPAddr{}
+}
+
+func (c *uotPacketConn) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
+}
+
+func (c *uotPacketConn) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
+
+func (c *uotPacketConn) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
+}
+
+var _ net.PacketConn = (*uotPacketConn)(nil)
+
+// parseTargetAddr parses a host:port target into a net.Addr.
+func parseTargetAddr(target string) net.Addr {
+	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
 		return &net.UDPAddr{}
 	}
@@ -86,129 +157,316 @@ func (a *asymmetricPacketConn) remoteAddr() net.Addr {
 	}
 	return &net.UDPAddr{IP: net.IPv4zero, Port: port}
 }
-func (a *asymmetricPacketConn) SetDeadline(t time.Time) error {
-	if err := a.SetReadDeadline(t); err != nil {
+
+// quicPacketConn adapts a QUIC UDP logical flow (control stream + datagrams) to net.PacketConn.
+type quicPacketConn struct {
+	session      *qSessionHandle
+	control      net.Conn
+	flowID       uint64
+	destination  net.Addr
+	readMu       sync.Mutex
+	writeMu      sync.Mutex
+	closeOnce    sync.Once
+	nextPacketID atomic.Uint32
+}
+
+type qSessionHandle struct {
+	quic          *quicPreparedStream
+	flow          *quicDatagramFlow
+	flowID        uint64
+	setupErr      error
+	closed        atomic.Bool
+	signalOnce    sync.Once
+	done          chan struct{}
+	readDeadline  *datagramDeadline
+	writeDeadline *datagramDeadline
+}
+
+func newQSessionHandle(prep *quicPreparedStream, flow *quicDatagramFlow, flowID uint64, setupErr error) *qSessionHandle {
+	return &qSessionHandle{
+		quic:          prep,
+		flow:          flow,
+		flowID:        flowID,
+		setupErr:      setupErr,
+		done:          make(chan struct{}),
+		readDeadline:  newDatagramDeadline(),
+		writeDeadline: newDatagramDeadline(),
+	}
+}
+
+func newQUICDatagramHandle(prep *quicPreparedStream, flowID uint64) (*qSessionHandle, error) {
+	if prep == nil || prep.session == nil {
+		return nil, errors.New("nowhere: nil quic session")
+	}
+	session, ok := prep.session.(*quicSessionMux)
+	if !ok {
+		return nil, errors.New("nowhere: quic session is not bundle managed")
+	}
+	flow, err := session.register(flowID)
+	if err != nil {
+		return nil, err
+	}
+	return newQSessionHandle(prep, flow, flowID, nil), nil
+}
+
+func newQUICSendHandle(prep *quicPreparedStream, flowID uint64) *qSessionHandle {
+	return newQSessionHandle(prep, nil, flowID, nil)
+}
+
+func newQUICPacketConn(prep *quicPreparedStream, control net.Conn, dest string) *quicPacketConn {
+	flowID := uint64(0)
+	if prep != nil {
+		flowID = prep.flowID()
+	}
+	handle, err := newQUICDatagramHandle(prep, flowID)
+	if err != nil {
+		handle = newQSessionHandle(prep, nil, flowID, err)
+	}
+	return &quicPacketConn{
+		session:     handle,
+		control:     control,
+		flowID:      flowID,
+		destination: parseTargetAddr(dest),
+	}
+}
+
+func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	payload, err := c.session.readPacket(context.Background())
+	if err != nil {
+		return 0, nil, err
+	}
+	return copy(p, payload), c.destination, nil
+}
+
+func (c *quicPacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return writeQUICUDPPacket(c.session, c.flowID, &c.nextPacketID, p)
+}
+
+func writeQUICUDPPacket(session *qSessionHandle, flowID uint64, nextPacketID *atomic.Uint32, payload []byte) (int, error) {
+	if err := session.stateError(); err != nil {
+		return 0, err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		packetID := nextPacketID.Add(1)
+		if packetID == 0 {
+			packetID = nextPacketID.Add(1)
+		}
+		frames, err := wire.EncodeUDPDataFragments(flowID, packetID, payload, session.quic.MaxDatagramSize())
+		if err != nil {
+			return 0, err
+		}
+		retry := false
+		for _, frame := range frames {
+			if err := session.sendDatagram(frame); err != nil {
+				var tooLarge *quic.DatagramTooLargeError
+				if !errors.As(err, &tooLarge) {
+					return 0, err
+				}
+				if attempt == 0 {
+					retry = true
+					break
+				}
+				return len(payload), nil
+			}
+		}
+		if retry {
+			continue
+		}
+		return len(payload), nil
+	}
+	return len(payload), nil
+}
+
+func (c *quicPacketConn) Close() (err error) {
+	c.closeOnce.Do(func() {
+		err = c.session.closePacket()
+		if c.control != nil {
+			if closeErr := c.control.Close(); err == nil {
+				err = closeErr
+			}
+		}
+	})
+	return err
+}
+
+func (c *quicPacketConn) LocalAddr() net.Addr {
+	if c.session != nil && c.session.quic != nil {
+		return c.session.quic.LocalAddr()
+	}
+	return &net.UDPAddr{}
+}
+
+func (c *quicPacketConn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return a.SetWriteDeadline(t)
+	return c.SetWriteDeadline(t)
 }
-func (a *asymmetricPacketConn) SetReadDeadline(t time.Time) error {
-	if d, ok := a.downlink.(interface{ SetReadDeadline(time.Time) error }); ok {
-		return d.SetReadDeadline(t)
+
+func (c *quicPacketConn) SetReadDeadline(t time.Time) error {
+	if err := c.session.setReadDeadline(t); err != nil {
+		return err
 	}
-	return nil
-}
-func (a *asymmetricPacketConn) SetWriteDeadline(t time.Time) error {
-	if d, ok := a.uplink.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		return d.SetWriteDeadline(t)
+	if c.control != nil {
+		return c.control.SetReadDeadline(t)
 	}
 	return nil
 }
 
-type quicUDPUplink struct {
-	client  carrier.QuicBackend
-	session carrier.QuicSession
-	flow    carrier.QuicUDPFlow
-	target  string
-	down    wire.Carrier
+func (c *quicPacketConn) SetWriteDeadline(t time.Time) error {
+	if err := c.session.setWriteDeadline(t); err != nil {
+		return err
+	}
+	if c.control != nil {
+		return c.control.SetWriteDeadline(t)
+	}
+	return nil
 }
 
-func (u *quicUDPUplink) WritePacket(p []byte) (int, error) {
-	var frame []byte
-	var err error
-	if u.flow.IsAcked() {
-		frame, err = wire.EncodeUDPCompact(wire.UDPTypeData, u.flow.FlowID(), p)
-	} else {
-		frame, err = wire.EncodeUDPOpenData(u.flow.FlowID(), u.down, u.target, p)
+func (h *qSessionHandle) doneSignal() <-chan struct{} {
+	h.signalOnce.Do(func() {
+		if h.done == nil {
+			h.done = make(chan struct{})
+		}
+		if h.closed.Load() {
+			close(h.done)
+		}
+	})
+	return h.done
+}
+
+func (h *qSessionHandle) markClosed() bool {
+	if h == nil || h.closed.Swap(true) {
+		return false
 	}
+	done := h.doneSignal()
+	select {
+	case <-done:
+	default:
+		close(h.done)
+	}
+	return true
+}
+
+func (h *qSessionHandle) setReadDeadline(t time.Time) error {
+	if h == nil || h.closed.Load() {
+		return net.ErrClosed
+	}
+	if err := h.readDeadline.set(t); err != nil {
+		return err
+	}
+	if h.closed.Load() {
+		h.readDeadline.close()
+		return net.ErrClosed
+	}
+	return nil
+}
+
+func (h *qSessionHandle) setWriteDeadline(t time.Time) error {
+	if h == nil || h.closed.Load() {
+		return net.ErrClosed
+	}
+	if err := h.writeDeadline.set(t); err != nil {
+		return err
+	}
+	if h.closed.Load() {
+		h.writeDeadline.close()
+		return net.ErrClosed
+	}
+	return nil
+}
+
+func (h *qSessionHandle) readPacket(ctx context.Context) ([]byte, error) {
+	if h == nil {
+		return nil, net.ErrClosed
+	}
+	if h.setupErr != nil {
+		return nil, h.setupErr
+	}
+	if h.closed.Load() {
+		return nil, net.ErrClosed
+	}
+	if h.flow == nil {
+		return nil, errors.New("nowhere: quic udp flow is not registered")
+	}
+	return h.flow.readPacket(ctx, h.readDeadline)
+}
+
+func (h *qSessionHandle) stateError() error {
+	if h == nil {
+		return net.ErrClosed
+	}
+	if h.setupErr != nil {
+		return h.setupErr
+	}
+	if h.closed.Load() {
+		return net.ErrClosed
+	}
+	if h.flow != nil {
+		select {
+		case <-h.flow.done:
+			return h.flow.closeCause()
+		default:
+		}
+	}
+	return nil
+}
+
+func (h *qSessionHandle) sendDatagram(frame []byte) error {
+	if err := h.stateError(); err != nil {
+		return err
+	}
+	if h.writeDeadline.expired() {
+		return errDatagramDeadline
+	}
+	if h.quic == nil || h.quic.session == nil {
+		return net.ErrClosed
+	}
+	if session, ok := h.quic.session.(*quicSessionMux); ok {
+		return session.sendDatagram(h, frame, h.writeDeadline)
+	}
+	if err := h.quic.SendDatagram(frame); err != nil {
+		return err
+	}
+	if h.writeDeadline.expired() {
+		return errDatagramDeadline
+	}
+	return nil
+}
+
+func (h *qSessionHandle) closePacket() error {
+	if !h.markClosed() {
+		return nil
+	}
+	h.readDeadline.close()
+	h.writeDeadline.close()
+	if h.flow != nil {
+		h.flow.unregister(net.ErrClosed)
+	}
+	if h.quic == nil || h.quic.session == nil || h.flowID == 0 {
+		return nil
+	}
+	closeFrame, err := wire.EncodeUDPClose(h.flowID)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if err := u.session.SendDatagram(frame); err != nil {
-		u.client.InvalidateSession(u.session)
-		return 0, err
+	if session, ok := h.quic.session.(*quicSessionMux); ok {
+		return session.enqueueClose(closeFrame)
 	}
-	return len(p), nil
-}
-
-func (u *quicUDPUplink) ClosePacket() error {
-	closeFrame, _ := wire.EncodeUDPCompact(wire.UDPTypeCompactClose, u.flow.FlowID(), nil)
-	_ = u.session.SendDatagram(closeFrame)
-	u.session.ReleaseUDPAsymmetricFlow(u.flow.FlowID())
 	return nil
 }
 
-type quicUDPDownlink struct {
-	flow carrier.QuicUDPFlow
+var _ net.PacketConn = (*quicPacketConn)(nil)
+
+const nowuDataHeaderLen = 4 + 1 + 8 + 4 + 1 + 1 + 2
+
+// flowIDer lets a prepared stream expose its flow id for datagram routing.
+type flowIDer interface {
+	flowID() uint64
 }
 
-func (d *quicUDPDownlink) ReadPacket(p []byte) (int, error) {
-	data, put, _, err := d.flow.WaitReadFrom()
-	if err != nil {
-		return 0, err
-	}
-	n := copy(p, data)
-	if put != nil {
-		put()
-	}
-	return n, nil
-}
-
-func (d *quicUDPDownlink) ClosePacket() error {
-	d.flow.Shutdown(io.EOF)
-	return nil
-}
-
-type uotLaneUplink struct {
-	raw net.Conn
-}
-
-func (u *uotLaneUplink) WritePacket(p []byte) (int, error) {
-	frame, err := wire.WriteUOTPacketFrame(p)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := u.raw.Write(frame); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (u *uotLaneUplink) ClosePacket() error { return u.raw.Close() }
-
-func (u *uotLaneUplink) SetWriteDeadline(t time.Time) error {
-	return u.raw.SetWriteDeadline(t)
-}
-
-type uotLaneDownlink struct {
-	raw net.Conn
-}
-
-func (d *uotLaneDownlink) ReadPacket(p []byte) (int, error) {
-	for {
-		var lenBuf [2]byte
-		if _, err := io.ReadFull(d.raw, lenBuf[:]); err != nil {
-			return 0, err
-		}
-		length := int(binary.BigEndian.Uint16(lenBuf[:]))
-		if length == 0 {
-			continue // empty UoT = OPEN_ACK / CLOSE
-		}
-		if length > len(p) {
-			if _, err := io.CopyN(io.Discard, d.raw, int64(length)); err != nil {
-				return 0, err
-			}
-			return 0, fmt.Errorf("nowhere: uot packet %d exceeds buffer %d", length, len(p))
-		}
-		if _, err := io.ReadFull(d.raw, p[:length]); err != nil {
-			return 0, err
-		}
-		return length, nil
-	}
-}
-
-func (d *uotLaneDownlink) ClosePacket() error { return d.raw.Close() }
-
-func (d *uotLaneDownlink) SetReadDeadline(t time.Time) error {
-	return d.raw.SetReadDeadline(t)
-}
+var _ flowIDer = (*quicPreparedStream)(nil)

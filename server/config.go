@@ -14,29 +14,29 @@ const (
 	DefaultAuthTimeout = 5 * time.Second
 	// DefaultRequestIdleTimeout bounds the first request after authentication.
 	DefaultRequestIdleTimeout = 40 * time.Second
-	// DefaultUOTSetupTimeout bounds UDP-over-TCP setup framing.
-	DefaultUOTSetupTimeout = 5 * time.Second
 	// DefaultFlowPairTimeout bounds asymmetric half pairing.
-	DefaultFlowPairTimeout = 5 * time.Second
+	DefaultFlowPairTimeout = 15 * time.Second
 	// DefaultUDPIdleTimeout closes inactive UDP flows.
 	DefaultUDPIdleTimeout = 120 * time.Second
 	// DefaultTCPReadGrace bounds the remaining relay direction after half-close.
 	DefaultTCPReadGrace = 30 * time.Second
+	// DefaultShutdownTimeout is normalized into Timeouts.Shutdown for host-controlled shutdown.
+	DefaultShutdownTimeout = 5 * time.Second
 )
 
 const (
-	// DefaultPendingPairsPerSession limits unmatched halves in one session.
-	DefaultPendingPairsPerSession = 1024
-	// DefaultPendingPairsGlobal limits unmatched halves process-wide.
-	DefaultPendingPairsGlobal = 4096
-	// DefaultQUICFlowsPerSession limits active UDP flows in one QUIC session.
-	DefaultQUICFlowsPerSession = 256
-	// DefaultQUICQueueBytes is the shared datagram queue byte budget per session.
-	DefaultQUICQueueBytes = 4 * 1024 * 1024
-	// DefaultQUICQueuePackets limits queued datagrams per flow.
-	DefaultQUICQueuePackets = 64
+	// DefaultPendingFlowsPerSession limits unresolved flows in one authenticated session.
+	DefaultPendingFlowsPerSession = 1024
+	// DefaultUDPFlowsPerSession limits UDP flows shared by QUIC and UoT.
+	DefaultUDPFlowsPerSession = 256
+	// DefaultUDPQueueBytes is the shared datagram queue byte budget per session.
+	DefaultUDPQueueBytes = 4 * 1024 * 1024
+	// DefaultUDPQueuePackets limits queued datagrams per flow.
+	DefaultUDPQueuePackets = 64
 	// DefaultActiveQUICSessions limits authenticated QUIC sessions.
 	DefaultActiveQUICSessions = 1024
+	// DefaultAuthenticatedTCPIdleConnections limits authenticated TCP halves awaiting use.
+	DefaultAuthenticatedTCPIdleConnections = 4096
 )
 
 // Network selects a Portal ingress carrier.
@@ -54,23 +54,23 @@ type Timeouts struct {
 	TLSHandshake time.Duration
 	Auth         time.Duration
 	RequestIdle  time.Duration
-	UOTSetup     time.Duration
 	FlowPair     time.Duration
 	UDPIdle      time.Duration
 	TCPReadGrace time.Duration
+	Shutdown     time.Duration
 }
 
 // Limits controls process and session resource bounds. Zero values use defaults.
 type Limits struct {
-	PendingPairsPerSession         int
-	PendingPairsGlobal             int
-	QUICFlowsPerSession            int
-	QUICQueueBytes                 int
-	QUICQueuePackets               int
-	ActiveQUICSessions             int
-	MaxUnauthenticatedConnections  int
-	MaxUnauthenticatedPerSource    int
-	MaxConcurrentHandshakes        int
+	PendingFlowsPerSession          int
+	UDPFlowsPerSession              int
+	UDPQueueBytes                   int
+	UDPQueuePackets                 int
+	ActiveQUICSessions              int
+	AuthenticatedTCPIdleConnections int
+	MaxUnauthenticatedConnections   int
+	MaxUnauthenticatedPerSource     int
+	MaxConcurrentHandshakes         int
 }
 
 // ConfigOptions builds an immutable server Config.
@@ -142,10 +142,10 @@ func normalizeTimeouts(value Timeouts) (Timeouts, error) {
 		TLSHandshake: DefaultTLSHandshakeTimeout,
 		Auth:         DefaultAuthTimeout,
 		RequestIdle:  DefaultRequestIdleTimeout,
-		UOTSetup:     DefaultUOTSetupTimeout,
 		FlowPair:     DefaultFlowPairTimeout,
 		UDPIdle:      DefaultUDPIdleTimeout,
 		TCPReadGrace: DefaultTCPReadGrace,
+		Shutdown:     DefaultShutdownTimeout,
 	}
 	fields := []struct {
 		name string
@@ -155,10 +155,10 @@ func normalizeTimeouts(value Timeouts) (Timeouts, error) {
 		{"tls handshake timeout", &value.TLSHandshake, &defaults.TLSHandshake},
 		{"auth timeout", &value.Auth, &defaults.Auth},
 		{"request idle timeout", &value.RequestIdle, &defaults.RequestIdle},
-		{"uot setup timeout", &value.UOTSetup, &defaults.UOTSetup},
 		{"flow pair timeout", &value.FlowPair, &defaults.FlowPair},
 		{"udp idle timeout", &value.UDPIdle, &defaults.UDPIdle},
 		{"tcp read grace", &value.TCPReadGrace, &defaults.TCPReadGrace},
+		{"shutdown timeout", &value.Shutdown, &defaults.Shutdown},
 	}
 	for _, field := range fields {
 		if *field.in < 0 {
@@ -173,27 +173,27 @@ func normalizeTimeouts(value Timeouts) (Timeouts, error) {
 
 func normalizeLimits(value Limits) (Limits, error) {
 	defaults := Limits{
-		PendingPairsPerSession:        DefaultPendingPairsPerSession,
-		PendingPairsGlobal:            DefaultPendingPairsGlobal,
-		QUICFlowsPerSession:           DefaultQUICFlowsPerSession,
-		QUICQueueBytes:                DefaultQUICQueueBytes,
-		QUICQueuePackets:              DefaultQUICQueuePackets,
-		ActiveQUICSessions:            DefaultActiveQUICSessions,
-		MaxUnauthenticatedConnections: DefaultMaxUnauthenticatedConnections,
-		MaxUnauthenticatedPerSource:   DefaultMaxUnauthenticatedPerSource,
-		MaxConcurrentHandshakes:       DefaultMaxConcurrentHandshakes,
+		PendingFlowsPerSession:          DefaultPendingFlowsPerSession,
+		UDPFlowsPerSession:              DefaultUDPFlowsPerSession,
+		UDPQueueBytes:                   DefaultUDPQueueBytes,
+		UDPQueuePackets:                 DefaultUDPQueuePackets,
+		ActiveQUICSessions:              DefaultActiveQUICSessions,
+		AuthenticatedTCPIdleConnections: DefaultAuthenticatedTCPIdleConnections,
+		MaxUnauthenticatedConnections:   DefaultMaxUnauthenticatedConnections,
+		MaxUnauthenticatedPerSource:     DefaultMaxUnauthenticatedPerSource,
+		MaxConcurrentHandshakes:         DefaultMaxConcurrentHandshakes,
 	}
 	fields := []struct {
 		name string
 		in   *int
 		out  *int
 	}{
-		{"pending pairs per-session", &value.PendingPairsPerSession, &defaults.PendingPairsPerSession},
-		{"pending pairs global", &value.PendingPairsGlobal, &defaults.PendingPairsGlobal},
-		{"quic flows per-session", &value.QUICFlowsPerSession, &defaults.QUICFlowsPerSession},
-		{"quic queue bytes", &value.QUICQueueBytes, &defaults.QUICQueueBytes},
-		{"quic queue packets", &value.QUICQueuePackets, &defaults.QUICQueuePackets},
+		{"pending flows per-session", &value.PendingFlowsPerSession, &defaults.PendingFlowsPerSession},
+		{"udp flows per-session", &value.UDPFlowsPerSession, &defaults.UDPFlowsPerSession},
+		{"udp queue bytes", &value.UDPQueueBytes, &defaults.UDPQueueBytes},
+		{"udp queue packets", &value.UDPQueuePackets, &defaults.UDPQueuePackets},
 		{"active quic sessions", &value.ActiveQUICSessions, &defaults.ActiveQUICSessions},
+		{"authenticated tcp idle connections", &value.AuthenticatedTCPIdleConnections, &defaults.AuthenticatedTCPIdleConnections},
 		{"max unauthenticated connections", &value.MaxUnauthenticatedConnections, &defaults.MaxUnauthenticatedConnections},
 		{"max unauthenticated per source", &value.MaxUnauthenticatedPerSource, &defaults.MaxUnauthenticatedPerSource},
 		{"max concurrent handshakes", &value.MaxConcurrentHandshakes, &defaults.MaxConcurrentHandshakes},
@@ -205,9 +205,6 @@ func normalizeLimits(value Limits) (Limits, error) {
 		if *field.in > 0 {
 			*field.out = *field.in
 		}
-	}
-	if defaults.PendingPairsPerSession > defaults.PendingPairsGlobal {
-		return Limits{}, fmt.Errorf("%w: per-session pair limit exceeds global limit", ErrInvalidConfig)
 	}
 	if defaults.MaxUnauthenticatedPerSource > defaults.MaxUnauthenticatedConnections {
 		return Limits{}, fmt.Errorf("%w: per-source unauthenticated limit exceeds global limit", ErrInvalidConfig)

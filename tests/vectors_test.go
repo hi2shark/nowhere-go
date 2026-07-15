@@ -3,15 +3,16 @@ package tests_test
 import (
 	"testing"
 
+	"github.com/hi2shark/nowhere-go/internal/veccheck"
 	"github.com/hi2shark/nowhere-go/internal/vectors"
 )
 
 func TestHarnessVectors(t *testing.T) {
 	dir, err := vectors.Dir()
 	if err != nil {
-		t.Skipf("vectors unavailable: %v", err)
+		t.Fatalf("vectors unavailable: %v", err)
 	}
-	n, err := vectors.CheckDir(dir)
+	n, err := veccheck.CheckDir(dir)
 	if err != nil {
 		t.Fatalf("CheckDir(%s): %v", dir, err)
 	}

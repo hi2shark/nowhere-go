@@ -57,9 +57,9 @@ func TestPortalSymmetricTCPEcho(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	conn, err := b.SymmetricOpenTCP(ctx, "example.com:443")
+	conn, err := b.OpenTCP(ctx, "example.com:443")
 	if err != nil {
-		t.Fatalf("SymmetricOpenTCP: %v", err)
+		t.Fatalf("OpenTCP: %v", err)
 	}
 	defer conn.Close()
 
@@ -93,11 +93,26 @@ func serveFakePortalOnce(ln net.Listener, key string, spec *wire.EffectiveSpec, 
 	if _, err := wire.ReadAuthFrame(c, key, spec); err != nil {
 		return err
 	}
+	header, err := wire.ReadFlowHeader(c)
+	if err != nil {
+		return err
+	}
+	if header.Role != wire.FlowRoleDuplex || header.Kind != wire.FlowKindTCP ||
+		header.Uplink != wire.CarrierTCP || header.Downlink != wire.CarrierTCP {
+		return errors.New("unexpected flow header")
+	}
 	target, err := wire.DecodeTCPRequest(c, spec)
 	if err != nil {
 		return err
 	}
 	if target != "example.com:443" {
+		return errors.New("unexpected target")
+	}
+	result, err := wire.WriteFlowResult(wire.FlowResult{Status: wire.FlowStatusReady, Code: 0})
+	if err != nil {
+		return err
+	}
+	if _, err := c.Write(result[:]); err != nil {
 		return err
 	}
 	buf := make([]byte, 64)

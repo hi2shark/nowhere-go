@@ -11,42 +11,36 @@ import (
 )
 
 // PreparedFlowHalf is an authenticated TLS/TCP carrier that has not yet sent
-// a FLOW header or request. Exactly one of Commit or Close must complete;
-// sync.Once enforces unique ownership.
+// a FLOW setup. Exactly one of Commit or Close must complete; sync.Once
+// enforces unique ownership.
 type PreparedFlowHalf struct {
 	pool   *TCPPool
 	cfg    *Config
 	conn   net.Conn
 	ci     *carrierInfo
-	flowID uint64
 	dest   string
 	header wire.FlowHeader
-	mode   TCPRelayMode
 
 	DialQueueMs int64
 	RawDialMs   int64
 	TLSms       int64
 	AuthMs      int64
 
+	warmBorrow bool
+
 	once      sync.Once
 	committed bool
 	closed    bool
 }
 
-// PrepareFlowHalf dials, TLS-handshakes, and authenticates without writing FLOW.
-// The dial concurrency slot covers dial+TLS+auth only.
+// PrepareFlowHalf acquires an authenticated TLS/TCP carrier without writing FLOW.
+// It prefers the warm pool; on miss it dials fresh. The returned half is not yet committed.
 func (p *TCPPool) PrepareFlowHalf(ctx context.Context, dest string, header wire.FlowHeader) (*PreparedFlowHalf, error) {
-	return p.prepareFlowHalf(ctx, dest, header, TCPRelayTCP)
-}
-
-// PrepareUDPFlowHalf prepares a TCP carrier for an asymmetric UDP flow half.
-func (p *TCPPool) PrepareUDPFlowHalf(ctx context.Context, dest string, header wire.FlowHeader) (*PreparedFlowHalf, error) {
-	return p.prepareFlowHalf(ctx, dest, header, TCPRelayUoT)
-}
-
-func (p *TCPPool) prepareFlowHalf(ctx context.Context, dest string, header wire.FlowHeader, mode TCPRelayMode) (*PreparedFlowHalf, error) {
 	if p == nil {
 		return nil, errors.New("nowhere: tcp pool unavailable")
+	}
+	if err := validatePrepareHeader(header); err != nil {
+		return nil, err
 	}
 	p.mu.Lock()
 	closed := p.closed
@@ -55,6 +49,7 @@ func (p *TCPPool) prepareFlowHalf(ctx context.Context, dest string, header wire.
 		return nil, errors.New("nowhere: tcp pool closed")
 	}
 
+	start := time.Now()
 	var half *PreparedFlowHalf
 	var dialQueueMs int64
 	err := p.runPortalDial(ctx, func(ctx context.Context) error {
@@ -64,7 +59,7 @@ func (p *TCPPool) prepareFlowHalf(ctx context.Context, dest string, header wire.
 			return err
 		}
 		dialQueueMs = time.Since(queueStart).Milliseconds()
-		h, err := prepareAuthenticatedLane(ctx, p.cfg, header.FlowID, dest, header, mode)
+		h, err := p.borrowOrDial(ctx, dest, header)
 		release()
 		if err != nil {
 			return err
@@ -77,10 +72,142 @@ func (p *TCPPool) prepareFlowHalf(ctx context.Context, dest string, header wire.
 	}
 	half.pool = p
 	half.DialQueueMs = dialQueueMs
+
+	p.mu.Lock()
+	snapshot := p.snapshotLocked()
+	p.mu.Unlock()
+	outcome := "fresh"
+	if half.warmBorrow {
+		outcome = "warm"
+	}
+	logPoolAcquire(p.cfg, outcome, header.FlowID, half.ci.id, snapshot, start)
 	return half, nil
 }
 
-// Commit writes the FLOW header and request, transferring ownership of the conn.
+func (p *TCPPool) borrowOrDial(ctx context.Context, dest string, header wire.FlowHeader) (*PreparedFlowHalf, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errors.New("nowhere: tcp pool closed")
+	}
+	var selected *warmConn
+	if len(p.idle) > 0 {
+		wc := p.idle[len(p.idle)-1]
+		p.idle = p.idle[:len(p.idle)-1]
+		if wc.expiry != nil {
+			wc.expiry.Stop()
+		}
+		selected = wc
+	}
+	snapshot := p.snapshotLocked()
+	p.mu.Unlock()
+
+	if selected != nil {
+		selected.carrier.transition(stateBorrowed)
+		p.logger().Debugf("[Nowhere] [carrier] borrow_warm flow_id=%d carrier_id=%d pool_remaining=%d",
+			header.FlowID, selected.carrier.id, func() int { p.mu.Lock(); n := len(p.idle); p.mu.Unlock(); return n }())
+		half, err := p.prepareFromWarm(selected.conn, selected.carrier, dest, header)
+		if err != nil {
+			p.logger().Debugf("[Nowhere] [carrier] activate_warm_failed flow_id=%d carrier_id=%d err=%v (falling back to fresh)",
+				header.FlowID, selected.carrier.id, err)
+			selected.carrier.transition(stateClosed)
+			_ = selected.conn.Close()
+			p.mu.Lock()
+			snapshot = p.snapshotLocked()
+			p.mu.Unlock()
+		} else {
+			p.maybeStartPrepare(p.replenishBudget(true))
+			return half, nil
+		}
+	}
+
+	half, err := p.prepareFresh(ctx, dest, header, snapshot)
+	if err != nil {
+		return nil, err
+	}
+	p.maybeStartPrepare(p.replenishBudget(false))
+	return half, nil
+}
+
+func (p *TCPPool) prepareFromWarm(conn net.Conn, ci *carrierInfo, dest string, header wire.FlowHeader) (*PreparedFlowHalf, error) {
+	return &PreparedFlowHalf{
+		pool:       p,
+		cfg:        p.cfg,
+		conn:       conn,
+		ci:         ci,
+		dest:       dest,
+		header:     header,
+		warmBorrow: true,
+	}, nil
+}
+
+func (p *TCPPool) prepareFresh(ctx context.Context, dest string, header wire.FlowHeader, snapshot poolSnapshot) (*PreparedFlowHalf, error) {
+	ci := newCarrierInfo(loggerFrom(p.cfg))
+	timing := newOpenTiming()
+	stage := "flow_prepare"
+	if header.Kind == wire.FlowKindUDP {
+		stage = "udp_flow_prepare"
+	}
+	network := relayNetwork(header.Kind)
+	role := "asymmetric_tcp"
+	if header.Kind == wire.FlowKindUDP {
+		role = "asymmetric_uot"
+	}
+	loggerFrom(p.cfg).Debugf("[Nowhere] [carrier] flow_start flow_id=%d carrier_id=%d role=%s target=%s stage=prepare", header.FlowID, ci.id, role, dest)
+	loggerFrom(p.cfg).Debugf("[Nowhere] [carrier] dial_start carrier_id=%d flow_id=%d stage=%s", ci.id, header.FlowID, stage)
+	ci.transition(stateBorrowed)
+
+	rawDialStart := time.Now()
+	raw, err := p.cfg.dialer.DialContext(ctx, "tcp", dialAddr(p.cfg))
+	timing.rawDial = time.Since(rawDialStart)
+	if err != nil {
+		ci.transition(stateClosed)
+		logOpenTiming(p.cfg, "fresh_failed", header.FlowID, ci.id, stage, network, dest, timing)
+		return nil, err
+	}
+	tuneNowhereTCPConn(p.cfg, raw, ci.id, stage)
+
+	tlsStart := time.Now()
+	tlsConn, err := p.cfg.tlsDialer.DialTLSConn(ctx, raw)
+	timing.tlsHandshake = time.Since(tlsStart)
+	if err != nil {
+		_ = raw.Close()
+		ci.transition(stateClosed)
+		logOpenTiming(p.cfg, "fresh_failed", header.FlowID, ci.id, stage, network, dest, timing)
+		return nil, err
+	}
+
+	auth, err := tcpAuthFrame(p.cfg)
+	if err != nil {
+		_ = tlsConn.Close()
+		ci.transition(stateClosed)
+		logOpenTiming(p.cfg, "fresh_failed", header.FlowID, ci.id, stage, network, dest, timing)
+		return nil, err
+	}
+	timing.authWrite, err = writeFullTimed(tlsConn, auth)
+	if err != nil {
+		_ = tlsConn.Close()
+		ci.transition(stateClosed)
+		logOpenTiming(p.cfg, "fresh_failed", header.FlowID, ci.id, stage, network, dest, timing)
+		return nil, err
+	}
+
+	logOpenTiming(p.cfg, "fresh_prepare", header.FlowID, ci.id, stage, network, dest, timing)
+	loggerFrom(p.cfg).Debugf("[Nowhere] [carrier] auth_ok carrier_id=%d flow_id=%d stage=prepare", ci.id, header.FlowID)
+
+	return &PreparedFlowHalf{
+		cfg:       p.cfg,
+		conn:      tlsConn,
+		ci:        ci,
+		dest:      dest,
+		header:    header,
+		RawDialMs: timing.rawDial.Milliseconds(),
+		TLSms:     timing.tlsHandshake.Milliseconds(),
+		AuthMs:    timing.authWrite.Milliseconds(),
+	}, nil
+}
+
+// Commit writes the FLOW setup bytes and transfers ownership of the conn.
 func (h *PreparedFlowHalf) Commit() (net.Conn, error) {
 	if h == nil {
 		return nil, errors.New("nowhere: nil prepared flow half")
@@ -95,38 +222,37 @@ func (h *PreparedFlowHalf) Commit() (net.Conn, error) {
 			return
 		}
 		timing := newOpenTiming()
-		network := relayNetwork(h.mode)
 		stage := "flow_commit"
-		if h.mode == TCPRelayUoT {
+		if h.header.Kind == wire.FlowKindUDP {
 			stage = "udp_flow_commit"
 		}
-		env, envErr := wire.WriteFlowHeader(h.header)
-		if envErr != nil {
-			err = envErr
+		network := relayNetwork(h.header.Kind)
+		setup, encErr := wire.EncodeFlowSetup(h.header, h.dest, h.cfg.spec)
+		if encErr != nil {
+			err = encErr
 			h.forceClose()
 			return
 		}
-		req, reqErr := wire.EncodeTCPRequest(h.dest, h.cfg.spec)
-		if reqErr != nil {
-			err = reqErr
-			h.forceClose()
-			return
-		}
-		buf := make([]byte, 0, len(env)+len(req))
-		buf = append(buf, env[:]...)
-		buf = append(buf, req...)
-		timing.requestWrite, err = writeFullTimed(h.conn, buf)
+		timing.requestWrite, err = writeFullTimed(h.conn, setup)
 		if err != nil {
-			logOpenTiming(h.cfg, "fresh_failed", h.flowID, h.ci.id, stage, network, h.dest, timing)
+			if h.warmBorrow {
+				logOpenTiming(h.cfg, "warm_failed", h.header.FlowID, h.ci.id, "warm_activate", network, h.dest, timing)
+			} else {
+				logOpenTiming(h.cfg, "fresh_failed", h.header.FlowID, h.ci.id, stage, network, h.dest, timing)
+			}
 			h.forceClose()
 			return
 		}
 		h.ci.transition(stateRequestSent)
 		h.ci.transition(stateConsumed)
-		logOpenTiming(h.cfg, "fresh", h.flowID, h.ci.id, stage, network, h.dest, timing)
+		if h.warmBorrow {
+			logOpenTiming(h.cfg, "warm", h.header.FlowID, h.ci.id, "warm_activate", network, h.dest, timing)
+		} else {
+			logOpenTiming(h.cfg, "fresh", h.header.FlowID, h.ci.id, stage, network, h.dest, timing)
+		}
 		loggerFrom(h.cfg).Debugf("[Nowhere] [carrier] request_sent flow_id=%d carrier_id=%d target=%s consumed=true",
-			h.flowID, h.ci.id, h.dest)
-		conn = wrapRelay(h.conn, h.ci, h.flowID, h.mode, h.dest)
+			h.header.FlowID, h.ci.id, h.dest)
+		conn = wrapRelay(h.conn, h.ci, h.header.FlowID, h.header.Kind, h.dest)
 		h.conn = nil
 		h.committed = true
 	})
@@ -175,107 +301,21 @@ func (h *PreparedFlowHalf) CarrierID() uint64 {
 	return h.ci.id
 }
 
-// FlowID returns the wire flow id used for correlation.
-func (h *PreparedFlowHalf) FlowID() uint64 {
-	if h == nil {
-		return 0
+func validatePrepareHeader(header wire.FlowHeader) error {
+	if header.FlowID == 0 {
+		return errors.New("nowhere: zero flow id")
 	}
-	return h.flowID
-}
-
-func prepareAuthenticatedLane(ctx context.Context, cfg *Config, flowID uint64, dest string, header wire.FlowHeader, mode TCPRelayMode) (*PreparedFlowHalf, error) {
-	ci := newCarrierInfo(loggerFrom(cfg))
-	timing := newOpenTiming()
-	stage := "flow_prepare"
-	network := relayNetwork(mode)
-	if mode == TCPRelayUoT {
-		stage = "udp_flow_prepare"
+	if header.Role != wire.FlowRoleOpen && header.Role != wire.FlowRoleAttach && header.Role != wire.FlowRoleDuplex {
+		return errors.New("nowhere: invalid flow role")
 	}
-	role := "asymmetric_tcp"
-	if mode == TCPRelayUoT {
-		role = "asymmetric_uot"
+	if header.Kind != wire.FlowKindTCP && header.Kind != wire.FlowKindUDP {
+		return errors.New("nowhere: invalid flow kind")
 	}
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] flow_start flow_id=%d carrier_id=%d role=%s target=%s stage=prepare", flowID, ci.id, role, dest)
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] dial_start carrier_id=%d flow_id=%d stage=%s", ci.id, flowID, stage)
-	ci.transition(stateBorrowed)
-
-	rawDialStart := time.Now()
-	raw, err := cfg.dialer.DialContext(ctx, "tcp", dialAddr(cfg))
-	timing.rawDial = time.Since(rawDialStart)
-	if err != nil {
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, "fresh_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
+	if header.Role == wire.FlowRoleDuplex && header.Uplink != header.Downlink {
+		return errors.New("nowhere: duplex carriers must match")
 	}
-	tuneNowhereTCPConn(cfg, raw, ci.id, stage)
-
-	tlsStart := time.Now()
-	tlsConn, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
-	timing.tlsHandshake = time.Since(tlsStart)
-	if err != nil {
-		_ = raw.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, "fresh_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
+	if header.Role != wire.FlowRoleDuplex && header.Uplink == header.Downlink {
+		return errors.New("nowhere: split carriers must differ")
 	}
-
-	auth, err := tcpAuthFrame(cfg)
-	if err != nil {
-		_ = tlsConn.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, "fresh_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-	timing.authWrite, err = writeFullTimed(tlsConn, auth)
-	if err != nil {
-		_ = tlsConn.Close()
-		ci.transition(stateClosed)
-		logOpenTiming(cfg, "fresh_failed", flowID, ci.id, stage, network, dest, timing)
-		return nil, err
-	}
-
-	logOpenTiming(cfg, "fresh_prepare", flowID, ci.id, stage, network, dest, timing)
-	loggerFrom(cfg).Debugf("[Nowhere] [carrier] auth_ok carrier_id=%d flow_id=%d stage=prepare", ci.id, flowID)
-
-	return &PreparedFlowHalf{
-		cfg:       cfg,
-		conn:      tlsConn,
-		ci:        ci,
-		flowID:    flowID,
-		dest:      dest,
-		header:    header,
-		mode:      mode,
-		RawDialMs: timing.rawDial.Milliseconds(),
-		TLSms:     timing.tlsHandshake.Milliseconds(),
-		AuthMs:    timing.authWrite.Milliseconds(),
-	}, nil
-}
-
-// AcquireFlowHalf opens a fresh lane with flow envelope + TCP request (no warm pool).
-// Prefer PrepareFlowHalf + Commit for mixed two-phase open.
-func (p *TCPPool) AcquireFlowHalf(ctx context.Context, dest string, header wire.FlowHeader) (net.Conn, error) {
-	half, err := p.PrepareFlowHalf(ctx, dest, header)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := half.Commit()
-	if err != nil {
-		_ = half.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
-// AcquireUDPFlowHalf opens a fresh TCP lane for an asymmetric UDP flow half.
-func (p *TCPPool) AcquireUDPFlowHalf(ctx context.Context, dest string, header wire.FlowHeader) (net.Conn, error) {
-	half, err := p.PrepareUDPFlowHalf(ctx, dest, header)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := half.Commit()
-	if err != nil {
-		_ = half.Close()
-		return nil, err
-	}
-	return conn, nil
+	return nil
 }

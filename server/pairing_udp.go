@@ -2,22 +2,28 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	carrierquic "github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/wire"
+)
+
+const (
+	nowuDataHeaderLen    = 4 + 1 + 8 + 4 + 1 + 1 + 2 // NOWU DATA frame header length
+	udpCloseWriteTimeout = 100 * time.Millisecond
 )
 
 // udpHalf is one side of an asymmetric UDP flow.
 type udpHalf struct {
-	Role       wire.FlowRole
-	Uplink     udpUplink
-	Downlink   udpDownlink
-	compactAck compactAck
+	Role     wire.FlowRole
+	Uplink   udpUplink
+	Downlink udpDownlink
 }
 
 type udpUplink interface {
@@ -27,77 +33,80 @@ type udpUplink interface {
 
 type udpDownlink interface {
 	WritePacket(p []byte) error
-	WriteAck(flowID uint64) error
-	WriteClose(flowID uint64) error
+	WriteClose() error
 	Close() error
 }
 
-// compactAck sends OPEN_ACK on the QUIC uplink session when present.
-type compactAck interface {
-	SendOpenAck(flowID uint64) error
-	MarkAcked()
-}
-
-// pairedUDP is a completed asymmetric UDP flow ready for routing.
+// pairedUDP is a completed UDP flow ready for routing.
 type pairedUDP struct {
 	FlowID      uint64
 	Target      string
 	Uplink      udpUplink
 	Downlink    udpDownlink
-	compactAck  compactAck
 	IdleTimeout time.Duration
+	Readiness   *flowReadiness
+	Context     context.Context
+	Release     func()
 }
 
 // SubmitUDP caches or pairs a UDP half. Completing half returns *pairedUDP;
 // waiting half returns (nil, nil).
-func (m *flowPairManager) SubmitUDP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) (*pairedUDP, error) {
-	return m.SubmitUDPWithSource(ctx, sessionID, header, target, half, nil, udpHalfTransport(header, half))
+func (r *claimRegistry) SubmitUDP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) (*pairedUDP, error) {
+	return r.SubmitUDPWithSource(ctx, sessionID, header, target, half, nil, udpHalfTransport(header, half))
 }
 
-// SubmitUDPWithSource is SubmitUDP with source/transport diagnostics.
-func (m *flowPairManager) SubmitUDPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf, source net.Addr, transport string) (*pairedUDP, error) {
-	if err := validatePairHeader(header, wire.FlowKindUDP); err != nil {
+// SubmitUDPWithSource is SubmitUDP with optional source/transport diagnostics.
+func (r *claimRegistry) SubmitUDPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf, source net.Addr, transport string) (*pairedUDP, error) {
+	return r.SubmitUDPWithGeneration(ctx, sessionID, r.CurrentGeneration(sessionID), false, header, target, half, source, transport)
+}
+
+func (r *claimRegistry) SubmitUDPWithGeneration(ctx context.Context, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target string, half udpHalf, source net.Addr, _ string) (*pairedUDP, error) {
+	if header.Kind != wire.FlowKindUDP || header.FlowID == 0 {
+		return nil, fmt.Errorf("%w: invalid UDP flow header", ErrUnsupportedFlow)
+	}
+	carrier := header.Uplink
+	if header.Role == wire.FlowRoleAttach {
+		carrier = header.Downlink
+		target = ""
+	}
+	claim := flowClaim{
+		SessionID: sessionID, FlowID: header.FlowID, Generation: generation, BoundGeneration: boundGeneration,
+		Role: header.Role, Carrier: carrier,
+		Metadata: claimMetadata{Kind: header.Kind, Uplink: header.Uplink, Downlink: header.Downlink},
+		Target:   target, Stream: udpHalfResultConn(half), UDP: half, Source: source,
+	}
+	active, err := r.Submit(ctx, claim)
+	if err != nil || active == nil {
 		return nil, err
 	}
-	if transport == "" {
-		transport = udpHalfTransport(header, half)
+	var uplink udpUplink
+	var downlink udpDownlink
+	if active.Duplex != nil {
+		uplink = active.Duplex.UDP.Uplink
+		downlink = active.Duplex.UDP.Downlink
+	} else if active.Open != nil && active.Attach != nil {
+		uplink = active.Open.UDP.Uplink
+		downlink = active.Attach.UDP.Downlink
 	}
-	pending := &pendingFlow{
-		meta: metadataFrom(header, target), role: half.Role, transport: transport, udp: half,
-		done: make(chan struct{}), state: pairWaiting, started: time.Now(),
-		sessionID: sessionID, flowID: header.FlowID, source: source,
+	if uplink == nil || downlink == nil {
+		active.Release()
+		return nil, fmt.Errorf("%w: incomplete UDP pair", ErrInvalidHandler)
 	}
-	key := pairKey{session: sessionID, flowID: header.FlowID}
-	existing, err := m.submit(ctx, key, pending)
-	if err != nil {
-		return nil, err
+	return &pairedUDP{
+		FlowID: header.FlowID, Target: active.Target, Uplink: uplink, Downlink: downlink,
+		Readiness: active.Readiness, Context: active.Context, Release: active.Release,
+	}, nil
+}
+
+func udpHalfResultConn(half udpHalf) net.Conn {
+	switch downlink := half.Downlink.(type) {
+	case *tcpUDPDownlink:
+		return downlink.conn
+	case *quicUDPDownlink:
+		return downlink.control
+	default:
+		return nil
 	}
-	if existing != nil {
-		var uplink udpUplink
-		var downlink udpDownlink
-		var ack compactAck
-		if half.Role == wire.FlowRoleOpen {
-			uplink, downlink = half.Uplink, existing.udp.Downlink
-			ack = half.compactAck
-			if ack == nil {
-				ack = existing.udp.compactAck
-			}
-		} else {
-			uplink, downlink = existing.udp.Uplink, half.Downlink
-			ack = existing.udp.compactAck
-			if ack == nil {
-				ack = half.compactAck
-			}
-		}
-		return &pairedUDP{
-			FlowID:     header.FlowID,
-			Target:     target,
-			Uplink:     uplink,
-			Downlink:   downlink,
-			compactAck: ack,
-		}, nil
-	}
-	return nil, m.wait(ctx, key, pending)
 }
 
 func udpHalfTransport(header wire.FlowHeader, half udpHalf) string {
@@ -145,19 +154,28 @@ func newTCPUDPUplink(conn net.Conn) udpUplink { return &tcpUDPUplink{conn: conn}
 func (u *tcpUDPUplink) ReadPacket() ([]byte, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(u.conn, lenBuf[:]); err != nil {
-		return nil, err
+	for {
+		frame, err := wire.ReadUOTFrame(u.conn)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, io.EOF
+			}
+			return nil, err
+		}
+		switch frame.Kind {
+		case wire.UOTFrameData:
+			if frame.Payload == nil {
+				return []byte{}, nil
+			}
+			return frame.Payload, nil
+		case wire.UOTFrameClose:
+			return nil, io.EOF
+		case wire.UOTFrameReady, wire.UOTFrameReject:
+			return nil, wire.ErrInvalidUOTFrame
+		default:
+			return nil, wire.ErrInvalidUOTFrame
+		}
 	}
-	n := int(binary.BigEndian.Uint16(lenBuf[:]))
-	if n == 0 {
-		return []byte{}, nil
-	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(u.conn, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
 }
 
 func (u *tcpUDPUplink) Close() error { return u.conn.Close() }
@@ -172,7 +190,7 @@ func newTCPUDPDownlink(conn net.Conn) udpDownlink { return &tcpUDPDownlink{conn:
 func (d *tcpUDPDownlink) WritePacket(p []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	frame, err := wire.WriteUOTPacketFrame(p)
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameData, Payload: p})
 	if err != nil {
 		return err
 	}
@@ -180,17 +198,16 @@ func (d *tcpUDPDownlink) WritePacket(p []byte) error {
 	return err
 }
 
-func (d *tcpUDPDownlink) WriteAck(_ uint64) error {
+func (d *tcpUDPDownlink) WriteClose() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.conn.Write([]byte{0, 0})
-	return err
-}
-
-func (d *tcpUDPDownlink) WriteClose(_ uint64) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	_, err := d.conn.Write([]byte{0, 0})
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameClose})
+	if err != nil {
+		return err
+	}
+	_ = d.conn.SetWriteDeadline(time.Now().Add(udpCloseWriteTimeout))
+	defer d.conn.SetWriteDeadline(time.Time{})
+	_, err = d.conn.Write(frame)
 	return err
 }
 
@@ -210,9 +227,9 @@ type quicUDPUplink struct {
 }
 
 func newQUICUDPUplink(session *portalSession) *quicUDPUplink {
-	queuePackets := DefaultQUICQueuePackets
+	queuePackets := DefaultUDPQueuePackets
 	if session != nil && session.Handler != nil {
-		queuePackets = session.Handler.config.limits.QUICQueuePackets
+		queuePackets = session.Handler.config.limits.UDPQueuePackets
 	}
 	return &quicUDPUplink{
 		ch:      make(chan []byte, queuePackets),
@@ -285,99 +302,235 @@ func (u *quicUDPUplink) SetReadDeadline(value time.Time) error {
 }
 
 type quicUDPDownlink struct {
-	send func([]byte) error
+	control         net.Conn
+	send            func([]byte) error
+	maxDatagramSize func() int
+	abort           func(error)
+	closeOnce       sync.Once
 }
 
-func newQUICUDPDownlink(send func([]byte) error) udpDownlink {
-	return &quicUDPDownlink{send: send}
+func newQUICUDPDownlink(control net.Conn, send func([]byte) error, maxDatagramSize func() int, abort ...func(error)) *quicUDPDownlink {
+	var abortSession func(error)
+	if len(abort) > 0 {
+		abortSession = abort[0]
+	}
+	return &quicUDPDownlink{
+		control: control, send: send, maxDatagramSize: maxDatagramSize, abort: abortSession,
+	}
 }
 
-func (d *quicUDPDownlink) WritePacket(p []byte) error {
+func (d *quicUDPDownlink) WritePacket([]byte) error {
 	return fmt.Errorf("nowhere: quic downlink WritePacket requires paired wrapper")
 }
 
-func (d *quicUDPDownlink) WriteAck(flowID uint64) error {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeOpenAck, flowID, nil)
-	if err != nil {
-		return err
-	}
-	return d.send(frame)
-}
+func (d *quicUDPDownlink) WriteClose() error { return nil }
 
-func (d *quicUDPDownlink) WriteClose(flowID uint64) error {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeCompactClose, flowID, nil)
-	if err != nil {
-		return err
-	}
-	return d.send(frame)
-}
+func (d *quicUDPDownlink) Close() error { return d.closeControl() }
 
-func (d *quicUDPDownlink) Close() error { return nil }
+func (d *quicUDPDownlink) closeControl() (err error) {
+	d.closeOnce.Do(func() {
+		if d.control != nil {
+			err = d.control.Close()
+		}
+	})
+	return err
+}
 
 type quicUDPDownlinkBound struct {
-	flowID uint64
-	send   func([]byte) error
+	flowID          uint64
+	base            *quicUDPDownlink
+	maxDatagramSize func() int
+	nextPacketID    atomic.Uint32
+	stateMu         sync.Mutex
+	closed          bool
+	terminalDone    chan struct{}
+	terminalForce   chan struct{}
+	terminalErr     error
+	sendOnce        sync.Once
+	sendToken       chan struct{}
 }
 
 func (d *quicUDPDownlinkBound) WritePacket(p []byte) error {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeData, d.flowID, p)
-	if err != nil {
-		return err
+	if d.isClosed() {
+		return net.ErrClosed
 	}
-	return d.send(frame)
-}
-
-func (d *quicUDPDownlinkBound) WriteAck(flowID uint64) error {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeOpenAck, flowID, nil)
-	if err != nil {
-		return err
+	token := d.sendGate()
+	<-token
+	defer func() { token <- struct{}{} }()
+	if d.isClosed() {
+		return net.ErrClosed
 	}
-	return d.send(frame)
-}
-
-func (d *quicUDPDownlinkBound) WriteClose(flowID uint64) error {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeCompactClose, flowID, nil)
-	if err != nil {
-		return err
+	if d.base == nil || d.base.send == nil {
+		return net.ErrClosed
 	}
-	return d.send(frame)
-}
-
-func (d *quicUDPDownlinkBound) Close() error { return nil }
-
-type quicCompactAck struct {
-	send  func([]byte) error
-	mark  func()
-	mu    sync.Mutex
-	acked bool
-}
-
-func newQUICCompactAck(send func([]byte) error, mark func()) compactAck {
-	return &quicCompactAck{send: send, mark: mark}
-}
-
-func (a *quicCompactAck) SendOpenAck(flowID uint64) error {
-	frame, err := wire.EncodeUDPCompact(wire.UDPTypeOpenAck, flowID, nil)
-	if err != nil {
-		return err
+	currentMax := d.maxDatagramSize
+	if currentMax == nil {
+		currentMax = d.base.maxDatagramSize
 	}
-	if err := a.send(frame); err != nil {
-		return err
+	for attempt := 0; attempt < 2; attempt++ {
+		max := 1200
+		if currentMax != nil {
+			if size := currentMax(); size > nowuDataHeaderLen {
+				max = size
+			}
+		}
+		packetID := d.nextPacketID.Add(1)
+		if packetID == 0 {
+			packetID = d.nextPacketID.Add(1)
+		}
+		frames, err := wire.EncodeUDPDataFragments(d.flowID, packetID, p, max)
+		if err != nil {
+			return err
+		}
+		retry := false
+		for _, frame := range frames {
+			if err := d.base.send(frame); err != nil {
+				var tooLarge *carrierquic.DatagramTooLargeError
+				if !errors.As(err, &tooLarge) {
+					return err
+				}
+				if attempt == 0 {
+					retry = true
+					break
+				}
+				return nil
+			}
+		}
+		if !retry {
+			return nil
+		}
 	}
-	a.MarkAcked()
 	return nil
 }
 
-func (a *quicCompactAck) MarkAcked() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.acked {
+func (d *quicUDPDownlinkBound) WriteClose() error {
+	return d.terminate(nil, true)
+}
+
+func (d *quicUDPDownlinkBound) Close() error {
+	return d.terminate(markForcedTermination(net.ErrClosed), false)
+}
+
+func (d *quicUDPDownlinkBound) terminate(cause error, graceful bool) error {
+	forced := isForcedTermination(cause)
+	d.stateMu.Lock()
+	if d.closed {
+		if forced {
+			d.forceTerminalLocked()
+		}
+		done := d.terminalDone
+		d.stateMu.Unlock()
+		if done != nil {
+			<-done
+		}
+		d.stateMu.Lock()
+		err := d.terminalErr
+		d.stateMu.Unlock()
+		return err
+	}
+	d.closed = true
+	d.terminalDone = make(chan struct{})
+	d.terminalForce = make(chan struct{})
+	if forced {
+		d.forceTerminalLocked()
+	}
+	done := d.terminalDone
+	force := d.terminalForce
+	d.stateMu.Unlock()
+
+	err := d.runTerminal(cause, graceful, forced, force)
+	d.stateMu.Lock()
+	d.terminalErr = err
+	close(done)
+	d.stateMu.Unlock()
+	return err
+}
+
+func (d *quicUDPDownlinkBound) runTerminal(cause error, graceful, forced bool, force <-chan struct{}) (err error) {
+	token := d.sendGate()
+	acquired := false
+	select {
+	case <-token:
+		acquired = true
+	default:
+	}
+	aborted := false
+	if forced || !acquired {
+		if d.base != nil && d.base.abort != nil {
+			d.base.abort(markForcedTermination(cause))
+			aborted = true
+		}
+		if !acquired {
+			<-token
+			acquired = true
+		}
+	}
+	if acquired {
+		defer func() { token <- struct{}{} }()
+	}
+	if graceful && !forced && !aborted && d.base != nil && d.base.send != nil {
+		frame, encodeErr := wire.EncodeUDPClose(d.flowID)
+		if encodeErr != nil {
+			err = encodeErr
+		} else {
+			err = d.sendGracefulClose(frame, force)
+		}
+	}
+	if d.base != nil {
+		if closeErr := d.base.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+func (d *quicUDPDownlinkBound) sendGracefulClose(frame []byte, force <-chan struct{}) error {
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- d.base.send(frame)
+	}()
+	timer := time.NewTimer(udpCloseWriteTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-sendDone:
+		return err
+	case <-force:
+		if d.base.abort != nil {
+			d.base.abort(markForcedTermination(ErrClosed))
+		}
+		return <-sendDone
+	case <-timer.C:
+		if d.base.abort != nil {
+			d.base.abort(markForcedTermination(context.DeadlineExceeded))
+		}
+		return <-sendDone
+	}
+}
+
+func (d *quicUDPDownlinkBound) forceTerminalLocked() {
+	if d.terminalForce == nil {
 		return
 	}
-	a.acked = true
-	if a.mark != nil {
-		a.mark()
+	select {
+	case <-d.terminalForce:
+	default:
+		close(d.terminalForce)
 	}
+}
+
+func (d *quicUDPDownlinkBound) isClosed() bool {
+	d.stateMu.Lock()
+	closed := d.closed
+	d.stateMu.Unlock()
+	return closed
+}
+
+func (d *quicUDPDownlinkBound) sendGate() chan struct{} {
+	d.sendOnce.Do(func() {
+		d.sendToken = make(chan struct{}, 1)
+		d.sendToken <- struct{}{}
+	})
+	return d.sendToken
 }
 
 // pairedUDPConn exposes a pairedUDP as net.PacketConn.
@@ -386,9 +539,11 @@ type pairedUDPConn struct {
 	dest        net.Addr
 	uplink      udpUplink
 	downlink    udpDownlink
-	compactAck  compactAck
-	ackOnce     sync.Once
-	closeOnce   sync.Once
+	release     func()
+	closeMu     sync.Mutex
+	closing     bool
+	closeDone   chan struct{}
+	ready       atomic.Bool
 	readDL      deadlineSignal
 	writeDL     deadlineSignal
 	idle        *time.Timer
@@ -400,16 +555,12 @@ type pairedUDPConn struct {
 func newPairedUDPConn(paired *pairedUDP) net.PacketConn {
 	down := paired.Downlink
 	if q, ok := down.(*quicUDPDownlink); ok {
-		down = &quicUDPDownlinkBound{flowID: paired.FlowID, send: q.send}
+		down = &quicUDPDownlinkBound{flowID: paired.FlowID, base: q, maxDatagramSize: q.maxDatagramSize}
 	}
 	dest := parseTargetAddr(paired.Target)
 	conn := &pairedUDPConn{
-		flowID:      paired.FlowID,
-		dest:        dest,
-		uplink:      paired.Uplink,
-		downlink:    down,
-		compactAck:  paired.compactAck,
-		idleTimeout: paired.IdleTimeout,
+		flowID: paired.FlowID, dest: dest, uplink: paired.Uplink, downlink: down,
+		release: paired.Release, idleTimeout: paired.IdleTimeout,
 	}
 	if conn.idleTimeout <= 0 {
 		conn.idleTimeout = DefaultUDPIdleTimeout
@@ -418,39 +569,19 @@ func newPairedUDPConn(paired *pairedUDP) net.PacketConn {
 	return conn
 }
 
-type addrString struct{ s string }
-
-func (a *addrString) Network() string { return "udp" }
-func (a *addrString) String() string  { return a.s }
-
-func (c *pairedUDPConn) sendAck() {
-	c.ackOnce.Do(func() {
-		_ = c.downlink.WriteAck(c.flowID)
-		if c.compactAck != nil {
-			_ = c.compactAck.SendOpenAck(c.flowID)
-		}
-	})
-}
-
 func (c *pairedUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	select {
 	case <-c.readDL.wait():
 		return 0, nil, deadlineError()
 	default:
 	}
-	for {
-		payload, err := c.uplink.ReadPacket()
-		if err != nil {
-			return 0, nil, err
-		}
-		if len(payload) == 0 {
-			continue
-		}
-		c.sendAck()
-		c.resetIdle()
-		n = copy(p, payload)
-		return n, c.dest, nil
+	payload, err := c.uplink.ReadPacket()
+	if err != nil {
+		return 0, nil, err
 	}
+	c.resetIdle()
+	n = copy(p, payload)
+	return n, c.dest, nil
 }
 
 func (c *pairedUDPConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
@@ -471,16 +602,52 @@ func (c *pairedUDPConn) Close() error {
 	return nil
 }
 
+func (c *pairedUDPConn) markReady() {
+	if c != nil {
+		c.ready.Store(true)
+	}
+}
+
 func (c *pairedUDPConn) closeWithError(cause error) {
-	c.closeOnce.Do(func() {
-		c.idleMu.Lock()
-		if c.idle != nil {
-			c.idle.Stop()
+	forced := forcedUDPClosure(cause)
+	c.closeMu.Lock()
+	if c.closing {
+		done := c.closeDone
+		downlink, isQUIC := c.downlink.(*quicUDPDownlinkBound)
+		c.closeMu.Unlock()
+		if forced && isQUIC {
+			_ = downlink.terminate(cause, false)
 		}
-		c.idleMu.Unlock()
-		_ = c.downlink.WriteClose(c.flowID)
+		<-done
+		return
+	}
+	c.closing = true
+	done := make(chan struct{})
+	c.closeDone = done
+	c.closeMu.Unlock()
+
+	c.idleMu.Lock()
+	if c.idle != nil {
+		c.idle.Stop()
+	}
+	c.idleMu.Unlock()
+	if downlink, ok := c.downlink.(*quicUDPDownlinkBound); ok {
+		_ = downlink.terminate(cause, c.ready.Load() && !forced)
+		closeUDPHalfWithError(udpHalf{Uplink: c.uplink}, cause)
+	} else {
+		if c.ready.Load() && c.downlink != nil && !forced {
+			_ = c.downlink.WriteClose()
+		}
 		closeUDPHalfWithError(udpHalf{Uplink: c.uplink, Downlink: c.downlink}, cause)
-	})
+	}
+	if c.release != nil {
+		c.release()
+	}
+	close(done)
+}
+
+func forcedUDPClosure(cause error) bool {
+	return isForcedTermination(cause)
 }
 
 func (c *pairedUDPConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
@@ -515,3 +682,8 @@ func (c *pairedUDPConn) resetIdle() {
 }
 
 var _ net.PacketConn = (*pairedUDPConn)(nil)
+
+type addrString struct{ s string }
+
+func (a *addrString) Network() string { return "udp" }
+func (a *addrString) String() string  { return a.s }

@@ -1,7 +1,7 @@
 package server
 
 import (
-	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -10,7 +10,7 @@ import (
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-// uotPacketConn adapts a Nowhere length-prefixed UoT stream to net.PacketConn.
+// uotPacketConn adapts a typed UoT stream to net.PacketConn.
 type uotPacketConn struct {
 	net.Conn
 	destination net.Addr
@@ -45,35 +45,37 @@ func (c *uotPacketConn) SetIdleTimeout(timeout time.Duration) {
 func (c *uotPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-	var length uint16
-	if err = binary.Read(c.Conn, binary.BigEndian, &length); err != nil {
-		return
-	}
-	if int(length) > len(p) {
-		// Drain oversized frame then report short buffer.
-		tmp := make([]byte, length)
-		if _, err = io.ReadFull(c.Conn, tmp); err != nil {
-			return
+	for {
+		frame, err := wire.ReadUOTFrame(c.Conn)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0, nil, io.EOF
+			}
+			return 0, nil, err
 		}
-		n = copy(p, tmp)
-		return n, c.destination, io.ErrShortBuffer
+		switch frame.Kind {
+		case wire.UOTFrameData:
+			c.resetIdle()
+			n = copy(p, frame.Payload)
+			return n, c.destination, nil
+		case wire.UOTFrameClose:
+			return 0, nil, io.EOF
+		case wire.UOTFrameReady, wire.UOTFrameReject:
+			return 0, nil, wire.ErrInvalidUOTFrame
+		default:
+			return 0, nil, wire.ErrInvalidUOTFrame
+		}
 	}
-	if _, err = io.ReadFull(c.Conn, p[:length]); err != nil {
-		return
-	}
-	c.resetIdle()
-	return int(length), c.destination, nil
 }
 
 func (c *uotPacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	frame, err := wire.WriteUOTPacketFrame(p)
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameData, Payload: p})
 	if err != nil {
 		return 0, err
 	}
-	_, err = c.Conn.Write(frame)
-	if err != nil {
+	if _, err = c.Conn.Write(frame); err != nil {
 		return 0, err
 	}
 	c.resetIdle()
@@ -88,6 +90,10 @@ func (c *uotPacketConn) Close() error {
 			c.idle.Stop()
 		}
 		c.idleMu.Unlock()
+		closeFrame, encErr := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameClose})
+		if encErr == nil {
+			_, _ = c.Conn.Write(closeFrame)
+		}
 		err = c.Conn.Close()
 	})
 	return err
@@ -136,3 +142,33 @@ var (
 	_ net.PacketConn = (*uotPacketConn)(nil)
 	_ io.Closer      = (*uotPacketConn)(nil)
 )
+
+// writeUOTReady writes a typed UoT READY frame to the connection.
+func writeUOTReady(w io.Writer) error {
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameReady})
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(frame)
+	return err
+}
+
+// writeUOTReject writes a typed UoT REJECT frame with the given error code.
+func writeUOTReject(w io.Writer, code wire.FlowErrorCode) error {
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameReject, Code: code})
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(frame)
+	return err
+}
+
+// writeUOTClose writes a typed UoT CLOSE frame.
+func writeUOTClose(w io.Writer) error {
+	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameClose})
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(frame)
+	return err
+}

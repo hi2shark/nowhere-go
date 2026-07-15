@@ -139,12 +139,12 @@ func TestServeTCPReleasesAdmissionAfterAuthSuccess(t *testing.T) {
 	}
 	routed := make(chan struct{}, 1)
 	handler, err := NewHandler(HandlerOptions{Config: config, Upstream: upstreamFuncs{
-		stream: func(context.Context, net.Conn, net.Addr, string) error {
+		stream: func(_ context.Context, _ net.Conn, _ net.Addr, _ string, readiness FlowReadiness) error {
 			select {
 			case routed <- struct{}{}:
 			default:
 			}
-			return nil
+			return readiness.Ready()
 		},
 	}})
 	if err != nil {
@@ -168,11 +168,14 @@ func TestServeTCPReleasesAdmissionAfterAuthSuccess(t *testing.T) {
 	if _, err := clientConn.Write(auth); err != nil {
 		t.Fatal(err)
 	}
-	req, err := wire.EncodeTCPRequest("example.com:443", config.EffectiveSpec())
+	setup, err := wire.EncodeFlowSetup(wire.FlowHeader{
+		Role: wire.FlowRoleDuplex, FlowID: 1, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierTCP, Downlink: wire.CarrierTCP,
+	}, "example.com:443", config.EffectiveSpec())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clientConn.Write(req); err != nil {
+	if _, err := clientConn.Write(setup); err != nil {
 		t.Fatal(err)
 	}
 

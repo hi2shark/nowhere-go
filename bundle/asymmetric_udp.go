@@ -3,84 +3,59 @@ package bundle
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/hi2shark/nowhere-go/carrier"
-	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-func (b *CarrierBundle) AsymmetricOpenUDP(ctx context.Context, dest string) (net.PacketConn, error) {
-	up, down := b.UpCarrier(), b.DownCarrier()
-	flowID := b.allocFlowID()
+func (b *CarrierBundle) openAsymmetricUDP(ctx context.Context, dest string) (net.PacketConn, error) {
+	up, down := b.cfg.up, b.cfg.down
+	flowID, err := b.allocFlowID()
+	if err != nil {
+		return nil, err
+	}
+	started := time.Now()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var quicFlow carrier.QuicUDPFlow
-	var quicSession carrier.QuicSession
-	if up == wire.CarrierUDP || down == wire.CarrierUDP {
-		client, err := b.quicClient()
-		if err != nil {
-			return nil, err
-		}
-		if client == nil {
-			return nil, errors.New("nowhere: udp carrier unavailable")
-		}
-		s, err := client.AcquireSession(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.EnsureReady(ctx); err != nil {
-			return nil, err
-		}
-		quicFlow, err = s.RegisterUDPAsymmetricFlow(ctx, dest, flowID)
-		if err != nil {
-			return nil, err
-		}
-		quicSession = s
-	}
-
 	switch {
 	case up == wire.CarrierTCP && down == wire.CarrierUDP:
-		return b.openTCPUDP(ctx, cancel, dest, flowID, up, down, quicSession, quicFlow)
+		return b.openTCPUDP(ctx, cancel, dest, flowID, up, down, started)
 	case up == wire.CarrierUDP && down == wire.CarrierTCP:
-		return b.openUDPTCP(ctx, cancel, dest, flowID, up, down, quicSession, quicFlow)
+		return b.openUDPTCP(ctx, cancel, dest, flowID, up, down, started)
 	default:
-		b.releaseQUICFlow(quicSession, quicFlow)
 		return nil, errors.New("nowhere: asymmetric udp requires mixed carriers")
 	}
 }
 
-// openTCPUDP: prepare TCP OPEN + QUIC ATTACH, then commit both before returning.
+// openTCPUDP: TCP uplink (typed UoT OPEN) + QUIC downlink (Attach).
 func (b *CarrierBundle) openTCPUDP(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	dest string,
 	flowID uint64,
 	up, down wire.Carrier,
-	quicSession carrier.QuicSession,
-	quicFlow carrier.QuicUDPFlow,
+	started time.Time,
 ) (net.PacketConn, error) {
-	started := time.Now()
+	openHeader := wire.FlowHeader{Role: wire.FlowRoleOpen, FlowID: flowID, Kind: wire.FlowKindUDP, Uplink: up, Downlink: down}
+	attachHeader := wire.FlowHeader{Role: wire.FlowRoleAttach, FlowID: flowID, Kind: wire.FlowKindUDP, Uplink: up, Downlink: down}
+
 	pool, err := b.tcpPool()
 	if err != nil {
-		b.releaseQUICFlow(quicSession, quicFlow)
-		return nil, err
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, 0, started, err)
+		return nil, fmtError("prepare tcp pool", err)
 	}
 	if pool == nil {
-		b.releaseQUICFlow(quicSession, quicFlow)
 		return nil, errors.New("nowhere: tcp uplink carrier unavailable")
 	}
-	openHeader := wire.FlowHeader{Role: wire.FlowRoleOpen, FlowID: flowID, Kind: wire.FlowKindUDP, Uplink: up, Downlink: down}
-	tcpHalf, err := pool.PrepareUDPFlowHalf(ctx, dest, openHeader)
+	tcpHalf, err := pool.PrepareFlowHalf(ctx, dest, openHeader)
 	if err != nil {
-		b.releaseQUICFlow(quicSession, quicFlow)
 		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, 0, started, err)
-		return nil, err
+		return nil, fmtError("prepare tcp open half", err)
 	}
 	tcpCarrierID := tcpHalf.CarrierID()
 	defer func() {
@@ -89,18 +64,11 @@ func (b *CarrierBundle) openTCPUDP(
 		}
 	}()
 
-	client := b.quicClientSync()
-	if client == nil {
-		b.releaseQUICFlow(quicSession, quicFlow)
-		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, errors.New("nowhere: udp downlink carrier unavailable"))
-		return nil, errors.New("nowhere: udp downlink carrier unavailable")
-	}
-	quicPrep, err := client.PrepareFlowStream(ctx)
+	quicPrep, err := b.prepareQUICStream(ctx, attachHeader.FlowID)
 	if err != nil {
 		cancel()
-		b.releaseQUICFlow(quicSession, quicFlow)
 		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
-		return nil, err
+		return nil, fmtError("prepare quic attach half", err)
 	}
 	defer func() {
 		if quicPrep != nil {
@@ -111,239 +79,302 @@ func (b *CarrierBundle) openTCPUDP(
 	tcpConn, err := tcpHalf.Commit()
 	if err != nil {
 		cancel()
-		b.releaseQUICFlow(quicSession, quicFlow)
 		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
-		return nil, fmt.Errorf("nowhere: commit tcp open half: %w", err)
+		return nil, fmtError("commit tcp open half", err)
 	}
 	tcpHalf = nil
 
-	attachHeader := wire.FlowHeader{Role: wire.FlowRoleAttach, FlowID: flowID, Kind: wire.FlowKindUDP, Uplink: up, Downlink: down}
-	attach, err := quicPrep.Commit(ctx, dest, attachHeader)
+	setupBytes, err := wire.EncodeFlowSetup(attachHeader, "", b.cfg.tcp.Spec())
+	if err != nil {
+		_ = tcpConn.Close()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
+		return nil, fmtError("encode quic attach", err)
+	}
+	quicConn, err := commitQUICFlow(ctx, quicPrep, setupBytes)
 	if err != nil {
 		cancel()
 		_ = tcpConn.Close()
-		b.releaseQUICFlow(quicSession, quicFlow)
 		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
-		return nil, fmt.Errorf("nowhere: commit quic attach half: %w", err)
+		return nil, fmtError("commit quic attach half", err)
+	}
+	quicHandle, err := newQUICDatagramHandle(quicPrep, flowID)
+	if err != nil {
+		cancel()
+		_ = quicConn.Close()
+		_ = tcpConn.Close()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
+		return nil, fmtError("register quic udp flow", err)
 	}
 	quicPrep = nil
 
+	uplink := &uotLaneUplink{raw: tcpConn}
+	downlink := &quicLaneDownlink{prep: quicHandle, flowID: flowID}
 	b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, nil)
 	return &asymmetricPacketConn{
 		dest:     dest,
-		uplink:   &uotLaneUplink{raw: tcpConn},
-		downlink: &quicUDPDownlink{flow: quicFlow},
+		uplink:   uplink,
+		downlink: downlink,
 		upCloser: tcpConn,
-		dnCloser: attach,
-		quicSess: quicSession,
-		quicFlow: quicFlow,
+		dnCloser: quicConn,
 	}, nil
 }
 
-// openUDPTCP: prepare TCP ATTACH first; commit it on the first OPEN_DATA write.
+// openUDPTCP: QUIC uplink (OPEN) + TCP downlink (typed UoT Attach).
 func (b *CarrierBundle) openUDPTCP(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	dest string,
 	flowID uint64,
 	up, down wire.Carrier,
-	quicSession carrier.QuicSession,
-	quicFlow carrier.QuicUDPFlow,
+	started time.Time,
 ) (net.PacketConn, error) {
-	_ = ctx
+	openHeader := wire.FlowHeader{Role: wire.FlowRoleOpen, FlowID: flowID, Kind: wire.FlowKindUDP, Uplink: up, Downlink: down}
+	attachHeader := wire.FlowHeader{Role: wire.FlowRoleAttach, FlowID: flowID, Kind: wire.FlowKindUDP, Uplink: up, Downlink: down}
+
+	quicPrep, err := b.prepareQUICStream(ctx, openHeader.FlowID)
+	if err != nil {
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, 0, started, err)
+		return nil, fmtError("prepare quic open half", err)
+	}
+	defer func() {
+		if quicPrep != nil {
+			_ = quicPrep.Close()
+		}
+	}()
+
 	pool, err := b.tcpPool()
 	if err != nil {
-		b.releaseQUICFlow(quicSession, quicFlow)
-		return nil, err
+		cancel()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, 0, started, err)
+		return nil, fmtError("prepare tcp pool", err)
 	}
 	if pool == nil {
-		b.releaseQUICFlow(quicSession, quicFlow)
+		cancel()
 		return nil, errors.New("nowhere: tcp downlink carrier unavailable")
 	}
-	attachHeader := wire.FlowHeader{Role: wire.FlowRoleAttach, FlowID: flowID, Kind: wire.FlowKindUDP, Uplink: up, Downlink: down}
-	tcpHalf, err := pool.PrepareUDPFlowHalf(ctx, dest, attachHeader)
+	tcpHalf, err := pool.PrepareFlowHalf(ctx, "", attachHeader)
 	if err != nil {
-		b.releaseQUICFlow(quicSession, quicFlow)
-		return nil, err
+		cancel()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, 0, started, err)
+		return nil, fmtError("prepare tcp attach half", err)
+	}
+	tcpCarrierID := tcpHalf.CarrierID()
+	defer func() {
+		if tcpHalf != nil {
+			_ = tcpHalf.Close()
+		}
+	}()
+
+	setupBytes, err := wire.EncodeFlowSetup(openHeader, dest, b.cfg.tcp.Spec())
+	if err != nil {
+		_ = tcpHalf.Close()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
+		return nil, fmtError("encode quic open", err)
+	}
+	quicConn, err := commitQUICHalf(ctx, quicPrep, setupBytes, true)
+	if err != nil {
+		cancel()
+		_ = tcpHalf.Close()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
+		return nil, fmtError("commit quic open half", err)
+	}
+	quicHandle := newQUICSendHandle(quicPrep, flowID)
+	quicPrep = nil
+
+	tcpConn, err := tcpHalf.Commit()
+	if err != nil {
+		cancel()
+		_ = quicConn.Close()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, tcpCarrierID, 0, started, err)
+		return nil, fmtError("commit tcp attach half", err)
+	}
+	tcpHalf = nil
+	if err := readUOTSetupResult(tcpConn); err != nil {
+		cancel()
+		_ = quicConn.Close()
+		_ = tcpConn.Close()
+		b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, tcpCarrierID, started, err)
+		return nil, fmtError("read tcp downlink setup result", err)
 	}
 
-	pending := &pendingAttachConn{}
-	uplink := &deferredAttachUplink{
-		inner: &quicUDPUplink{
-			client:  b.quicClientSync(),
-			session: quicSession,
-			flow:    quicFlow,
-			target:  dest,
-			down:    down,
-		},
-		prepared: tcpHalf,
-		cancel:   cancel,
-		pending:  pending,
-	}
-	pending.uplink = uplink
-
+	uplink := &quicLaneUplink{prep: quicHandle, flowID: flowID}
+	downlink := &uotLaneDownlink{raw: tcpConn}
+	b.emitAsymmetric(ctx, "asymmetric_udp_open", flowID, dest, up, down, 0, tcpCarrierID, started, nil)
 	return &asymmetricPacketConn{
 		dest:     dest,
 		uplink:   uplink,
-		downlink: &uotLaneDownlink{raw: pending},
-		quicSess: quicSession,
-		quicFlow: quicFlow,
+		downlink: downlink,
+		upCloser: quicConn,
+		dnCloser: tcpConn,
 	}, nil
 }
 
-// deferredAttachUplink commits the prepared TCP ATTACH immediately before the
-// first OPEN_DATA datagram so both halves reach the portal together.
-type deferredAttachUplink struct {
-	inner    *quicUDPUplink
-	prepared *tcptls.PreparedFlowHalf
-	cancel   context.CancelFunc
-	pending  *pendingAttachConn
-
-	once      sync.Once
-	commitErr error
-	conn      net.Conn
-}
-
-func (u *deferredAttachUplink) ensureCommitted() error {
-	u.once.Do(func() {
-		if u.prepared == nil {
-			u.commitErr = errors.New("nowhere: tcp attach already released")
-			return
-		}
-		conn, err := u.prepared.Commit()
-		u.prepared = nil
-		if err != nil {
-			u.commitErr = fmt.Errorf("nowhere: commit tcp attach half: %w", err)
-			if u.cancel != nil {
-				u.cancel()
-			}
-			return
-		}
-		u.conn = conn
-		if u.pending != nil {
-			u.pending.conn = conn
-		}
-	})
-	return u.commitErr
-}
-
-func (u *deferredAttachUplink) WritePacket(p []byte) (int, error) {
-	if err := u.ensureCommitted(); err != nil {
-		return 0, err
-	}
-	return u.inner.WritePacket(p)
-}
-
-func (u *deferredAttachUplink) ClosePacket() error {
-	var closeErr error
-	u.once.Do(func() {
-		if u.prepared != nil {
-			closeErr = u.prepared.Close()
-			u.prepared = nil
-		}
-	})
-	if u.conn != nil {
-		if err := u.conn.Close(); err != nil && closeErr == nil {
-			closeErr = err
-		}
-	}
-	if u.inner != nil {
-		if err := u.inner.ClosePacket(); err != nil && closeErr == nil {
-			closeErr = err
-		}
-	}
-	return closeErr
-}
-
-func (u *deferredAttachUplink) SetWriteDeadline(t time.Time) error {
-	if err := u.ensureCommitted(); err != nil {
+func readUOTSetupResult(r io.Reader) error {
+	frame, err := wire.ReadUOTFrame(r)
+	if err != nil {
 		return err
 	}
-	if u.conn == nil {
+	switch frame.Kind {
+	case wire.UOTFrameReady:
 		return nil
+	case wire.UOTFrameReject:
+		return &wire.FlowError{Code: frame.Code, Remote: true}
+	default:
+		return wire.ErrInvalidUOTFrame
 	}
-	return u.conn.SetWriteDeadline(t)
 }
 
-// pendingAttachConn stands in as the TCP downlink until ATTACH is committed.
-type pendingAttachConn struct {
-	uplink *deferredAttachUplink
-	conn   net.Conn
+// --- asymmetric UDP packet conn ---
+
+type asymmetricPacketConn struct {
+	dest     string
+	uplink   udpUplink
+	downlink udpDownlink
+	upCloser io.Closer
+	dnCloser io.Closer
 }
 
-func (c *pendingAttachConn) Read(p []byte) (int, error) {
-	if err := c.uplink.ensureCommitted(); err != nil {
-		return 0, err
+func (a *asymmetricPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := a.downlink.ReadPacket(p)
+	if err != nil {
+		return n, nil, err
 	}
-	if c.conn == nil {
-		return 0, net.ErrClosed
-	}
-	return c.conn.Read(p)
+	return n, parseTargetAddr(a.dest), nil
 }
 
-func (c *pendingAttachConn) Write(p []byte) (int, error) {
-	if err := c.uplink.ensureCommitted(); err != nil {
-		return 0, err
-	}
-	if c.conn == nil {
-		return 0, net.ErrClosed
-	}
-	return c.conn.Write(p)
+func (a *asymmetricPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return a.uplink.WritePacket(p)
 }
 
-func (c *pendingAttachConn) Close() error {
-	if c.uplink != nil {
-		return c.uplink.ClosePacket()
+func (a *asymmetricPacketConn) Close() error {
+	_ = a.uplink.ClosePacket()
+	if a.upCloser != nil {
+		_ = a.upCloser.Close()
 	}
-	if c.conn != nil {
-		return c.conn.Close()
+	_ = a.downlink.ClosePacket()
+	if a.dnCloser != nil {
+		_ = a.dnCloser.Close()
 	}
 	return nil
 }
 
-func (c *pendingAttachConn) LocalAddr() net.Addr {
-	if c.conn != nil {
-		return c.conn.LocalAddr()
-	}
-	return &net.TCPAddr{}
-}
+func (a *asymmetricPacketConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
 
-func (c *pendingAttachConn) RemoteAddr() net.Addr {
-	if c.conn != nil {
-		return c.conn.RemoteAddr()
-	}
-	return &net.TCPAddr{}
-}
-
-func (c *pendingAttachConn) SetDeadline(t time.Time) error {
-	if err := c.SetReadDeadline(t); err != nil {
+func (a *asymmetricPacketConn) SetDeadline(t time.Time) error {
+	if err := a.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return c.SetWriteDeadline(t)
+	return a.SetWriteDeadline(t)
+}
+func (a *asymmetricPacketConn) SetReadDeadline(t time.Time) error {
+	if d, ok := a.downlink.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return d.SetReadDeadline(t)
+	}
+	return nil
+}
+func (a *asymmetricPacketConn) SetWriteDeadline(t time.Time) error {
+	if d, ok := a.uplink.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return d.SetWriteDeadline(t)
+	}
+	return nil
 }
 
-func (c *pendingAttachConn) SetReadDeadline(t time.Time) error {
-	if err := c.uplink.ensureCommitted(); err != nil {
-		return err
-	}
-	if c.conn == nil {
-		return nil
-	}
-	return c.conn.SetReadDeadline(t)
+var _ net.PacketConn = (*asymmetricPacketConn)(nil)
+
+// --- UoT lanes ---
+
+type uotLaneUplink struct {
+	raw        net.Conn
+	writerOnce sync.Once
+	writer     *uotStreamWriter
 }
 
-func (c *pendingAttachConn) SetWriteDeadline(t time.Time) error {
-	if err := c.uplink.ensureCommitted(); err != nil {
-		return err
-	}
-	if c.conn == nil {
-		return nil
-	}
-	return c.conn.SetWriteDeadline(t)
+func (u *uotLaneUplink) streamWriter() *uotStreamWriter {
+	u.writerOnce.Do(func() {
+		u.writer = &uotStreamWriter{conn: u.raw}
+	})
+	return u.writer
 }
 
-var (
-	_ net.Conn   = (*pendingAttachConn)(nil)
-	_ udpUplink  = (*deferredAttachUplink)(nil)
-	_ io.Closer  = (*pendingAttachConn)(nil)
-)
+func (u *uotLaneUplink) WritePacket(p []byte) (int, error) {
+	return u.streamWriter().WritePacket(p)
+}
+
+func (u *uotLaneUplink) ClosePacket() error { return u.streamWriter().Close() }
+
+func (u *uotLaneUplink) SetWriteDeadline(t time.Time) error {
+	return u.raw.SetWriteDeadline(t)
+}
+
+type uotLaneDownlink struct {
+	raw net.Conn
+	mu  sync.Mutex
+}
+
+func (d *uotLaneDownlink) ReadPacket(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	frame, err := wire.ReadUOTFrame(d.raw)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, io.EOF
+		}
+		return 0, err
+	}
+	switch frame.Kind {
+	case wire.UOTFrameData:
+		n := copy(p, frame.Payload)
+		return n, nil
+	case wire.UOTFrameClose:
+		return 0, io.EOF
+	default:
+		return 0, wire.ErrInvalidUOTFrame
+	}
+}
+
+func (d *uotLaneDownlink) ClosePacket() error { return d.raw.Close() }
+
+func (d *uotLaneDownlink) SetReadDeadline(t time.Time) error {
+	return d.raw.SetReadDeadline(t)
+}
+
+// --- QUIC datagram lanes ---
+
+type quicLaneUplink struct {
+	prep   *qSessionHandle
+	flowID uint64
+	nextID atomic.Uint32
+}
+
+func (u *quicLaneUplink) WritePacket(p []byte) (int, error) {
+	return writeQUICUDPPacket(u.prep, u.flowID, &u.nextID, p)
+}
+
+func (u *quicLaneUplink) ClosePacket() error {
+	return u.prep.closePacket()
+}
+
+func (u *quicLaneUplink) SetWriteDeadline(t time.Time) error {
+	return u.prep.setWriteDeadline(t)
+}
+
+type quicLaneDownlink struct {
+	prep   *qSessionHandle
+	flowID uint64
+}
+
+func (d *quicLaneDownlink) ReadPacket(p []byte) (int, error) {
+	payload, err := d.prep.readPacket(context.Background())
+	if err != nil {
+		return 0, err
+	}
+	return copy(p, payload), nil
+}
+
+func (d *quicLaneDownlink) ClosePacket() error {
+	return d.prep.closePacket()
+}
+
+func (d *quicLaneDownlink) SetReadDeadline(t time.Time) error {
+	return d.prep.setReadDeadline(t)
+}
