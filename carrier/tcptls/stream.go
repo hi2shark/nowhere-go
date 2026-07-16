@@ -7,7 +7,7 @@ import (
 )
 
 // wrapRelay promotes a consumed carrier to active_relay with diagnostic tracking.
-func wrapRelay(conn net.Conn, ci *carrierInfo, flowID uint64, kind wire.FlowKind, target string) net.Conn {
+func wrapRelay(conn net.Conn, ci *carrierInfo, flowID wire.FlowID, kind wire.FlowKind, target string) net.Conn {
 	network := relayNetwork(kind)
 	ci.transition(stateActiveRelay)
 	ci.logger().Debugf("[Nowhere] [carrier] relay_start flow_id=%d carrier_id=%d network=%s target=%s",

@@ -9,6 +9,7 @@ import (
 
 	"github.com/hi2shark/nowhere-go/carrier"
 	"github.com/hi2shark/nowhere-go/diagnostic"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // carrierState tracks TLS/TCP carrier lifecycle for diagnostics only.
@@ -118,8 +119,8 @@ func legalTransition(prev, next carrierState) bool {
 type trackedConn struct {
 	net.Conn
 	carrier      *carrierInfo
-	flowID       uint64 // local log id (symmetric)
-	network      string // "tcp" or "udp" (UoT)
+	flowID       wire.FlowID // local log id (symmetric)
+	network      string      // "tcp" or "udp" (UoT)
 	target       string
 	openedAt     time.Time
 	firstByteMs  atomic.Int64
@@ -129,7 +130,7 @@ type trackedConn struct {
 	closed       atomic.Bool
 }
 
-func newTrackedConn(conn net.Conn, ci *carrierInfo, flowID uint64, network, target string) *trackedConn {
+func newTrackedConn(conn net.Conn, ci *carrierInfo, flowID wire.FlowID, network, target string) *trackedConn {
 	t := &trackedConn{
 		Conn:     conn,
 		carrier:  ci,

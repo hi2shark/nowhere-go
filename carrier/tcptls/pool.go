@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -36,9 +37,10 @@ const (
 )
 
 type warmConn struct {
-	conn    net.Conn
-	carrier *carrierInfo
-	expiry  *time.Timer
+	conn     net.Conn
+	exporter wire.TLSExporter
+	carrier  *carrierInfo
+	expiry   *time.Timer
 }
 
 type poolSnapshot struct {
@@ -65,7 +67,7 @@ type TCPPool struct {
 }
 
 func NewTCPPool(cfg *Config, target int) *TCPPool {
-	if cfg == nil || cfg.spec == nil || cfg.dialer == nil || cfg.tlsDialer == nil {
+	if cfg == nil || cfg.credentials == nil || cfg.dialer == nil || cfg.tlsDialer == nil {
 		return nil
 	}
 	if target < 0 {
@@ -299,7 +301,7 @@ func (p *TCPPool) runPortalDial(ctx context.Context, fn func(context.Context) er
 	return p.dialGate.Run(ctx, fn)
 }
 
-func logPoolAcquire(cfg *Config, outcome string, flowID uint64, carrierID uint64, snapshot poolSnapshot, start time.Time) {
+func logPoolAcquire(cfg *Config, outcome string, flowID wire.FlowID, carrierID uint64, snapshot poolSnapshot, start time.Time) {
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] pool_acquire outcome=%s flow_id=%d carrier_id=%d pool_idle=%d pool_preparing=%d pool_target=%d acquire_wait_ms=%d",
 		outcome, flowID, carrierID, snapshot.idle, snapshot.preparing, snapshot.target, time.Since(start).Milliseconds())
 }
@@ -346,7 +348,7 @@ func (p *TCPPool) prepareOne() {
 	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	conn, ci, err := prepare(ctx, p.cfg)
+	conn, exporter, ci, err := prepare(ctx, p.cfg)
 	cancel()
 	if err != nil {
 		p.logger().Debugf("[Nowhere] warm prepare failed: %v", err)
@@ -357,7 +359,7 @@ func (p *TCPPool) prepareOne() {
 		return
 	}
 
-	wc := &warmConn{conn: conn, carrier: ci}
+	wc := &warmConn{conn: conn, exporter: exporter, carrier: ci}
 	p.mu.Lock()
 	p.preparing--
 	p.clearWarmBackoffLocked()
@@ -415,7 +417,7 @@ func newOpenTiming() openTiming {
 	return openTiming{start: time.Now()}
 }
 
-func logOpenTiming(cfg *Config, outcome string, flowID uint64, carrierID uint64, stage string, network string, target string, timing openTiming) {
+func logOpenTiming(cfg *Config, outcome string, flowID wire.FlowID, carrierID uint64, stage string, network string, target string, timing openTiming) {
 	server := dialAddr(cfg)
 	// Warm prepare has no business destination; only portal server address.
 	if strings.HasPrefix(stage, "tls") || stage == "warm_prepare" || strings.Contains(outcome, "warm_prepare") {
@@ -528,7 +530,8 @@ func configuredTCPSocketBuffer() (bytes int, forced bool, invalidValue string) {
 }
 
 // prepare dials, TLS-handshakes, and authenticates. Caller moves to authenticatedIdle.
-func prepare(ctx context.Context, cfg *Config) (net.Conn, *carrierInfo, error) {
+// The returned exporter is bound to the physical connection's TLS handshake.
+func prepare(ctx context.Context, cfg *Config) (net.Conn, wire.TLSExporter, *carrierInfo, error) {
 	ci := newCarrierInfo(loggerFrom(cfg))
 	timing := newOpenTiming()
 	stage := "tls"
@@ -540,41 +543,47 @@ func prepare(ctx context.Context, cfg *Config) (net.Conn, *carrierInfo, error) {
 	if err != nil {
 		ci.transition(stateClosed)
 		logOpenTiming(cfg, "warm_prepare_failed", 0, ci.id, stage, "tcp", target, timing)
-		return nil, nil, err
+		return nil, wire.TLSExporter{}, nil, err
 	}
 	tuneNowhereTCPConn(cfg, raw, ci.id, stage)
 	tlsStart := time.Now()
-	tlsConn, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
+	handshaked, err := cfg.tlsDialer.DialTLSConn(ctx, raw)
 	timing.tlsHandshake = time.Since(tlsStart)
 	if err != nil {
 		_ = raw.Close()
 		ci.transition(stateClosed)
 		logOpenTiming(cfg, "warm_prepare_failed", 0, ci.id, stage, "tcp", target, timing)
-		return nil, nil, err
+		return nil, wire.TLSExporter{}, nil, err
 	}
-	auth, err := tcpAuthFrame(cfg)
+	tlsConn := handshaked.Conn
+	exporter := handshaked.Exporter
+	auth, err := tcpAuthFrame(cfg, exporter)
 	if err != nil {
 		_ = tlsConn.Close()
 		ci.transition(stateClosed)
 		logOpenTiming(cfg, "warm_prepare_failed", 0, ci.id, stage, "tcp", target, timing)
-		return nil, nil, err
+		return nil, wire.TLSExporter{}, nil, err
 	}
 	timing.authWrite, err = writeFullTimed(tlsConn, auth)
 	if err != nil {
 		_ = tlsConn.Close()
 		ci.transition(stateClosed)
 		logOpenTiming(cfg, "warm_prepare_failed", 0, ci.id, stage, "tcp", target, timing)
-		return nil, nil, err
+		return nil, wire.TLSExporter{}, nil, err
 	}
 	logOpenTiming(cfg, "warm_prepare", 0, ci.id, stage, "tcp", target, timing)
 	loggerFrom(cfg).Debugf("[Nowhere] [carrier] auth_ok carrier_id=%d", ci.id)
-	return tlsConn, ci, nil
+	return tlsConn, exporter, ci, nil
 }
 
-func tcpAuthFrame(cfg *Config) ([]byte, error) {
-	if cfg.sessionID != (wire.SessionID{}) {
-		return wire.MakeAuthFrameWithSession(cfg.key, cfg.spec, cfg.sessionID)
+// tcpAuthFrame builds the connection-bound auth frame using the credentials,
+// the physical transport and this connection's TLS exporter. The session id is
+// supplied by the bundle via WithSessionID; a zero session id is rejected to
+// avoid authenticating before the bundle has generated one.
+func tcpAuthFrame(cfg *Config, exporter wire.TLSExporter) ([]byte, error) {
+	if cfg.sessionID == (wire.SessionID{}) {
+		return nil, errors.New("nowhere: missing session id for auth frame")
 	}
-	frame, _, err := wire.MakeAuthFrame(cfg.key, cfg.spec)
-	return frame, err
+	frame := wire.EncodeAuthFrame(cfg.credentials, cfg.transport, exporter, cfg.sessionID)
+	return frame[:], nil
 }

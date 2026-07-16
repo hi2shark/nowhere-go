@@ -38,17 +38,20 @@ type TCPDialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
-// TLSDialer performs the host-owned TLS client handshake on a carrier.
+// TLSDialer performs the host-owned TLS 1.3 client handshake on a carrier and
+// returns the connection together with its TLS exporter. The exporter is
+// required for connection-bound authentication; a host that cannot produce one
+// must fail the handshake rather than return a zero exporter.
 type TLSDialer interface {
-	DialTLSConn(ctx context.Context, conn net.Conn) (net.Conn, error)
+	DialTLSConn(ctx context.Context, conn net.Conn) (wire.HandshakedConn, error)
 }
 
 // TCPOptions builds an immutable TLS/TCP carrier Config.
 type TCPOptions struct {
 	Address        string
 	ConnectAddress string
-	Spec           *wire.EffectiveSpec
-	Key            string
+	Credentials    *wire.Credentials
+	Transport      wire.AuthTransport
 	Dialer         TCPDialer
 	TLSDialer      TLSDialer
 	Observer       diagnostic.Observer
@@ -74,8 +77,8 @@ type TCPOptions struct {
 type Config struct {
 	address            string
 	connectAddress     string
-	spec               *wire.EffectiveSpec
-	key                string
+	credentials        *wire.Credentials
+	transport          wire.AuthTransport
 	dialer             TCPDialer
 	tlsDialer          TLSDialer
 	observer           diagnostic.Observer
@@ -93,11 +96,11 @@ func NewConfig(options TCPOptions) (*Config, error) {
 	if options.Address == "" {
 		return nil, fmt.Errorf("nowhere: empty TCP carrier address")
 	}
-	if options.Spec == nil {
-		return nil, fmt.Errorf("nowhere: nil effective spec")
+	if options.Credentials == nil {
+		return nil, fmt.Errorf("nowhere: nil credentials")
 	}
-	if _, err := wire.BuildEffectiveSpec(options.Key, options.Spec.Spec(), options.Spec.ALPN()); err != nil {
-		return nil, err
+	if options.Transport != wire.AuthTransportTLSTCP && options.Transport != wire.AuthTransportQUIC {
+		return nil, fmt.Errorf("nowhere: invalid auth transport")
 	}
 	if options.Dialer == nil {
 		return nil, fmt.Errorf("nowhere: nil TCP dialer")
@@ -148,7 +151,8 @@ func NewConfig(options TCPOptions) (*Config, error) {
 	}
 	config := &Config{
 		address: options.Address, connectAddress: options.ConnectAddress,
-		spec: options.Spec, key: options.Key, dialer: options.Dialer,
+		credentials: options.Credentials, transport: options.Transport,
+		dialer: options.Dialer,
 		tlsDialer: options.TLSDialer, observer: options.Observer,
 		maxConcurrentDials: maxDials,
 		warmBackoffInitial: warmInitial,
@@ -218,12 +222,20 @@ func (c *Config) Observer() diagnostic.Observer {
 	return c.observer
 }
 
-// Spec returns the configured effective spec.
-func (c *Config) Spec() *wire.EffectiveSpec {
+// Credentials returns the connection-independent authentication credentials.
+func (c *Config) Credentials() *wire.Credentials {
 	if c == nil {
 		return nil
 	}
-	return c.spec
+	return c.credentials
+}
+
+// Transport returns the physical carrier domain separator bound into auth tags.
+func (c *Config) Transport() wire.AuthTransport {
+	if c == nil {
+		return wire.AuthTransportTLSTCP
+	}
+	return c.transport
 }
 
 type observerLogger struct{ observer diagnostic.Observer }
