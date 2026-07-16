@@ -2,9 +2,13 @@ package wire
 
 import "errors"
 
+// Codec errors. They are intentionally coarse: Nowhere 1.5 closes a connection
+// on any protocol violation and never distinguishes failure causes to the peer.
 var (
 	ErrInvalidTarget      = errors.New("nowhere: invalid target address")
 	ErrInvalidFrame       = errors.New("nowhere: invalid frame")
-	ErrUnsupportedVersion = errors.New("nowhere: unsupported frame version")
-	ErrPaddingTooLarge    = errors.New("nowhere: padding too large")
+	ErrInvalidFlowHeader  = errors.New("nowhere: invalid flow header")
+	ErrInvalidAuthFrame   = errors.New("nowhere: invalid authentication frame")
+	ErrInvalidSetupResult = errors.New("nowhere: invalid setup result")
+	ErrTruncated          = errors.New("nowhere: truncated input")
 )

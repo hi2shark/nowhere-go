@@ -2,183 +2,110 @@ package wire
 
 import (
 	"bytes"
-	"strconv"
 	"testing"
-
-	"github.com/hi2shark/nowhere-go/internal/vectors"
 )
 
-func TestFlowCorpusHeaders(t *testing.T) {
-	corpus, err := vectors.LoadFlow()
-	if err != nil {
-		t.Fatalf("LoadFlow: %v", err)
+func TestFlowHeaderFixedVectors(t *testing.T) {
+	cases := []struct {
+		name   string
+		header FlowHeader
+		want   [FlowHeaderLen]byte
+	}{
+		{
+			"duplex-tcp-tls-tls",
+			FlowHeader{Role: FlowRoleDuplex, FlowID: 0x01020304, Kind: FlowKindTCP, Uplink: CarrierTLSTCP, Downlink: CarrierTLSTCP},
+			[FlowHeaderLen]byte{0x00, 1, 2, 3, 4},
+		},
+		{
+			"open-udp-quic-tcp",
+			FlowHeader{Role: FlowRoleOpen, FlowID: 0x11223344, Kind: FlowKindUDP, Uplink: CarrierQUIC, Downlink: CarrierTLSTCP},
+			[FlowHeaderLen]byte{0x0d, 0x11, 0x22, 0x33, 0x44},
+		},
+		{
+			"attach-udp-tcp-quic",
+			FlowHeader{Role: FlowRoleAttach, FlowID: 7, Kind: FlowKindUDP, Uplink: CarrierTLSTCP, Downlink: CarrierQUIC},
+			[FlowHeaderLen]byte{0x16, 0, 0, 0, 7},
+		},
+		{
+			"duplex-udp-quic-quic",
+			FlowHeader{Role: FlowRoleDuplex, FlowID: 0x01020304, Kind: FlowKindUDP, Uplink: CarrierQUIC, Downlink: CarrierQUIC},
+			[FlowHeaderLen]byte{0x1c, 1, 2, 3, 4},
+		},
 	}
-	for _, tc := range corpus.Cases {
-		if tc.Operation != "flow_header" {
-			continue
-		}
-		t.Run(tc.ID, func(t *testing.T) {
-			frame, err := vectors.DecodeHex(tc.FrameHex)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := WriteFlowHeader(tc.header)
 			if err != nil {
-				t.Fatalf("DecodeHex: %v", err)
+				t.Fatalf("encode: %v", err)
 			}
-			if !tc.Valid {
-				if _, err := ReadFlowHeader(bytes.NewReader(frame)); err == nil {
-					t.Fatal("ReadFlowHeader accepted invalid corpus frame")
-				}
-				return
+			if !bytes.Equal(got[:], tc.want[:]) {
+				t.Fatalf("header mismatch\n got %x\nwant %x", got[:], tc.want[:])
 			}
-			header := flowHeaderFromCorpus(t, tc)
-			encoded, err := WriteFlowHeader(header)
+			decoded, err := DecodeFlowHeader(got[:])
 			if err != nil {
-				t.Fatalf("WriteFlowHeader: %v", err)
+				t.Fatalf("decode: %v", err)
 			}
-			if !bytes.Equal(encoded[:], frame) {
-				t.Fatalf("encoded = %x, want corpus %x", encoded, frame)
-			}
-			decoded, err := ReadFlowHeader(bytes.NewReader(frame))
-			if err != nil {
-				t.Fatalf("ReadFlowHeader: %v", err)
-			}
-			if decoded != header {
-				t.Fatalf("decoded = %+v, want %+v", decoded, header)
+			if decoded != tc.header {
+				t.Fatalf("decoded mismatch\n got %+v\nwant %+v", decoded, tc.header)
 			}
 		})
 	}
-
-	if FlowHeaderLen != 14 {
-		t.Fatalf("FlowHeaderLen = %d, want 14", FlowHeaderLen)
-	}
-	smoke, err := WriteFlowHeader(FlowHeader{
-		Role: FlowRoleDuplex, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierUDP, Downlink: CarrierUDP,
-	})
-	if err != nil {
-		t.Fatalf("WriteFlowHeader smoke: %v", err)
-	}
-	if smoke[0] != 0xf1 {
-		t.Fatalf("flow magic = %#x, want 0xf1", smoke[0])
-	}
 }
 
-func TestFlowHeaderRejectsInvalidCarrierShapes(t *testing.T) {
-	cases := []FlowHeader{
-		{Role: FlowRoleOpen, FlowID: 0, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: CarrierUDP},
-		{Role: 0, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: CarrierUDP},
-		{Role: FlowRoleOpen, FlowID: 1, Kind: 0, Uplink: CarrierTCP, Downlink: CarrierUDP},
-		{Role: FlowRoleOpen, FlowID: 1, Kind: FlowKindTCP, Uplink: 0, Downlink: CarrierUDP},
-		{Role: FlowRoleOpen, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: 0},
-		{Role: FlowRoleOpen, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: CarrierTCP},
-		{Role: FlowRoleAttach, FlowID: 1, Kind: FlowKindUDP, Uplink: CarrierUDP, Downlink: CarrierUDP},
-		{Role: FlowRoleDuplex, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: CarrierUDP},
+func TestFlowHeaderRejectsInvalid(t *testing.T) {
+	invalids := [][]byte{
+		{},                         // empty
+		{0, 0, 0, 0},               // short
+		{0, 0, 0, 0, 0, 0},         // long
+		{0, 0, 0, 0, 0},            // zero flow id
+		{0x20, 0, 0, 0, 1},         // reserved bit
+		{0x40, 0, 0, 0, 1},         // reserved bit
+		{0x80, 0, 0, 0, 1},         // reserved bit
+		{0x03, 0, 0, 0, 1},         // invalid role
+		{0x10, 0, 0, 0, 1},         // duplex carrier mismatch
+		{0x01, 0, 0, 0, 1},         // open split carrier match
 	}
-	for _, header := range cases {
-		if _, err := WriteFlowHeader(header); err == nil {
-			t.Fatalf("WriteFlowHeader accepted invalid shape: %+v", header)
+	for _, frame := range invalids {
+		if _, err := DecodeFlowHeader(frame); err == nil {
+			t.Fatalf("expected decode error for %x", frame)
 		}
 	}
 }
 
-func TestFlowCorpusContainsOnlyKnownOperations(t *testing.T) {
-	corpus, err := vectors.LoadFlow()
+func TestFlowHeaderValidateOnCarrier(t *testing.T) {
+	open := FlowHeader{Role: FlowRoleOpen, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierTLSTCP, Downlink: CarrierQUIC}
+	if err := open.ValidateOn(CarrierTLSTCP); err != nil {
+		t.Fatalf("open on uplink carrier: %v", err)
+	}
+	if err := open.ValidateOn(CarrierQUIC); err == nil {
+		t.Fatal("open accepted on downlink carrier")
+	}
+	attach := FlowHeader{Role: FlowRoleAttach, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierTLSTCP, Downlink: CarrierQUIC}
+	if err := attach.ValidateOn(CarrierQUIC); err != nil {
+		t.Fatalf("attach on downlink carrier: %v", err)
+	}
+	if err := attach.ValidateOn(CarrierTLSTCP); err == nil {
+		t.Fatal("attach accepted on uplink carrier")
+	}
+	if open.CarriesTarget() != true {
+		t.Fatal("open must carry target")
+	}
+	if attach.CarriesTarget() {
+		t.Fatal("attach must not carry target")
+	}
+}
+
+func TestFlowHeaderMaxFlowIDRoundTrips(t *testing.T) {
+	header := FlowHeader{Role: FlowRoleDuplex, FlowID: 0xffffffff, Kind: FlowKindTCP, Uplink: CarrierQUIC, Downlink: CarrierQUIC}
+	encoded, err := WriteFlowHeader(header)
 	if err != nil {
-		t.Fatalf("LoadFlow: %v", err)
+		t.Fatalf("encode: %v", err)
 	}
-	counts := map[string]int{"flow_header": 0, "flow_result": 0}
-	for _, tc := range corpus.Cases {
-		if _, ok := counts[tc.Operation]; !ok {
-			t.Fatalf("unknown flow corpus operation %q in %s", tc.Operation, tc.ID)
-		}
-		counts[tc.Operation]++
-	}
-	for operation, count := range counts {
-		if count == 0 {
-			t.Fatalf("flow corpus has no %s cases", operation)
-		}
-	}
-}
-
-func TestEncodeFlowSetupAttachIsHeaderOnly(t *testing.T) {
-	spec, err := BuildEffectiveSpec("secret", "auto", "now/1")
+	decoded, err := DecodeFlowHeader(encoded[:])
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("decode: %v", err)
 	}
-	attach := FlowHeader{
-		Role: FlowRoleAttach, FlowID: 1, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: CarrierUDP,
-	}
-	attachSetup, err := EncodeFlowSetup(attach, "", nil)
-	if err != nil {
-		t.Fatalf("EncodeFlowSetup attach: %v", err)
-	}
-	if len(attachSetup) != FlowHeaderLen {
-		t.Fatalf("attach setup length = %d, want %d", len(attachSetup), FlowHeaderLen)
-	}
-
-	for _, header := range []FlowHeader{
-		{Role: FlowRoleOpen, FlowID: 2, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: CarrierUDP},
-		{Role: FlowRoleDuplex, FlowID: 3, Kind: FlowKindTCP, Uplink: CarrierTCP, Downlink: CarrierTCP},
-	} {
-		setup, err := EncodeFlowSetup(header, "example.com:443", spec)
-		if err != nil {
-			t.Fatalf("EncodeFlowSetup role %d: %v", header.Role, err)
-		}
-		if len(setup) <= FlowHeaderLen {
-			t.Fatalf("role %d setup length = %d, want > %d", header.Role, len(setup), FlowHeaderLen)
-		}
-	}
-}
-
-func flowHeaderFromCorpus(t *testing.T, tc vectors.FlowCase) FlowHeader {
-	t.Helper()
-	flowID, err := strconv.ParseUint(tc.FlowID, 10, 64)
-	if err != nil {
-		t.Fatalf("flow_id %q: %v", tc.FlowID, err)
-	}
-	return FlowHeader{
-		Role:     parseFlowRole(t, tc.Role),
-		FlowID:   flowID,
-		Kind:     parseFlowKind(t, tc.Kind),
-		Uplink:   parseCarrier(t, tc.Uplink),
-		Downlink: parseCarrier(t, tc.Downlink),
-	}
-}
-
-func parseFlowRole(t *testing.T, value string) FlowRole {
-	t.Helper()
-	switch value {
-	case "open":
-		return FlowRoleOpen
-	case "attach":
-		return FlowRoleAttach
-	case "duplex":
-		return FlowRoleDuplex
-	default:
-		t.Fatalf("unknown flow role %q", value)
-		return 0
-	}
-}
-
-func parseFlowKind(t *testing.T, value string) FlowKind {
-	t.Helper()
-	switch value {
-	case "tcp":
-		return FlowKindTCP
-	case "udp":
-		return FlowKindUDP
-	default:
-		t.Fatalf("unknown flow kind %q", value)
-		return 0
-	}
-}
-
-func parseCarrier(t *testing.T, value string) Carrier {
-	t.Helper()
-	switch value {
-	case "tls_tcp":
-		return CarrierTCP
-	case "quic":
-		return CarrierUDP
-	default:
-		t.Fatalf("unknown carrier %q", value)
-		return 0
+	if decoded != header {
+		t.Fatalf("decoded mismatch\n got %+v\nwant %+v", decoded, header)
 	}
 }

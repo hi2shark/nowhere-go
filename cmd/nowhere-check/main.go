@@ -18,8 +18,8 @@ import (
 var Version = "dev"
 
 const (
-	UpstreamVersion = "v1.4.0"
-	UpstreamCommit  = "3e20354ebfe70b1639a94055810581d966dbe44e"
+	UpstreamVersion = "v1.5.0"
+	UpstreamCommit  = "c7c4b013234d264c60252a21c35c0316e6076e7c"
 )
 
 func main() {
@@ -77,29 +77,42 @@ func resolveVersion() string {
 }
 
 func runSelfCheck() error {
-	spec, err := wire.BuildEffectiveSpec("secret", "auto", "now/1")
+	target, err := wire.NewDomainTarget("example.com", 443)
 	if err != nil {
 		return err
 	}
-	frame, err := wire.EncodeTCPRequest("example.com:443", spec)
+	frame, err := wire.EncodeTarget(target)
 	if err != nil {
 		return err
 	}
 	if len(frame) == 0 {
-		return fmt.Errorf("empty tcp request frame")
+		return fmt.Errorf("empty target frame")
 	}
 	hdr, err := wire.WriteFlowHeader(wire.FlowHeader{
 		Role:     wire.FlowRoleOpen,
 		FlowID:   1,
 		Kind:     wire.FlowKindTCP,
-		Uplink:   wire.CarrierTCP,
-		Downlink: wire.CarrierUDP,
+		Uplink:   wire.CarrierQUIC,
+		Downlink: wire.CarrierTLSTCP,
 	})
 	if err != nil {
 		return err
 	}
-	if hdr[0] != wire.FlowFrameMagic {
-		return fmt.Errorf("bad flow magic %#x", hdr[0])
+	if len(hdr) != wire.FlowHeaderLen {
+		return fmt.Errorf("bad flow header length %d", len(hdr))
+	}
+	// Auth frame sanity: 32 bytes, round-trips.
+	creds, err := wire.NewCredentials("secret")
+	if err != nil {
+		return err
+	}
+	exporter := wire.TLSExporter{}
+	for i := range exporter {
+		exporter[i] = byte(i)
+	}
+	authFrame := wire.EncodeAuthFrame(creds, wire.AuthTransportTLSTCP, exporter, wire.SessionID{})
+	if len(authFrame) != wire.AuthFrameLen {
+		return fmt.Errorf("bad auth frame length %d", len(authFrame))
 	}
 	return nil
 }

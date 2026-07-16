@@ -1,162 +1,92 @@
 package wire
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"errors"
-	"fmt"
+	"crypto/subtle"
+	"encoding/binary"
 	"io"
 )
 
-func MakeAuthFrame(key string, spec *EffectiveSpec) (frame []byte, sessionID SessionID, err error) {
-	if spec == nil {
-		return nil, SessionID{}, errors.New("nowhere: nil effective spec")
-	}
-	nonce := make([]byte, authNonceLength)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, SessionID{}, fmt.Errorf("nowhere: generate auth nonce: %w", err)
-	}
-	if _, err := rand.Read(sessionID[:]); err != nil {
-		return nil, SessionID{}, fmt.Errorf("nowhere: generate auth session id: %w", err)
-	}
-	return assembleAuthFrame(key, spec, nonce, sessionID), sessionID, nil
-}
+// AuthTransport is the physical carrier domain separator bound into the
+// authentication tag, so an auth frame captured on one transport cannot be
+// replayed on another.
+type AuthTransport uint8
 
-func MakeAuthFrameWithSession(key string, spec *EffectiveSpec, sessionID SessionID) ([]byte, error) {
-	if spec == nil {
-		return nil, errors.New("nowhere: nil effective spec")
-	}
-	nonce := make([]byte, authNonceLength)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("nowhere: generate auth nonce: %w", err)
-	}
-	return assembleAuthFrame(key, spec, nonce, sessionID), nil
-}
+const (
+	// AuthTransportTLSTCP is TLS 1.3 over TCP.
+	AuthTransportTLSTCP AuthTransport = 0x01
+	// AuthTransportQUIC is QUIC over UDP.
+	AuthTransportQUIC AuthTransport = 0x02
+)
 
-// MakeAuthFrameWithNonce pins nonce and session id for conformance-vector tests.
-func MakeAuthFrameWithNonce(key string, spec *EffectiveSpec, nonce []byte, sessionID SessionID) ([]byte, error) {
-	if spec == nil {
-		return nil, errors.New("nowhere: nil effective spec")
-	}
-	if len(nonce) != authNonceLength {
-		return nil, fmt.Errorf("nowhere: auth nonce must be %d bytes", authNonceLength)
-	}
-	return assembleAuthFrame(key, spec, nonce, sessionID), nil
-}
+// TLSExporterLen is the length of a TLS exporter bound to one connection.
+const TLSExporterLen = 32
 
-func assembleAuthFrame(key string, spec *EffectiveSpec, nonce []byte, sessionID SessionID) []byte {
-	padding := authPaddingBytes(spec, nonce)
+// TLSExporter carries the keying material exported from the physical
+// connection's TLS 1.3 handshake.
+type TLSExporter = [TLSExporterLen]byte
 
-	authKey := sha256.Sum256([]byte(key))
-	tagMsg := make([]byte, 0,
-		len(spec.authInfo)+len(spec.authContext)+len(nonce)+1+len(padding)+SessionIDLen)
-	tagMsg = append(tagMsg, spec.authInfo...)
-	tagMsg = append(tagMsg, spec.authContext...)
-	tagMsg = append(tagMsg, nonce...)
-	tagMsg = append(tagMsg, spec.authPaddingLen)
-	tagMsg = append(tagMsg, padding...)
-	tagMsg = append(tagMsg, sessionID[:]...)
-	tag := hmacSHA256(authKey[:], tagMsg)
+// AuthTagLen is the truncated HMAC tag carried on the wire.
+const AuthTagLen = 16
 
-	paddingBlock := make([]byte, 1+len(padding))
-	paddingBlock[0] = spec.authPaddingLen
-	copy(paddingBlock[1:], padding)
+// AuthFrameLen is the fixed authentication frame length: session_id || tag.
+const AuthFrameLen = SessionIDLen + AuthTagLen
 
-	frame := make([]byte, 0, authFrameLen(spec))
-	for _, element := range spec.authFrameOrder {
-		switch element {
-		case AuthMagic:
-			frame = append(frame, spec.authMagic...)
-		case AuthNonce:
-			frame = append(frame, nonce...)
-		case AuthPadding:
-			frame = append(frame, paddingBlock...)
-		case AuthTag:
-			frame = append(frame, tag...)
-		}
-	}
-	frame = append(frame, sessionID[:]...)
+// AuthFrame is the complete fixed authentication frame.
+type AuthFrame = [AuthFrameLen]byte
+
+// EncodeAuthFrame produces the fixed 32-byte authentication frame:
+//
+//	frame = session_id[16] || tag[16]
+//	tag  = HMAC-SHA256(auth_key, transport || exporter || session_id)[0:16]
+//
+// The frame is bound to the shared key, transport, the connection's TLS
+// exporter and the session id, so it cannot be replayed on any other
+// connection.
+func EncodeAuthFrame(creds *Credentials, transport AuthTransport, exporter TLSExporter, sessionID SessionID) AuthFrame {
+	tag := authTag(creds.authKeyBytes(), transport, exporter, sessionID)
+	var frame AuthFrame
+	copy(frame[:SessionIDLen], sessionID[:])
+	copy(frame[SessionIDLen:], tag[:])
 	return frame
 }
 
-func authFrameLen(spec *EffectiveSpec) int {
-	return authMagicLength + authNonceLength + 1 + int(spec.authPaddingLen) + authTagLength + SessionIDLen
-}
-
-func authPaddingBytes(spec *EffectiveSpec, nonce []byte) []byte {
-	info := make([]byte, 0, len(authPaddingBytesLabel)+len(nonce)+1)
-	info = append(info, authPaddingBytesLabel...)
-	info = append(info, nonce...)
-	info = append(info, spec.authPaddingLen)
-	return hkdfExpand(spec.authPaddingKey, info, int(spec.authPaddingLen))
-}
-
-// ValidateAuthFrame checks length, fields, and HMAC tag in constant time.
-func ValidateAuthFrame(msg []byte, key string, spec *EffectiveSpec) (SessionID, error) {
+// ValidateAuthFrame checks the fixed-length frame and returns the session id
+// embedded in it. The comparison is constant-time and a failure only surfaces
+// a coarse error; callers must apply the common auth deadline before closing.
+func ValidateAuthFrame(frame []byte, creds *Credentials, transport AuthTransport, exporter TLSExporter) (SessionID, error) {
+	if len(frame) != AuthFrameLen {
+		return SessionID{}, ErrInvalidAuthFrame
+	}
 	var sessionID SessionID
-	if spec == nil {
-		return sessionID, errors.New("nowhere: nil effective spec")
-	}
-	if len(msg) != authFrameLen(spec) {
-		return sessionID, ErrInvalidFrame
-	}
-
-	offset := 0
-	var magic, nonce, paddingBlock, tag []byte
-	for _, element := range spec.authFrameOrder {
-		var fieldLen int
-		switch element {
-		case AuthMagic:
-			fieldLen = authMagicLength
-			magic = msg[offset : offset+fieldLen]
-		case AuthNonce:
-			fieldLen = authNonceLength
-			nonce = msg[offset : offset+fieldLen]
-		case AuthPadding:
-			fieldLen = 1 + int(spec.authPaddingLen)
-			paddingBlock = msg[offset : offset+fieldLen]
-		case AuthTag:
-			fieldLen = authTagLength
-			tag = msg[offset : offset+fieldLen]
-		}
-		offset += fieldLen
-	}
-
-	copy(sessionID[:], msg[offset:offset+SessionIDLen])
-	padding := paddingBlock[1:]
-	expectedPadding := authPaddingBytes(spec, nonce)
-
-	authKey := sha256.Sum256([]byte(key))
-	tagMsg := make([]byte, 0,
-		len(spec.authInfo)+len(spec.authContext)+len(nonce)+1+len(padding)+SessionIDLen)
-	tagMsg = append(tagMsg, spec.authInfo...)
-	tagMsg = append(tagMsg, spec.authContext...)
-	tagMsg = append(tagMsg, nonce...)
-	tagMsg = append(tagMsg, spec.authPaddingLen)
-	tagMsg = append(tagMsg, padding...)
-	tagMsg = append(tagMsg, sessionID[:]...)
-	expectedTag := hmacSHA256(authKey[:], tagMsg)
-
-	var diff byte
-	diff |= constantTimeDiff(magic, spec.authMagic)
-	diff |= paddingBlock[0] ^ spec.authPaddingLen
-	diff |= constantTimeDiff(padding, expectedPadding)
-	diff |= constantTimeDiff(tag, expectedTag)
-	if diff != 0 {
-		return SessionID{}, ErrInvalidFrame
+	copy(sessionID[:], frame[:SessionIDLen])
+	want := authTag(creds.authKeyBytes(), transport, exporter, sessionID)
+	if subtle.ConstantTimeCompare(frame[SessionIDLen:], want[:]) != 1 {
+		return SessionID{}, ErrInvalidAuthFrame
 	}
 	return sessionID, nil
 }
 
-func ReadAuthFrame(r io.Reader, key string, spec *EffectiveSpec) (SessionID, error) {
-	if spec == nil {
-		return SessionID{}, ErrInvalidFrame
-	}
-	buf := make([]byte, authFrameLen(spec))
-	if _, err := io.ReadFull(r, buf); err != nil {
+// ReadAuthFrame reads exactly one auth frame, leaving any immediately
+// following flow bytes buffered on the reader.
+func ReadAuthFrame(r io.Reader, creds *Credentials, transport AuthTransport, exporter TLSExporter) (SessionID, error) {
+	var frame AuthFrame
+	if _, err := io.ReadFull(r, frame[:]); err != nil {
 		return SessionID{}, err
 	}
-	return ValidateAuthFrame(buf, key, spec)
+	return ValidateAuthFrame(frame[:], creds, transport, exporter)
 }
 
-// DecodeTCPRequest reads a TCP request frame in the effective spec field order.
+func authTag(authKey AuthKey, transport AuthTransport, exporter TLSExporter, sessionID SessionID) [AuthTagLen]byte {
+	mac := newHMAC(authKey[:])
+	mac.Write([]byte{byte(transport)})
+	mac.Write(exporter[:])
+	mac.Write(sessionID[:])
+	sum := mac.Sum(nil)
+	var tag [AuthTagLen]byte
+	copy(tag[:], sum[:AuthTagLen])
+	return tag
+}
+
+// encodeUint32BE / decodeUint32BE are small helpers used by flow/datagram.
+func encodeUint32BE(b []byte, v uint32) { binary.BigEndian.PutUint32(b, v) }
+func decodeUint32BE(b []byte) uint32     { return binary.BigEndian.Uint32(b) }

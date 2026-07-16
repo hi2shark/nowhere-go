@@ -1,124 +1,185 @@
 package wire
 
 import (
-	"encoding/binary"
 	"errors"
 	"io"
 )
 
-// Flow envelope prepended to every Nowhere 1.4 logical flow.
-const (
-	FlowFrameMagic   byte = 0xf1
-	FlowFrameVersion byte = 1
-	FlowHeaderLen         = 14
-)
+// FlowHeaderLen is the fixed binary flow header length: one flags byte plus a
+// big-endian uint32 flow id.
+const FlowHeaderLen = 5
 
+// FlowID identifies one logical flow scoped to a session. It is a uint32, not
+// the uint64 carried by Nowhere 1.4.
+type FlowID = uint32
+
+// FlowRole is the relationship of the current physical lane to a logical flow.
 type FlowRole uint8
 
 const (
-	FlowRoleOpen   FlowRole = 1 // uplink: client->target
-	FlowRoleAttach FlowRole = 2 // downlink: target->client
-	FlowRoleDuplex FlowRole = 3 // one carrier owns both directions
+	// FlowRoleDuplex carries both directions on one symmetric lane.
+	FlowRoleDuplex FlowRole = 0
+	// FlowRoleOpen is the first half of an asymmetric flow; carries target+uplink.
+	FlowRoleOpen FlowRole = 1
+	// FlowRoleAttach is the second half of an asymmetric flow; carries the downlink.
+	FlowRoleAttach FlowRole = 2
 )
 
+// FlowKind is the proxied payload semantics.
 type FlowKind uint8
 
 const (
-	FlowKindTCP FlowKind = 1
-	FlowKindUDP FlowKind = 2
+	FlowKindTCP FlowKind = 0
+	FlowKindUDP FlowKind = 1
 )
 
+// Carrier is the physical transport selected for one flow direction.
 type Carrier uint8
 
 const (
-	CarrierTCP Carrier = 1
-	CarrierUDP Carrier = 2
+	CarrierTLSTCP Carrier = 0
+	CarrierQUIC   Carrier = 1
 )
 
+const (
+	flowRoleMask    byte = 0b0000_0011
+	flowKindBit     byte = 0b0000_0100
+	flowUplinkBit   byte = 0b0000_1000
+	flowDownlinkBit byte = 0b0001_0000
+	flowReserved    byte = 0b1110_0000
+)
+
+// FlowHeader is the fully decoded logical-flow metadata.
 type FlowHeader struct {
 	Role     FlowRole
-	FlowID   uint64
+	FlowID   FlowID
 	Kind     FlowKind
 	Uplink   Carrier
 	Downlink Carrier
 }
 
-var ErrInvalidFlowHeader = errors.New("nowhere: invalid flow header")
-
-func WriteFlowHeader(h FlowHeader) ([FlowHeaderLen]byte, error) {
-	if err := validateFlowHeader(h); err != nil {
-		return [FlowHeaderLen]byte{}, err
+// Validate enforces role/id/carrier invariants independent of the lane the
+// header arrived on.
+func (h FlowHeader) Validate() error {
+	if h.FlowID == 0 {
+		return errors.New("nowhere: zero flow id")
 	}
-	var out [FlowHeaderLen]byte
-	out[0] = FlowFrameMagic
-	out[1] = FlowFrameVersion
-	out[2] = byte(h.Role)
-	binary.BigEndian.PutUint64(out[3:11], h.FlowID)
-	out[11] = byte(h.Kind)
-	out[12] = byte(h.Uplink)
-	out[13] = byte(h.Downlink)
-	return out, nil
+	switch h.Role {
+	case FlowRoleDuplex:
+		if h.Uplink != h.Downlink {
+			return errors.New("nowhere: duplex carrier mismatch")
+		}
+	case FlowRoleOpen, FlowRoleAttach:
+		if h.Uplink == h.Downlink {
+			return errors.New("nowhere: split carriers must differ")
+		}
+	default:
+		return errors.New("nowhere: invalid flow role")
+	}
+	if h.Kind != FlowKindTCP && h.Kind != FlowKindUDP {
+		return errors.New("nowhere: invalid flow kind")
+	}
+	if h.Uplink != CarrierTLSTCP && h.Uplink != CarrierQUIC {
+		return errors.New("nowhere: invalid uplink carrier")
+	}
+	if h.Downlink != CarrierTLSTCP && h.Downlink != CarrierQUIC {
+		return errors.New("nowhere: invalid downlink carrier")
+	}
+	return nil
 }
 
+// ValidateOn additionally checks that the header arrived on the physical
+// carrier its role declares.
+func (h FlowHeader) ValidateOn(current Carrier) error {
+	if err := h.Validate(); err != nil {
+		return err
+	}
+	var expected Carrier
+	switch h.Role {
+	case FlowRoleDuplex, FlowRoleOpen:
+		expected = h.Uplink
+	case FlowRoleAttach:
+		expected = h.Downlink
+	}
+	if current != expected {
+		return errors.New("nowhere: flow arrived on the wrong carrier")
+	}
+	return nil
+}
+
+// CarriesTarget reports whether this lane is followed by a binary target.
+func (h FlowHeader) CarriesTarget() bool {
+	return h.Role == FlowRoleDuplex || h.Role == FlowRoleOpen
+}
+
+// WriteFlowHeader encodes the header after validating its invariants.
+func WriteFlowHeader(h FlowHeader) ([FlowHeaderLen]byte, error) {
+	if err := h.Validate(); err != nil {
+		return [FlowHeaderLen]byte{}, err
+	}
+	return writeFlowHeaderUnchecked(h), nil
+}
+
+// EncodeFlowHeader is an alias for WriteFlowHeader returning a slice.
+func EncodeFlowHeader(h FlowHeader) ([]byte, error) {
+	out, err := WriteFlowHeader(h)
+	if err != nil {
+		return nil, err
+	}
+	return out[:], nil
+}
+
+func writeFlowHeaderUnchecked(h FlowHeader) [FlowHeaderLen]byte {
+	flags := byte(h.Role) |
+		(byte(h.Kind) << 2) |
+		(byte(h.Uplink) << 3) |
+		(byte(h.Downlink) << 4)
+	var out [FlowHeaderLen]byte
+	out[0] = flags
+	encodeUint32BE(out[1:], h.FlowID)
+	return out
+}
+
+// DecodeFlowHeader decodes exactly one 5-byte header.
+func DecodeFlowHeader(b []byte) (FlowHeader, error) {
+	if len(b) != FlowHeaderLen {
+		return FlowHeader{}, ErrInvalidFlowHeader
+	}
+	flags := b[0]
+	if flags&flowReserved != 0 {
+		return FlowHeader{}, ErrInvalidFlowHeader
+	}
+	role := FlowRole(flags & flowRoleMask)
+	kind := FlowKindTCP
+	if flags&flowKindBit != 0 {
+		kind = FlowKindUDP
+	}
+	uplink := CarrierTLSTCP
+	if flags&flowUplinkBit != 0 {
+		uplink = CarrierQUIC
+	}
+	downlink := CarrierTLSTCP
+	if flags&flowDownlinkBit != 0 {
+		downlink = CarrierQUIC
+	}
+	h := FlowHeader{
+		Role:     role,
+		FlowID:   decodeUint32BE(b[1:]),
+		Kind:     kind,
+		Uplink:   uplink,
+		Downlink: downlink,
+	}
+	if err := h.Validate(); err != nil {
+		return FlowHeader{}, ErrInvalidFlowHeader
+	}
+	return h, nil
+}
+
+// ReadFlowHeader reads exactly one header, leaving any following payload.
 func ReadFlowHeader(r io.Reader) (FlowHeader, error) {
 	var buf [FlowHeaderLen]byte
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		return FlowHeader{}, err
 	}
-	if buf[0] != FlowFrameMagic || buf[1] != FlowFrameVersion {
-		return FlowHeader{}, ErrInvalidFlowHeader
-	}
-	header := FlowHeader{
-		Role:     FlowRole(buf[2]),
-		FlowID:   binary.BigEndian.Uint64(buf[3:11]),
-		Kind:     FlowKind(buf[11]),
-		Uplink:   Carrier(buf[12]),
-		Downlink: Carrier(buf[13]),
-	}
-	if err := validateFlowHeader(header); err != nil {
-		return FlowHeader{}, ErrInvalidFlowHeader
-	}
-	return header, nil
-}
-
-// EncodeFlowSetup writes the common header and, except for Attach, one target request.
-func EncodeFlowSetup(header FlowHeader, target string, spec *EffectiveSpec) ([]byte, error) {
-	encodedHeader, err := WriteFlowHeader(header)
-	if err != nil {
-		return nil, err
-	}
-	setup := append([]byte(nil), encodedHeader[:]...)
-	if header.Role == FlowRoleAttach {
-		return setup, nil
-	}
-	request, err := EncodeTCPRequest(target, spec)
-	if err != nil {
-		return nil, err
-	}
-	return append(setup, request...), nil
-}
-
-func validateFlowHeader(header FlowHeader) error {
-	if header.FlowID == 0 {
-		return errors.New("nowhere: zero flow id")
-	}
-	if header.Role != FlowRoleOpen && header.Role != FlowRoleAttach && header.Role != FlowRoleDuplex {
-		return errors.New("nowhere: invalid flow role")
-	}
-	if header.Kind != FlowKindTCP && header.Kind != FlowKindUDP {
-		return errors.New("nowhere: invalid flow kind")
-	}
-	if header.Uplink != CarrierTCP && header.Uplink != CarrierUDP {
-		return errors.New("nowhere: invalid uplink carrier")
-	}
-	if header.Downlink != CarrierTCP && header.Downlink != CarrierUDP {
-		return errors.New("nowhere: invalid downlink carrier")
-	}
-	if header.Role == FlowRoleDuplex && header.Uplink != header.Downlink {
-		return errors.New("nowhere: duplex carriers must match")
-	}
-	if header.Role != FlowRoleDuplex && header.Uplink == header.Downlink {
-		return errors.New("nowhere: split carriers must differ")
-	}
-	return nil
+	return DecodeFlowHeader(buf[:])
 }
