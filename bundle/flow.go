@@ -182,19 +182,6 @@ func readSetupResult(r io.Reader) error {
 	return nil
 }
 
-// setupResultError reads the SetupResult and maps non-ready outcomes to a typed
-// error so UDP lanes can distinguish rejection from a clean close.
-func setupResultError(r io.Reader) error {
-	result, err := wire.ReadSetupResult(r)
-	if err != nil {
-		return err
-	}
-	if result.IsReady() {
-		return nil
-	}
-	return fmt.Errorf("nowhere: flow rejected: %s", result.String())
-}
-
 // splicedConn joins an independent reader and writer into net.Conn.
 type splicedConn struct {
 	reader io.Reader

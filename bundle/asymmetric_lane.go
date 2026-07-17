@@ -491,11 +491,6 @@ func (h *qSessionHandle) closePacket() error {
 
 var _ net.PacketConn = (*quicPacketConn)(nil)
 
-// nowuDataHeaderLen is the 1.5 unfragmented DATA/CLOSE datagram header length
-// (1 flags byte + 4-byte flow id). Used to size fragment payloads against the
-// QUIC DATAGRAM MTU.
-const nowuDataHeaderLen = wire.UDPHeaderLen
-
 // flowIDer lets a prepared stream expose its flow id for datagram routing.
 type flowIDer interface {
 	flowID() wire.FlowID

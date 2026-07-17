@@ -88,20 +88,16 @@ func runSelfCheck() error {
 	if len(frame) == 0 {
 		return fmt.Errorf("empty target frame")
 	}
-	hdr, err := wire.WriteFlowHeader(wire.FlowHeader{
+	if _, err := wire.WriteFlowHeader(wire.FlowHeader{
 		Role:     wire.FlowRoleOpen,
 		FlowID:   1,
 		Kind:     wire.FlowKindTCP,
 		Uplink:   wire.CarrierQUIC,
 		Downlink: wire.CarrierTLSTCP,
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
-	if len(hdr) != wire.FlowHeaderLen {
-		return fmt.Errorf("bad flow header length %d", len(hdr))
-	}
-	// Auth frame sanity: 32 bytes, round-trips.
+	// Auth frame sanity: validates against its connection-bound exporter.
 	creds, err := wire.NewCredentials("secret")
 	if err != nil {
 		return err
@@ -111,8 +107,8 @@ func runSelfCheck() error {
 		exporter[i] = byte(i)
 	}
 	authFrame := wire.EncodeAuthFrame(creds, wire.AuthTransportTLSTCP, exporter, wire.SessionID{})
-	if len(authFrame) != wire.AuthFrameLen {
-		return fmt.Errorf("bad auth frame length %d", len(authFrame))
+	if _, err := wire.ValidateAuthFrame(authFrame[:], creds, wire.AuthTransportTLSTCP, exporter); err != nil {
+		return err
 	}
 	return nil
 }

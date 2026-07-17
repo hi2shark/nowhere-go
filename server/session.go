@@ -15,13 +15,9 @@ import (
 )
 
 const (
-	preAuthDatagramBudget         = 64 * 1024
-	preactivationControlLimit     = 64
-	preactivationDatagramLimit    = 64
-	preactivationByteLimit        = 64 * 1024
-	preactivationFramesPerControl = 16
-	preactivationBytesPerControl  = 16 * 1024
-	preactivationTTL              = 10 * time.Second
+	preAuthDatagramBudget     = 64 * 1024
+	preactivationControlLimit = 64
+	preactivationTTL          = 10 * time.Second
 )
 
 type reassemblyTicker interface {
@@ -361,36 +357,6 @@ func (s *portalSession) getFlow(id wire.FlowID) *nowuFlow {
 	return s.flows[id]
 }
 
-type flowInsertResult uint8
-
-const (
-	flowInserted flowInsertResult = iota
-	flowDuplicate
-	flowSessionClosed
-)
-
-func (s *portalSession) insertFlow(id wire.FlowID, flow *nowuFlow) flowInsertResult {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return flowSessionClosed
-	}
-	if _, exists := s.flows[id]; exists {
-		return flowDuplicate
-	}
-	s.flows[id] = flow
-	return flowInserted
-}
-
-func (s *portalSession) putFlow(id wire.FlowID, flow *nowuFlow) bool {
-	flow.ownsReassembly.Store(true)
-	if s.insertFlow(id, flow) == flowInserted {
-		return true
-	}
-	flow.ownsReassembly.Store(false)
-	return false
-}
-
 func (s *portalSession) removeFlow(id wire.FlowID, flow *nowuFlow) {
 	s.mu.Lock()
 	if current := s.flows[id]; current == flow {
@@ -439,31 +405,6 @@ func (s *portalSession) cancelPendingUDPControl(flowID wire.FlowID, pending *pen
 		s.removePendingControlLocked(flowID, pending)
 	}
 	s.mu.Unlock()
-}
-
-func (s *portalSession) bufferPendingUDPData(frame wire.UDPFrame, size int) bool {
-	now := time.Now()
-	if s.Handler != nil && s.Handler.now != nil {
-		now = s.Handler.now()
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.expirePendingControlsLocked(now)
-	pending := s.pendingControls[frame.FlowID]
-	if pending == nil {
-		return false
-	}
-	if size < 0 ||
-		s.pendingFrames >= preactivationDatagramLimit || s.pendingBytes+size > preactivationByteLimit ||
-		len(pending.frames) >= preactivationFramesPerControl || pending.bytes+size > preactivationBytesPerControl {
-		return true
-	}
-	frame.Fragment.Payload = append([]byte(nil), frame.Fragment.Payload...)
-	pending.frames = append(pending.frames, frame)
-	pending.bytes += size
-	s.pendingFrames++
-	s.pendingBytes += size
-	return true
 }
 
 func (s *portalSession) expirePendingControls(now time.Time) {
@@ -796,20 +737,6 @@ func (s *portalSession) activateNOWUFlowLocked(flow *nowuFlow, pending *pendingU
 	frames := pending.frames
 	s.removePendingControlLocked(flow.flowID, pending)
 	return frames, nil
-}
-
-func (s *portalSession) insertNOWUFlow(flow *nowuFlow) error {
-	flow.ownsReassembly.Store(true)
-	switch s.insertFlow(flow.flowID, flow) {
-	case flowInserted:
-		return nil
-	case flowDuplicate:
-		flow.ownsReassembly.Store(false)
-		return ErrDuplicateHalf
-	default:
-		flow.ownsReassembly.Store(false)
-		return ErrClosed
-	}
 }
 
 func rejectQUICControl(conn net.Conn, header wire.FlowHeader, code wire.SetupResult) {

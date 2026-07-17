@@ -73,12 +73,5 @@ func DeriveAuthKey(sharedKey []byte) AuthKey {
 	return key
 }
 
-// hmacSHA256 returns the HMAC-SHA256 of data under key.
-func hmacSHA256(key, data []byte) []byte {
-	mac := hmac.New(sha256.New, key)
-	mac.Write(data)
-	return mac.Sum(nil)
-}
-
 // newHMAC constructs an HMAC-SHA256 hasher, factored out for the reassembler.
 func newHMAC(key []byte) hash.Hash { return hmac.New(sha256.New, key) }

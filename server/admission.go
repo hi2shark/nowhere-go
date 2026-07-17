@@ -12,8 +12,8 @@ const DefaultMaxUnauthenticatedConnections = 256
 const DefaultMaxUnauthenticatedPerSource = 32
 
 type sourceKey struct {
-	v4 [4]byte
-	v6 uint64
+	v4  [4]byte
+	v6  uint64
 	is6 bool
 }
 
@@ -61,9 +61,9 @@ type unauthenticatedAdmission struct {
 	maxTotal  int
 	maxSource int
 
-	mu         sync.Mutex
-	total      int
-	perSource  map[sourceKey]int
+	mu        sync.Mutex
+	total     int
+	perSource map[sourceKey]int
 }
 
 func newUnauthenticatedAdmission(maxTotal, maxSource int) *unauthenticatedAdmission {
@@ -126,13 +126,4 @@ func (g *admissionGuard) Release() {
 			a.perSource[g.key] = count - 1
 		}
 	}
-}
-
-func (a *unauthenticatedAdmission) active() int {
-	if a == nil {
-		return 0
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.total
 }

@@ -573,8 +573,3 @@ func (c *pairedUDPConn) resetIdle() {
 }
 
 var _ net.PacketConn = (*pairedUDPConn)(nil)
-
-type addrString struct{ s string }
-
-func (a *addrString) Network() string { return "udp" }
-func (a *addrString) String() string  { return a.s }

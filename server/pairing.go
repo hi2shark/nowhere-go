@@ -12,24 +12,6 @@ import (
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-// flowPairManager is retained as an internal compatibility name for the unified registry.
-type flowPairManager = claimRegistry
-
-func newFlowPairManager(timeout time.Duration) *flowPairManager {
-	limits, _ := normalizeLimits(Limits{})
-	return newClaimRegistry(timeout, limits)
-}
-
-func (r *claimRegistry) configureLimits(limits Limits) {
-	normalized, err := normalizeLimits(limits)
-	if err != nil {
-		return
-	}
-	r.mu.Lock()
-	r.limits = normalized
-	r.mu.Unlock()
-}
-
 func (r *claimRegistry) setObserver(observer diagnostic.Observer) {
 	r.mu.Lock()
 	r.observer = observer

@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -190,18 +189,4 @@ func setupFailureCode(err error) wire.SetupResult {
 	default:
 		return wire.SetupResultDialFailed
 	}
-}
-
-func writeAll(writer io.Writer, payload []byte) error {
-	for len(payload) > 0 {
-		n, err := writer.Write(payload)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		payload = payload[n:]
-	}
-	return nil
 }
