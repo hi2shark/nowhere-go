@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,6 +52,69 @@ func TestServeQUICAuthOnlyNotifiesAdapterAfterAuthentication(t *testing.T) {
 	}
 }
 
+func TestServeQUICRoutesFirstFlowCoalescedWithAuthentication(t *testing.T) {
+	credentials, err := wire.NewCredentials("secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := NewConfig(ConfigOptions{Credentials: credentials, Networks: []Network{NetworkUDP}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := &v15SignalingUpstream{routed: make(chan wire.Target, 1)}
+	handler, err := NewHandler(HandlerOptions{Config: config, Upstream: upstream})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var exporter wire.TLSExporter
+	exporter[0] = 9
+	id := wire.SessionID{2}
+	auth := wire.EncodeAuthFrame(credentials, wire.AuthTransportQUIC, exporter, id)
+	target, err := wire.NewIPTarget(netip.MustParseAddr("192.0.2.1"), 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := wire.WriteFlowHeader(wire.FlowHeader{
+		Role: wire.FlowRoleDuplex, FlowID: 1, Kind: wire.FlowKindTCP,
+		Uplink: wire.CarrierQUIC, Downlink: wire.CarrierQUIC,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetBytes, err := wire.EncodeTarget(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 0, len(auth)+len(header)+len(targetBytes))
+	payload = append(payload, auth[:]...)
+	payload = append(payload, header[:]...)
+	payload = append(payload, targetBytes...)
+
+	conn := newV15QUICConn(exporter, &v15QuicStream{Reader: bytes.NewReader(payload)})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- handler.ServeQUIC(ctx, conn) }()
+
+	select {
+	case got := <-upstream.routed:
+		if got != target {
+			t.Fatalf("routed target = %+v, want %+v", got, target)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coalesced first flow was not routed")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeQUIC = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeQUIC did not exit after cancellation")
+	}
+}
+
 type v15DiscardUpstream struct{}
 
 func (v15DiscardUpstream) HandleStream(context.Context, net.Conn, net.Addr, wire.Target, FlowReadiness) error {
@@ -57,6 +122,22 @@ func (v15DiscardUpstream) HandleStream(context.Context, net.Conn, net.Addr, wire
 }
 func (v15DiscardUpstream) HandlePacket(context.Context, net.PacketConn, net.Addr, wire.Target, FlowReadiness) error {
 	return nil
+}
+
+type v15SignalingUpstream struct {
+	routed chan wire.Target
+}
+
+func (u *v15SignalingUpstream) HandleStream(_ context.Context, _ net.Conn, _ net.Addr, target wire.Target, readiness FlowReadiness) error {
+	if err := readiness.Ready(); err != nil {
+		return err
+	}
+	u.routed <- target
+	return nil
+}
+
+func (*v15SignalingUpstream) HandlePacket(context.Context, net.PacketConn, net.Addr, wire.Target, FlowReadiness) error {
+	return errors.New("unexpected packet flow")
 }
 
 type v15QUICConn struct {

@@ -36,8 +36,8 @@ type bundleConfig struct {
 //
 // In Nowhere 1.5 the bundle owns the session id and the QUIC auth handshake:
 // it generates a session id with crypto/rand, reads the TLS exporter off each
-// physical session, opens the first stream, and writes the connection-bound
-// auth frame. The injected QUIC backend never learns the session id.
+// physical session, and prefixes the first flow with the connection-bound auth
+// frame. The injected QUIC backend never learns the session id.
 type CarrierBundle struct {
 	cfg bundleConfig
 
@@ -168,39 +168,26 @@ func (b *CarrierBundle) quicClient() (carrier.QuicBackend, error) {
 			b.quicErr = errors.New("nowhere: missing credentials for quic auth")
 			return
 		}
-		auth := func(ctx context.Context, session carrier.QuicSession) error {
-			return authenticateQUICSession(ctx, session, creds, wire.AuthTransportQUIC, sessionID)
+		auth := func(_ context.Context, session carrier.QuicSession) (wire.AuthFrame, error) {
+			return buildQUICAuthFrame(session, creds, wire.AuthTransportQUIC, sessionID)
 		}
 		b.quic = newQUICMuxBackend(b.cfg.quic, auth)
 	})
 	return b.quic, b.quicErr
 }
 
-// authenticateQUICSession performs the 1.5 connection-bound auth handshake on
-// one physical QUIC session: read the TLS exporter off the session, open the
-// first stream, and write the 32-byte auth frame followed by FIN (auth-only
-// first stream; Go outbound does not coalesce auth with the first flow). The
-// session is invalidated on any failure.
-func authenticateQUICSession(ctx context.Context, session carrier.QuicSession, creds *wire.Credentials, transport wire.AuthTransport, sessionID wire.SessionID) error {
+// buildQUICAuthFrame binds one physical QUIC session to the bundle identity.
+// The returned frame is retained by the mux and prepended atomically when the
+// first flow commits its setup bytes on the first stream.
+func buildQUICAuthFrame(session carrier.QuicSession, creds *wire.Credentials, transport wire.AuthTransport, sessionID wire.SessionID) (wire.AuthFrame, error) {
 	if session == nil {
-		return errors.New("nowhere: nil quic session")
+		return wire.AuthFrame{}, errors.New("nowhere: nil quic session")
 	}
 	exporter, err := session.TLSExporter()
 	if err != nil {
-		return err
+		return wire.AuthFrame{}, err
 	}
-	prep, err := session.PrepareStream(ctx)
-	if err != nil {
-		return err
-	}
-	frame := wire.EncodeAuthFrame(creds, transport, exporter, sessionID)
-	// Auth-only first stream: commit the frame with finishWrite=true so the
-	// stream is half-closed (FIN) after the auth bytes, matching the 1.5 spec.
-	if _, err := prep.Commit(ctx, frame[:], true); err != nil {
-		_ = prep.Close()
-		return err
-	}
-	return nil
+	return wire.EncodeAuthFrame(creds, transport, exporter, sessionID), nil
 }
 
 func (b *CarrierBundle) tcpPool() (*tcptls.TCPPool, error) {

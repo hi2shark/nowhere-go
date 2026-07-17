@@ -30,6 +30,7 @@ const (
 )
 
 var errManagedDatagramReceive = errors.New("nowhere: quic datagram receive is bundle managed")
+var errQUICAuthenticationAborted = errors.New("nowhere: first quic stream closed before authentication")
 
 const (
 	quicSendQueued uint32 = iota
@@ -58,25 +59,24 @@ func (r *quicSendRequest) finish(err error) {
 	r.result <- err
 }
 
-// quicAuthenticator binds a fresh physical QUIC session to the bundle identity
-// by writing the connection-bound auth frame on the session's first stream. It
-// is supplied by the bundle (which owns the Credentials + Transport + Session
-// ID) and called exactly once per physical session, the first time the mux
-// sees it.
-type quicAuthenticator func(ctx context.Context, session carrier.QuicSession) error
+// quicAuthFrameBuilder binds a fresh physical QUIC session to the bundle
+// identity. It is supplied by the bundle (which owns the Credentials +
+// Transport + Session ID) and called exactly once per physical session. The
+// mux retains the result until the first flow commits.
+type quicAuthFrameBuilder func(ctx context.Context, session carrier.QuicSession) (wire.AuthFrame, error)
 
 // quicMuxBackend owns one receive loop and one bounded send owner for every
 // physical QUIC session returned by the injected backend.
 type quicMuxBackend struct {
 	backend carrier.QuicBackend
-	auth    quicAuthenticator
+	auth    quicAuthFrameBuilder
 
 	mu       sync.Mutex
 	sessions map[carrier.QuicSession]*quicSessionMux
 	closed   bool
 }
 
-func newQUICMuxBackend(backend carrier.QuicBackend, auth quicAuthenticator) *quicMuxBackend {
+func newQUICMuxBackend(backend carrier.QuicBackend, auth quicAuthFrameBuilder) *quicMuxBackend {
 	return &quicMuxBackend{
 		backend:  backend,
 		auth:     auth,
@@ -113,19 +113,21 @@ func (b *quicMuxBackend) AcquireSession(ctx context.Context) (carrier.QuicSessio
 			b.mu.Unlock()
 			return session, nil
 		}
-		// First time the mux sees this physical session: authenticate it.
-		// In Nowhere 1.5 the bundle owns the QUIC auth handshake (read the
-		// exporter off the session, open the first stream, write the auth
-		// frame). The injected backend never learns the Session ID.
-		if b.auth != nil {
-			authErr := b.auth(ctx, raw)
-			if authErr != nil {
-				b.mu.Unlock()
-				b.backend.InvalidateSession(raw)
-				return nil, authErr
-			}
+		// First time the mux sees this physical session: derive and retain its
+		// connection-bound auth frame. PrepareStream will reserve the first
+		// stream and Commit will write auth || first FLOW in one operation.
+		if b.auth == nil {
+			b.mu.Unlock()
+			b.backend.InvalidateSession(raw)
+			return nil, errors.New("nowhere: missing quic authenticator")
 		}
-		session := newQUICSessionMux(b, raw)
+		authFrame, authErr := b.auth(ctx, raw)
+		if authErr != nil {
+			b.mu.Unlock()
+			b.backend.InvalidateSession(raw)
+			return nil, authErr
+		}
+		session := newQUICSessionMux(b, raw, authFrame)
 		b.sessions[raw] = session
 		b.mu.Unlock()
 		return session, nil
@@ -200,13 +202,20 @@ type quicSessionMux struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
-	mu         sync.Mutex
-	flows      map[wire.FlowID]*quicDatagramFlow
+	authMu       sync.Mutex
+	authFrame    wire.AuthFrame
+	authClaimed  bool
+	authComplete bool
+	authErr      error
+	authDone     chan struct{}
+
+	mu          sync.Mutex
+	flows       map[wire.FlowID]*quicDatagramFlow
 	reassembler *wire.DatagramReassembler
-	closeQueue [][]byte
-	started    bool
-	closed     bool
-	cause      error
+	closeQueue  [][]byte
+	started     bool
+	closed      bool
+	cause       error
 
 	startOnce        sync.Once
 	closeOnce        sync.Once
@@ -220,13 +229,15 @@ type quicSessionMux struct {
 	sendLoopDone     chan struct{}
 }
 
-func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession) *quicSessionMux {
+func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession, authFrame wire.AuthFrame) *quicSessionMux {
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &quicSessionMux{
 		backend:          backend,
 		raw:              raw,
 		ctx:              ctx,
 		cancel:           cancel,
+		authFrame:        authFrame,
+		authDone:         make(chan struct{}),
 		flows:            make(map[wire.FlowID]*quicDatagramFlow),
 		reassembler:      wire.NewDatagramReassembler(wire.DefaultReassemblyConfig()),
 		invalidationDone: make(chan struct{}),
@@ -241,7 +252,118 @@ func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession) *quicSe
 }
 
 func (s *quicSessionMux) PrepareStream(ctx context.Context) (carrier.QuicPreparedStream, error) {
-	return s.raw.PrepareStream(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.authMu.Lock()
+	if s.authComplete {
+		err := s.authErr
+		s.authMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return s.raw.PrepareStream(ctx)
+	}
+	if s.authClaimed {
+		done := s.authDone
+		s.authMu.Unlock()
+		select {
+		case <-done:
+			s.authMu.Lock()
+			err := s.authErr
+			s.authMu.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			return s.raw.PrepareStream(ctx)
+		case <-s.done:
+			return nil, s.terminalError()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	s.authClaimed = true
+	s.authMu.Unlock()
+
+	stream, err := s.raw.PrepareStream(ctx)
+	if err != nil {
+		s.failAuthentication(err)
+		return nil, err
+	}
+	return &quicAuthPreparedStream{session: s, stream: stream}, nil
+}
+
+func (s *quicSessionMux) completeAuthentication(err error) {
+	s.authMu.Lock()
+	if !s.authComplete {
+		s.authComplete = true
+		s.authErr = err
+		close(s.authDone)
+	}
+	s.authMu.Unlock()
+}
+
+func (s *quicSessionMux) failAuthentication(err error) {
+	if err == nil {
+		err = errQUICAuthenticationAborted
+	}
+	s.completeAuthentication(err)
+	s.invalidateRaw(err)
+}
+
+// quicAuthPreparedStream owns the first raw stream. Its single Commit sends
+// the fixed auth frame and the first FLOW setup as one opaque payload, keeping
+// the caller's FIN choice for the logical flow.
+type quicAuthPreparedStream struct {
+	session *quicSessionMux
+	stream  carrier.QuicPreparedStream
+	once    sync.Once
+}
+
+func (p *quicAuthPreparedStream) Commit(ctx context.Context, setup []byte, finishWrite bool) (net.Conn, error) {
+	var (
+		conn net.Conn
+		err  error
+	)
+	p.once.Do(func() {
+		if p.session == nil || p.stream == nil {
+			err = net.ErrClosed
+			return
+		}
+		payload := make([]byte, 0, wire.AuthFrameLen+len(setup))
+		payload = append(payload, p.session.authFrame[:]...)
+		payload = append(payload, setup...)
+		conn, err = p.stream.Commit(ctx, payload, finishWrite)
+		if err == nil && conn == nil {
+			err = net.ErrClosed
+		}
+		if err != nil {
+			p.session.failAuthentication(err)
+			return
+		}
+		p.session.completeAuthentication(nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, net.ErrClosed
+	}
+	return conn, nil
+}
+
+func (p *quicAuthPreparedStream) Close() error {
+	var err error
+	p.once.Do(func() {
+		if p.stream != nil {
+			err = p.stream.Close()
+		}
+		if p.session != nil {
+			p.session.failAuthentication(errors.Join(errQUICAuthenticationAborted, err))
+		}
+	})
+	return err
 }
 
 // TLSExporter delegates to the underlying physical session. The bundle reads
@@ -583,6 +705,7 @@ func (s *quicSessionMux) close(cause error) {
 		if cause == nil || errors.Is(cause, context.Canceled) {
 			cause = net.ErrClosed
 		}
+		s.completeAuthentication(cause)
 		s.cancel()
 
 		s.mu.Lock()
@@ -609,6 +732,7 @@ func (s *quicSessionMux) close(cause error) {
 }
 
 var _ carrier.QuicSession = (*quicSessionMux)(nil)
+var _ carrier.QuicPreparedStream = (*quicAuthPreparedStream)(nil)
 
 type quicDatagramFlow struct {
 	session *quicSessionMux

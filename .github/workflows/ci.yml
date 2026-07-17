@@ -6,64 +6,61 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: go test (${{ matrix.go }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.20.x", "1.24.x", stable]
+        # Align with go.mod (1.20) + current LTS-ish + latest stable
+        go: ["1.20.x", "1.24.x", "stable"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
           cache: true
-      - run: go test -count=1 ./...
-      - run: go vet ./...
-      - run: go build -o /tmp/nowhere-check ./cmd/nowhere-check
-      - run: /tmp/nowhere-check
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build nowhere-check
+        run: go build -o /tmp/nowhere-check ./cmd/nowhere-check
+      - name: Run nowhere-check
+        run: /tmp/nowhere-check
 
   staticcheck:
     name: staticcheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: true
-      - run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
-      - run: staticcheck ./...
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
+      - name: Run staticcheck
+        run: staticcheck ./...
 
   race:
     name: race and shuffle
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: true
-      - name: PR stress
-        if: github.event_name != 'schedule'
-        run: go test -race -shuffle=on -count=20 ./...
-      - name: Nightly stress
-        if: github.event_name == 'schedule'
-        run: go test -race -shuffle=on -count=100 ./...
-
-  fuzz:
-    name: nightly wire fuzz smoke
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          cache: true
-      - run: go test ./wire -run=^$ -fuzz=FuzzValidateAuthFrame -fuzztime=30s
-      - run: go test ./wire -run=^$ -fuzz=FuzzReadFlowHeader -fuzztime=30s
-      - run: go test ./wire -run=^$ -fuzz=^FuzzDecodeUDPFrame$ -fuzztime=30s
-      - run: go test ./wire -run=^$ -fuzz=^FuzzReadUDPPacket$ -fuzztime=30s
+      - run: go test -race -shuffle=on -count=20 ./...

@@ -241,7 +241,7 @@ go run ./cmd/nowhere-check            # wire vectors + self-check
 go run ./cmd/nowhere-check -version
 ```
 
-GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) validates Go **1.20.x / 1.24.x / stable** for push, PR, and `workflow_dispatch`. No release binaries are published — consume the module with `go get`.
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) validates Go **1.20.x / 1.24.x / stable** on push (`main`/`test`), PR, and `workflow_dispatch`. No release binaries are published — consume the module with `go get`.
 
 ```bash
 go get github.com/hi2shark/nowhere-go@latest

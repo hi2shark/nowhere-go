@@ -1,9 +1,9 @@
 // Package quic defines host-injected QUIC interfaces (no QUIC library imports).
 //
 // The carrier-layer Session represents one QUIC connection that has completed
-// its handshake. The nowhere-go core reads the TLS exporter off the Session,
-// opens the first stream itself, writes the connection-bound auth frame, and
-// then drives subsequent flows. The host never knows the Session ID.
+// its handshake. The nowhere-go core reads the TLS exporter off the Session
+// and prefixes the first flow on the first stream with the connection-bound
+// auth frame. The host never knows the Session ID.
 package quic
 
 import (
