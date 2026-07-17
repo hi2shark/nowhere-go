@@ -590,12 +590,20 @@ func (h *Handler) waitAuthFailure(ctx context.Context, deadline time.Time) {
 }
 
 func (h *Handler) emit(ctx context.Context, level diagnostic.Level, code string, source net.Addr, target string, sessionID wire.SessionID, flowID wire.FlowID, err error) {
+	h.emitCarrier(ctx, diagnostic.CarrierTCPTLS, level, code, source, target, sessionID, flowID, err)
+}
+
+func (h *Handler) emitQUIC(ctx context.Context, level diagnostic.Level, code string, source net.Addr, target string, sessionID wire.SessionID, flowID wire.FlowID, err error) {
+	h.emitCarrier(ctx, diagnostic.CarrierQUIC, level, code, source, target, sessionID, flowID, err)
+}
+
+func (h *Handler) emitCarrier(ctx context.Context, carrier string, level diagnostic.Level, code string, source net.Addr, target string, sessionID wire.SessionID, flowID wire.FlowID, err error) {
 	result, class := "", ""
 	if err != nil {
 		result, class = diagnostic.ClassifyClose(err)
 	}
 	diagnostic.Emit(ctx, h.observer, diagnostic.Event{
-		Level: level, Code: code, Component: "server", Carrier: diagnostic.CarrierTCPTLS,
+		Level: level, Code: code, Component: "server", Carrier: carrier,
 		Source: source, Target: target, SessionID: sessionID, FlowID: flowID,
 		Result: result, ErrorClass: class, Err: err,
 	})

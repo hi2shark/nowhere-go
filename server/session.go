@@ -510,7 +510,7 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 	session, firstStream, err := h.authenticateQuic(ctx, conn)
 	if err != nil {
 		_ = conn.CloseWithError(1, "access denied")
-		h.emit(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
+		h.emitQUIC(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
 		return err
 	}
 	releaseAdmission()
@@ -527,7 +527,7 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 		notifier.MarkAuthenticated()
 	}
 
-	h.emit(ctx, diagnostic.LevelInfo, "session_started", source, "", session.ID, 0, nil)
+	h.emitQUIC(ctx, diagnostic.LevelInfo, "session_started", source, "", session.ID, 0, nil)
 	if firstStream != nil {
 		go session.handleStream(ctx, firstStream, true)
 	}
@@ -597,14 +597,14 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream, fir
 		if first && errors.Is(err, io.EOF) {
 			return
 		}
-		s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, "", s.ID, 0, err)
+		s.Handler.emitQUIC(ctx, diagnostic.LevelError, "request_read_failed", source, "", s.ID, 0, err)
 		return
 	}
 	target, err := s.Handler.readFlowTarget(conn, header)
 	if err != nil {
 		s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.SetupResultInvalidRequest)
 		_ = conn.Close()
-		s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, "", s.ID, header.FlowID, err)
+		s.Handler.emitQUIC(ctx, diagnostic.LevelError, "request_read_failed", source, "", s.ID, header.FlowID, err)
 		return
 	}
 	var pending *pendingUDPControl
@@ -617,7 +617,7 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream, fir
 				s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, setupFailureCode(err))
 			}
 			_ = conn.Close()
-			s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, targetAddress(target), s.ID, header.FlowID, err)
+			s.Handler.emitQUIC(ctx, diagnostic.LevelError, "request_read_failed", source, targetAddress(target), s.ID, header.FlowID, err)
 			return
 		}
 		defer s.cancelPendingUDPControl(header.FlowID, pending)
@@ -629,7 +629,7 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream, fir
 			err = wire.ErrInvalidFrame
 			s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.SetupResultInvalidRequest)
 			_ = conn.Close()
-			s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, targetAddress(target), s.ID, header.FlowID, err)
+			s.Handler.emitQUIC(ctx, diagnostic.LevelError, "request_read_failed", source, targetAddress(target), s.ID, header.FlowID, err)
 			return
 		}
 	}
@@ -641,7 +641,7 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream, fir
 		err = s.Handler.handleFlowGeneration(ctx, conn, source, s.ID, s.Generation, true, header, target, wire.CarrierQUIC)
 	}
 	if err != nil && !IsReported(err) {
-		s.Handler.emit(ctx, diagnostic.LevelWarn, "flow_failed", source, targetAddress(target), s.ID, header.FlowID, err)
+		s.Handler.emitQUIC(ctx, diagnostic.LevelWarn, "flow_failed", source, targetAddress(target), s.ID, header.FlowID, err)
 	}
 }
 

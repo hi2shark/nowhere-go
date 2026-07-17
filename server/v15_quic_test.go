@@ -11,8 +11,58 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
+
+func TestServeQUICAuthFailureReportsQUICCarrier(t *testing.T) {
+	credentials, err := wire.NewCredentials("secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidCredentials, err := wire.NewCredentials("wrong-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := NewConfig(ConfigOptions{
+		Credentials: credentials,
+		Networks:    []Network{NetworkUDP},
+		Timeouts:    Timeouts{Auth: 10 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan diagnostic.Event, 1)
+	handler, err := NewHandler(HandlerOptions{
+		Config:   config,
+		Upstream: v15DiscardUpstream{},
+		Observer: diagnostic.ObserverFunc(func(_ context.Context, event diagnostic.Event) {
+			if event.Code == "auth_failed" {
+				events <- event
+			}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var exporter wire.TLSExporter
+	exporter[0] = 5
+	auth := wire.EncodeAuthFrame(invalidCredentials, wire.AuthTransportQUIC, exporter, wire.SessionID{1})
+	conn := newV15QUICConn(exporter, &v15QuicStream{Reader: bytes.NewReader(auth[:])})
+	if err := handler.ServeQUIC(context.Background(), conn); err == nil {
+		t.Fatal("ServeQUIC accepted invalid authentication")
+	}
+
+	select {
+	case event := <-events:
+		if event.Carrier != diagnostic.CarrierQUIC {
+			t.Fatalf("auth_failed carrier = %q, want %q", event.Carrier, diagnostic.CarrierQUIC)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("auth_failed event was not emitted")
+	}
+}
 
 func TestServeQUICAuthOnlyNotifiesAdapterAfterAuthentication(t *testing.T) {
 	credentials, err := wire.NewCredentials("secret")
