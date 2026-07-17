@@ -12,7 +12,7 @@ import (
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-func TestServeQUICAuthOnlyRaisesStreamLimitAfterAuthentication(t *testing.T) {
+func TestServeQUICAuthOnlyNotifiesAdapterAfterAuthentication(t *testing.T) {
 	credentials, err := wire.NewCredentials("secret")
 	if err != nil {
 		t.Fatal(err)
@@ -35,12 +35,9 @@ func TestServeQUICAuthOnlyRaisesStreamLimitAfterAuthentication(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- handler.ServeQUIC(ctx, conn) }()
 	select {
-	case <-conn.limitSet:
-		if bidi, uni := conn.limits(); bidi != int64(DefaultPendingFlowsPerSession) || uni != 0 {
-			t.Fatalf("stream limits = (%d, %d), want (%d, 0)", bidi, uni, DefaultPendingFlowsPerSession)
-		}
+	case <-conn.authenticated:
 	case <-time.After(time.Second):
-		t.Fatal("authenticated connection did not raise stream limits")
+		t.Fatal("authenticated connection did not notify adapter")
 	}
 	cancel()
 	select {
@@ -68,32 +65,18 @@ type v15QUICConn struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 
-	accepted  atomic.Bool
-	mu        sync.Mutex
-	bidi      int64
-	uni       int64
-	limitSet  chan struct{}
-	limitOnce sync.Once
+	accepted      atomic.Bool
+	authenticated chan struct{}
+	authOnce      sync.Once
 }
 
 func newV15QUICConn(exporter wire.TLSExporter, stream QuicStream) *v15QUICConn {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &v15QUICConn{exporter: exporter, stream: stream, ctx: ctx, cancel: cancel, limitSet: make(chan struct{})}
+	return &v15QUICConn{exporter: exporter, stream: stream, ctx: ctx, cancel: cancel, authenticated: make(chan struct{})}
 }
 
 func (c *v15QUICConn) TLSExporter() (wire.TLSExporter, error) { return c.exporter, nil }
-func (c *v15QUICConn) SetMaxIncomingStreamLimits(bidi, uni int64) error {
-	c.mu.Lock()
-	c.bidi, c.uni = bidi, uni
-	c.mu.Unlock()
-	c.limitOnce.Do(func() { close(c.limitSet) })
-	return nil
-}
-func (c *v15QUICConn) limits() (int64, int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.bidi, c.uni
-}
+func (c *v15QUICConn) MarkAuthenticated()                     { c.authOnce.Do(func() { close(c.authenticated) }) }
 func (c *v15QUICConn) AcceptStream(ctx context.Context) (QuicStream, error) {
 	if c.accepted.CompareAndSwap(false, true) {
 		return c.stream, nil

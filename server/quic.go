@@ -30,10 +30,6 @@ type QuicStream interface {
 // by adapters separately from this interface contract.
 type QuicConn interface {
 	TLSExporter() (wire.TLSExporter, error)
-	// SetMaxIncomingStreamLimits raises the peer-advertised incoming stream
-	// limits after the TLS 1-RTT handshake. Implementations must reject a
-	// decrease and must not apply a limit before 1-RTT is available.
-	SetMaxIncomingStreamLimits(maxBidi, maxUni int64) error
 	AcceptStream(ctx context.Context) (QuicStream, error)
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
 	SendDatagram(b []byte) error
@@ -42,6 +38,17 @@ type QuicConn interface {
 	Context() context.Context
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
+}
+
+// QuicAuthenticationNotifier is an optional host capability. A QUIC adapter
+// that enforces its own pre-auth stream gate implements it and starts admitting
+// flow streams once the core reports successful authentication (after session
+// registration in the current core implementation).
+//
+// MarkAuthenticated must be non-blocking and idempotent. It is deliberately
+// separate from QuicConn: not every host has a transport-specific stream gate.
+type QuicAuthenticationNotifier interface {
+	MarkAuthenticated()
 }
 
 // QuicListener accepts QuicConn connections.

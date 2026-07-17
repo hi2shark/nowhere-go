@@ -513,10 +513,6 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 		h.emit(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
 		return err
 	}
-	if err := conn.SetMaxIncomingStreamLimits(int64(h.config.limits.PendingFlowsPerSession), 0); err != nil {
-		_ = conn.CloseWithError(1, "access denied")
-		return err
-	}
 	releaseAdmission()
 	session.cancel = cancel
 	if err := h.sessions.Register(session); err != nil {
@@ -527,6 +523,9 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 	defer session.Close()
 	session.startReassemblyExpiry()
 	pump.activate(session)
+	if notifier, ok := conn.(QuicAuthenticationNotifier); ok {
+		notifier.MarkAuthenticated()
+	}
 
 	h.emit(ctx, diagnostic.LevelInfo, "session_started", source, "", session.ID, 0, nil)
 	if firstStream != nil {
