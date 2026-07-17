@@ -36,17 +36,17 @@ func (r *claimRegistry) setObserver(observer diagnostic.Observer) {
 	r.mu.Unlock()
 }
 
-func (r *claimRegistry) RejectFlowSetup(sessionID wire.SessionID, flowID uint64, code wire.FlowErrorCode) {
-	r.Reject(sessionID, flowID, r.CurrentGeneration(sessionID), &wire.FlowError{Code: code})
+func (r *claimRegistry) RejectFlowSetup(sessionID wire.SessionID, flowID wire.FlowID, code wire.SetupResult) {
+	r.Reject(sessionID, flowID, r.CurrentGeneration(sessionID), &setupResultError{code: code})
 }
 
 // SubmitTCP caches or pairs a TCP half.
-func (r *claimRegistry) SubmitTCP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, conn net.Conn) (net.Conn, error) {
+func (r *claimRegistry) SubmitTCP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target wire.Target, conn net.Conn) (net.Conn, error) {
 	return r.SubmitTCPWithSource(ctx, sessionID, header, target, conn, nil)
 }
 
 // SubmitTCPWithSource is SubmitTCP with optional source for diagnostics.
-func (r *claimRegistry) SubmitTCPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, conn net.Conn, source net.Addr) (net.Conn, error) {
+func (r *claimRegistry) SubmitTCPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target wire.Target, conn net.Conn, source net.Addr) (net.Conn, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("%w: nil tcp half", ErrInvalidHandler)
 	}
@@ -56,7 +56,7 @@ func (r *claimRegistry) SubmitTCPWithSource(ctx context.Context, sessionID wire.
 	carrier := header.Uplink
 	if header.Role == wire.FlowRoleAttach {
 		carrier = header.Downlink
-		target = ""
+		target = wire.Target{}
 	}
 	active, err := r.Submit(ctx, flowClaim{
 		SessionID: sessionID, FlowID: header.FlowID, Generation: r.CurrentGeneration(sessionID),
@@ -88,15 +88,15 @@ func validatePairHeader(header wire.FlowHeader, kind wire.FlowKind) error {
 		return fmt.Errorf("%w: invalid role", ErrUnsupportedFlow)
 	}
 	if header.Uplink == header.Downlink ||
-		(header.Uplink != wire.CarrierTCP && header.Uplink != wire.CarrierUDP) ||
-		(header.Downlink != wire.CarrierTCP && header.Downlink != wire.CarrierUDP) {
+		(header.Uplink != wire.CarrierTLSTCP && header.Uplink != wire.CarrierQUIC) ||
+		(header.Downlink != wire.CarrierTLSTCP && header.Downlink != wire.CarrierQUIC) {
 		return fmt.Errorf("%w: invalid carriers", ErrCarrierMismatch)
 	}
 	return nil
 }
 
 func carrierTransportName(c wire.Carrier) string {
-	if c == wire.CarrierUDP {
+	if c == wire.CarrierQUIC {
 		return "quic"
 	}
 	return "tcp"
@@ -121,7 +121,7 @@ type splicedConn struct {
 	closer       []io.Closer
 	remote       net.Addr
 	local        net.Addr
-	target       string
+	target       wire.Target
 	resultWriter net.Conn
 	onClose      func()
 	once         sync.Once

@@ -1,0 +1,138 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/hi2shark/nowhere-go/wire"
+)
+
+func TestServeQUICAuthOnlyRaisesStreamLimitAfterAuthentication(t *testing.T) {
+	credentials, err := wire.NewCredentials("secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := NewConfig(ConfigOptions{Credentials: credentials, Networks: []Network{NetworkUDP}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(HandlerOptions{Config: config, Upstream: v15DiscardUpstream{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exporter wire.TLSExporter
+	exporter[0] = 7
+	id := wire.SessionID{1}
+	auth := wire.EncodeAuthFrame(credentials, wire.AuthTransportQUIC, exporter, id)
+	conn := newV15QUICConn(exporter, &v15QuicStream{Reader: bytes.NewReader(auth[:])})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- handler.ServeQUIC(ctx, conn) }()
+	select {
+	case <-conn.limitSet:
+		if bidi, uni := conn.limits(); bidi != int64(DefaultPendingFlowsPerSession) || uni != 0 {
+			t.Fatalf("stream limits = (%d, %d), want (%d, 0)", bidi, uni, DefaultPendingFlowsPerSession)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authenticated connection did not raise stream limits")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeQUIC = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeQUIC did not exit after cancellation")
+	}
+}
+
+type v15DiscardUpstream struct{}
+
+func (v15DiscardUpstream) HandleStream(context.Context, net.Conn, net.Addr, wire.Target, FlowReadiness) error {
+	return nil
+}
+func (v15DiscardUpstream) HandlePacket(context.Context, net.PacketConn, net.Addr, wire.Target, FlowReadiness) error {
+	return nil
+}
+
+type v15QUICConn struct {
+	exporter wire.TLSExporter
+	stream   QuicStream
+	ctx      context.Context
+	cancel   context.CancelFunc
+
+	accepted  atomic.Bool
+	mu        sync.Mutex
+	bidi      int64
+	uni       int64
+	limitSet  chan struct{}
+	limitOnce sync.Once
+}
+
+func newV15QUICConn(exporter wire.TLSExporter, stream QuicStream) *v15QUICConn {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &v15QUICConn{exporter: exporter, stream: stream, ctx: ctx, cancel: cancel, limitSet: make(chan struct{})}
+}
+
+func (c *v15QUICConn) TLSExporter() (wire.TLSExporter, error) { return c.exporter, nil }
+func (c *v15QUICConn) SetMaxIncomingStreamLimits(bidi, uni int64) error {
+	c.mu.Lock()
+	c.bidi, c.uni = bidi, uni
+	c.mu.Unlock()
+	c.limitOnce.Do(func() { close(c.limitSet) })
+	return nil
+}
+func (c *v15QUICConn) limits() (int64, int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bidi, c.uni
+}
+func (c *v15QUICConn) AcceptStream(ctx context.Context) (QuicStream, error) {
+	if c.accepted.CompareAndSwap(false, true) {
+		return c.stream, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.ctx.Done():
+		return nil, net.ErrClosed
+	}
+}
+func (c *v15QUICConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.ctx.Done():
+		return nil, net.ErrClosed
+	}
+}
+func (c *v15QUICConn) SendDatagram([]byte) error           { return nil }
+func (c *v15QUICConn) CloseWithError(uint64, string) error { c.cancel(); return nil }
+func (c *v15QUICConn) Close() error                        { c.cancel(); return nil }
+func (c *v15QUICConn) Context() context.Context            { return c.ctx }
+func (*v15QUICConn) LocalAddr() net.Addr                   { return &net.UDPAddr{} }
+func (*v15QUICConn) RemoteAddr() net.Addr                  { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+type v15QuicStream struct {
+	*bytes.Reader
+}
+
+func (s *v15QuicStream) Write(p []byte) (int, error)    { return len(p), nil }
+func (*v15QuicStream) Close() error                     { return nil }
+func (*v15QuicStream) SetDeadline(time.Time) error      { return nil }
+func (*v15QuicStream) SetReadDeadline(time.Time) error  { return nil }
+func (*v15QuicStream) SetWriteDeadline(time.Time) error { return nil }
+func (*v15QuicStream) CancelRead(uint64)                {}
+func (*v15QuicStream) CancelWrite(uint64)               {}
+
+var (
+	_ QuicConn   = (*v15QUICConn)(nil)
+	_ QuicStream = (*v15QuicStream)(nil)
+)

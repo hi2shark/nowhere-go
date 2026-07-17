@@ -25,8 +25,9 @@ type udpDownlink interface {
 	ClosePacket() error
 }
 
-// uotStreamWriter serializes DATA and the best-effort CLOSE attempt. Close
-// never waits behind a blocked DATA write; closing the conn releases that write.
+// uotStreamWriter serializes UoT packets (u16 length + payload). In 1.5 there
+// is no explicit CLOSE frame: closing the writer closes the underlying stream,
+// which the reader observes as a clean half-close (ReadUDPPacket returns nil).
 type uotStreamWriter struct {
 	conn      net.Conn
 	mu        sync.Mutex
@@ -39,7 +40,7 @@ func (w *uotStreamWriter) WritePacket(p []byte) (int, error) {
 	if w.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameData, Payload: p})
+	frame, err := wire.EncodeUDPPacket(p)
 	if err != nil {
 		return 0, err
 	}
@@ -58,10 +59,9 @@ func (w *uotStreamWriter) Close() error {
 	w.closeOnce.Do(func() {
 		w.closed.Store(true)
 		if w.mu.TryLock() {
+			// Best-effort flush of any buffered data via a zero-deadline wake;
+			// the real close below tears the stream down.
 			_ = w.conn.SetWriteDeadline(time.Now())
-			if closeFrame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameClose}); err == nil {
-				_, _ = w.conn.Write(closeFrame)
-			}
 			w.mu.Unlock()
 		}
 		w.closeErr = w.conn.Close()
@@ -69,7 +69,7 @@ func (w *uotStreamWriter) Close() error {
 	return w.closeErr
 }
 
-// uotPacketConn adapts a typed UoT stream to net.PacketConn.
+// uotPacketConn adapts a UoT stream (u16 length + payload) to net.PacketConn.
 type uotPacketConn struct {
 	conn        net.Conn
 	destination net.Addr
@@ -95,22 +95,15 @@ func (c *uotPacketConn) streamWriter() *uotStreamWriter {
 func (c *uotPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-	frame, err := wire.ReadUOTFrame(c.conn)
+	payload, err := wire.ReadUDPPacket(c.conn)
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return 0, nil, io.EOF
-		}
 		return 0, nil, err
 	}
-	switch frame.Kind {
-	case wire.UOTFrameData:
-		n = copy(p, frame.Payload)
-		return n, c.destination, nil
-	case wire.UOTFrameClose:
+	if payload == nil {
+		// clean EOF: the peer half-closed the stream.
 		return 0, nil, io.EOF
-	default:
-		return 0, nil, wire.ErrInvalidUOTFrame
 	}
+	return copy(p, payload), c.destination, nil
 }
 
 func (c *uotPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
@@ -142,27 +135,63 @@ func (c *uotPacketConn) SetWriteDeadline(t time.Time) error {
 
 var _ net.PacketConn = (*uotPacketConn)(nil)
 
-// parseTargetAddr parses a host:port target into a net.Addr.
-func parseTargetAddr(target string) net.Addr {
-	host, portStr, err := net.SplitHostPort(target)
-	if err != nil {
+// targetToAddr renders a typed target into a net.Addr for PacketConn bookkeeping.
+// Domain targets resolve to a zero-IP placeholder (the host dials them later).
+func targetToAddr(t wire.Target) net.Addr {
+	port := int(t.Port)
+	switch t.Type {
+	case wire.TargetTypeIPv4, wire.TargetTypeIPv6:
+		return &net.UDPAddr{IP: t.Addr.AsSlice(), Port: port}
+	case wire.TargetTypeDomain:
+		return &net.UDPAddr{IP: net.IPv4zero, Port: port}
+	default:
 		return &net.UDPAddr{}
 	}
-	port, err := net.LookupPort("udp", portStr)
-	if err != nil {
-		return &net.UDPAddr{}
+}
+
+// targetString renders a target for diagnostics only; never parsed back.
+func targetString(t wire.Target) string {
+	switch t.Type {
+	case wire.TargetTypeIPv4, wire.TargetTypeIPv6:
+		return net.JoinHostPort(t.Addr.String(), itoaPort(t.Port))
+	case wire.TargetTypeDomain:
+		return net.JoinHostPort(t.Host, itoaPort(t.Port))
+	default:
+		return ""
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return &net.UDPAddr{IP: ip, Port: port}
+}
+
+func itoaPort(port uint16) string {
+	return itoa(int(port))
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
 	}
-	return &net.UDPAddr{IP: net.IPv4zero, Port: port}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }
 
 // quicPacketConn adapts a QUIC UDP logical flow (control stream + datagrams) to net.PacketConn.
 type quicPacketConn struct {
 	session      *qSessionHandle
 	control      net.Conn
-	flowID       uint64
+	flowID       wire.FlowID
 	destination  net.Addr
 	readMu       sync.Mutex
 	writeMu      sync.Mutex
@@ -173,7 +202,7 @@ type quicPacketConn struct {
 type qSessionHandle struct {
 	quic          *quicPreparedStream
 	flow          *quicDatagramFlow
-	flowID        uint64
+	flowID        wire.FlowID
 	setupErr      error
 	closed        atomic.Bool
 	signalOnce    sync.Once
@@ -182,7 +211,7 @@ type qSessionHandle struct {
 	writeDeadline *datagramDeadline
 }
 
-func newQSessionHandle(prep *quicPreparedStream, flow *quicDatagramFlow, flowID uint64, setupErr error) *qSessionHandle {
+func newQSessionHandle(prep *quicPreparedStream, flow *quicDatagramFlow, flowID wire.FlowID, setupErr error) *qSessionHandle {
 	return &qSessionHandle{
 		quic:          prep,
 		flow:          flow,
@@ -194,7 +223,7 @@ func newQSessionHandle(prep *quicPreparedStream, flow *quicDatagramFlow, flowID 
 	}
 }
 
-func newQUICDatagramHandle(prep *quicPreparedStream, flowID uint64) (*qSessionHandle, error) {
+func newQUICDatagramHandle(prep *quicPreparedStream, flowID wire.FlowID) (*qSessionHandle, error) {
 	if prep == nil || prep.session == nil {
 		return nil, errors.New("nowhere: nil quic session")
 	}
@@ -209,12 +238,12 @@ func newQUICDatagramHandle(prep *quicPreparedStream, flowID uint64) (*qSessionHa
 	return newQSessionHandle(prep, flow, flowID, nil), nil
 }
 
-func newQUICSendHandle(prep *quicPreparedStream, flowID uint64) *qSessionHandle {
+func newQUICSendHandle(prep *quicPreparedStream, flowID wire.FlowID) *qSessionHandle {
 	return newQSessionHandle(prep, nil, flowID, nil)
 }
 
-func newQUICPacketConn(prep *quicPreparedStream, control net.Conn, dest string) *quicPacketConn {
-	flowID := uint64(0)
+func newQUICPacketConn(prep *quicPreparedStream, control net.Conn, target wire.Target) *quicPacketConn {
+	flowID := wire.FlowID(0)
 	if prep != nil {
 		flowID = prep.flowID()
 	}
@@ -226,7 +255,7 @@ func newQUICPacketConn(prep *quicPreparedStream, control net.Conn, dest string) 
 		session:     handle,
 		control:     control,
 		flowID:      flowID,
-		destination: parseTargetAddr(dest),
+		destination: targetToAddr(target),
 	}
 }
 
@@ -246,7 +275,7 @@ func (c *quicPacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	return writeQUICUDPPacket(c.session, c.flowID, &c.nextPacketID, p)
 }
 
-func writeQUICUDPPacket(session *qSessionHandle, flowID uint64, nextPacketID *atomic.Uint32, payload []byte) (int, error) {
+func writeQUICUDPPacket(session *qSessionHandle, flowID wire.FlowID, nextPacketID *atomic.Uint32, payload []byte) (int, error) {
 	if err := session.stateError(); err != nil {
 		return 0, err
 	}
@@ -455,18 +484,21 @@ func (h *qSessionHandle) closePacket() error {
 		return err
 	}
 	if session, ok := h.quic.session.(*quicSessionMux); ok {
-		return session.enqueueClose(closeFrame)
+		return session.enqueueClose(closeFrame[:])
 	}
 	return nil
 }
 
 var _ net.PacketConn = (*quicPacketConn)(nil)
 
-const nowuDataHeaderLen = 4 + 1 + 8 + 4 + 1 + 1 + 2
+// nowuDataHeaderLen is the 1.5 unfragmented DATA/CLOSE datagram header length
+// (1 flags byte + 4-byte flow id). Used to size fragment payloads against the
+// QUIC DATAGRAM MTU.
+const nowuDataHeaderLen = wire.UDPHeaderLen
 
 // flowIDer lets a prepared stream expose its flow id for datagram routing.
 type flowIDer interface {
-	flowID() uint64
+	flowID() wire.FlowID
 }
 
 var _ flowIDer = (*quicPreparedStream)(nil)

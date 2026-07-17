@@ -21,6 +21,14 @@ const (
 // TLSExporterLen is the length of a TLS exporter bound to one connection.
 const TLSExporterLen = 32
 
+// TLSExporterLabel is the fixed TLS exporter label required by Nowhere 1.5.
+const TLSExporterLabel = "EXPORTER-Nowhere-Auth"
+
+// EmptyTLSExporterContext returns a present empty context for TLS exporter APIs.
+// It intentionally allocates a non-nil zero-length slice so callers cannot
+// accidentally pass the nil context with different TLS API semantics.
+func EmptyTLSExporterContext() []byte { return []byte{} }
+
 // TLSExporter carries the keying material exported from the physical
 // connection's TLS 1.3 handshake.
 type TLSExporter = [TLSExporterLen]byte

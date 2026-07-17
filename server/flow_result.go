@@ -23,7 +23,7 @@ type flowReadiness struct {
 	once          sync.Once
 	mu            sync.Mutex
 	ready         func() error
-	reject        func(wire.FlowErrorCode) error
+	reject        func(wire.SetupResult) error
 	onReady       func()
 	resolved      bool
 	readyResolved bool
@@ -31,7 +31,7 @@ type flowReadiness struct {
 	err           error
 }
 
-func newFlowReadiness(ready func() error, reject func(wire.FlowErrorCode) error) *flowReadiness {
+func newFlowReadiness(ready func() error, reject func(wire.SetupResult) error) *flowReadiness {
 	return &flowReadiness{ready: ready, reject: reject, done: make(chan struct{})}
 }
 
@@ -114,45 +114,36 @@ func (r *flowReadiness) Wait(ctx context.Context) error {
 	}
 }
 
-type setupResultFormat uint8
-
-const (
-	setupResultF2 setupResultFormat = iota
-	setupResultUOT
-)
-
+// setupResult commits the single 1.5 setup-result byte exactly once. UDP over
+// TLS carries ordinary UoT packets only after READY; it has no separate control
+// envelope.
 type setupResult struct {
 	mu        sync.Mutex
 	writer    net.Conn
-	format    setupResultFormat
 	committed bool
 }
 
-func newSetupResult(writer net.Conn, kind wire.FlowKind, downlink wire.Carrier) *setupResult {
-	format := setupResultF2
-	if kind == wire.FlowKindUDP && downlink == wire.CarrierTCP {
-		format = setupResultUOT
-	}
-	return &setupResult{writer: writer, format: format}
+type setupResultError struct{ code wire.SetupResult }
+
+func (e *setupResultError) Error() string { return "nowhere: setup rejected: " + e.code.String() }
+
+func newSetupResult(writer net.Conn, _ wire.FlowKind, _ wire.Carrier) *setupResult {
+	return &setupResult{writer: writer}
 }
 
-func (r *setupResult) ready() error {
-	return r.commit(wire.FlowResult{Status: wire.FlowStatusReady})
+func (r *setupResult) ready() error { return r.commit(wire.SetupResultReady) }
+
+func (r *setupResult) reject(code wire.SetupResult) error { return r.commit(code) }
+
+func (r *setupResult) rejectContext(ctx context.Context, code wire.SetupResult) error {
+	return r.commitContext(ctx, code)
 }
 
-func (r *setupResult) reject(code wire.FlowErrorCode) error {
-	return r.commit(wire.FlowResult{Status: wire.FlowStatusReject, Code: code})
-}
-
-func (r *setupResult) rejectContext(ctx context.Context, code wire.FlowErrorCode) error {
-	return r.commitContext(ctx, wire.FlowResult{Status: wire.FlowStatusReject, Code: code})
-}
-
-func (r *setupResult) commit(result wire.FlowResult) error {
+func (r *setupResult) commit(result wire.SetupResult) error {
 	return r.commitContext(context.Background(), result)
 }
 
-func (r *setupResult) commitContext(ctx context.Context, result wire.FlowResult) error {
+func (r *setupResult) commitContext(ctx context.Context, result wire.SetupResult) error {
 	if r == nil || r.writer == nil {
 		return nil
 	}
@@ -177,38 +168,27 @@ func (r *setupResult) commitContext(ctx context.Context, result wire.FlowResult)
 		stop := afterContextFunc(ctx, func() { _ = r.writer.Close() })
 		defer stop()
 	}
-	if r.format == setupResultUOT {
-		frame := wire.UOTFrame{Kind: wire.UOTFrameReady}
-		if result.Status == wire.FlowStatusReject {
-			frame = wire.UOTFrame{Kind: wire.UOTFrameReject, Code: result.Code}
-		}
-		return wire.WriteUOTFrame(r.writer, frame)
-	}
-	frame, err := wire.WriteFlowResult(result)
-	if err != nil {
-		return err
-	}
-	return writeAll(r.writer, frame[:])
+	return wire.WriteSetupResult(r.writer, result)
 }
 
-func setupFailureCode(err error) wire.FlowErrorCode {
-	var flowErr *wire.FlowError
-	if errors.As(err, &flowErr) && flowErr.Code != 0 {
-		return flowErr.Code
+func setupFailureCode(err error) wire.SetupResult {
+	var setupErr *setupResultError
+	if errors.As(err, &setupErr) {
+		return setupErr.code
 	}
 	switch {
 	case errors.Is(err, ErrCarrierMismatch), errors.Is(err, ErrDuplicateHalf):
-		return wire.FlowErrorCodeMetadataConflict
+		return wire.SetupResultMetadataConflict
 	case errors.Is(err, ErrPairTimeout):
-		return wire.FlowErrorCodePairTimeout
+		return wire.SetupResultPairTimeout
 	case errors.Is(err, ErrPairLimit), errors.Is(err, ErrSessionLimit):
-		return wire.FlowErrorCodeFlowLimit
+		return wire.SetupResultFlowLimit
 	case errors.Is(err, ErrClosed), errors.Is(err, net.ErrClosed), errors.Is(err, context.Canceled):
-		return wire.FlowErrorCodeSessionReplaced
+		return wire.SetupResultSessionReplaced
 	case errors.Is(err, ErrInvalidHandler), errors.Is(err, ErrUpstreamNotConfigured):
-		return wire.FlowErrorCodeInternalError
+		return wire.SetupResultInternalError
 	default:
-		return wire.FlowErrorCodeDialFailed
+		return wire.SetupResultDialFailed
 	}
 }
 

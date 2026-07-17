@@ -165,8 +165,8 @@ type portalSession struct {
 	cancel context.CancelCauseFunc
 
 	mu              sync.Mutex
-	flows           map[uint64]*nowuFlow
-	pendingControls map[uint64]*pendingUDPControl
+	flows           map[wire.FlowID]*nowuFlow
+	pendingControls map[wire.FlowID]*pendingUDPControl
 	pendingFrames   int
 	pendingBytes    int
 	queuedBytes     int
@@ -177,6 +177,55 @@ type portalSession struct {
 	closeDone       chan struct{}
 	closed          bool
 	transportOnce   sync.Once
+}
+
+// quicDatagramPump is the single owner of ReceiveDatagram for a QUIC
+// connection. It deliberately discards packets until authentication and
+// session registration complete; that prevents unauthenticated datagrams from
+// being replayed into a later authenticated session.
+type quicDatagramPump struct {
+	conn QuicConn
+
+	mu      sync.RWMutex
+	session *portalSession
+	done    chan struct{}
+}
+
+func newQUICDatagramPump(conn QuicConn) *quicDatagramPump {
+	return &quicDatagramPump{conn: conn, done: make(chan struct{})}
+}
+
+func (p *quicDatagramPump) run(ctx context.Context) {
+	defer close(p.done)
+	for {
+		data, err := p.conn.ReceiveDatagram(ctx)
+		if err != nil {
+			return
+		}
+		p.mu.RLock()
+		session := p.session
+		if session != nil {
+			session.handleDatagram(ctx, data)
+		}
+		p.mu.RUnlock()
+	}
+}
+
+func (p *quicDatagramPump) activate(session *portalSession) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.session = session
+	p.mu.Unlock()
+}
+
+func (p *quicDatagramPump) stop() {
+	if p == nil {
+		return
+	}
+	_ = p.conn.CloseWithError(0, "")
+	<-p.done
 }
 
 func newPortalSession(id wire.SessionID, conn QuicConn, handler *Handler, source net.Addr) *portalSession {
@@ -190,8 +239,8 @@ func newPortalSession(id wire.SessionID, conn QuicConn, handler *Handler, source
 		Conn:            conn,
 		Handler:         handler,
 		Source:          source,
-		flows:           make(map[uint64]*nowuFlow),
-		pendingControls: make(map[uint64]*pendingUDPControl),
+		flows:           make(map[wire.FlowID]*nowuFlow),
+		pendingControls: make(map[wire.FlowID]*pendingUDPControl),
 		budget:          budget,
 		reassembler:     newUDPReassembler(nowuPartialLimit, nowuPartialTTL, budget),
 	}
@@ -247,7 +296,7 @@ func (s *portalSession) closeTransport(error) {
 	}
 	s.transportOnce.Do(func() {
 		if s.Conn != nil {
-			_ = s.Conn.CloseWithError(uint64(wire.CloseErrCodeOK), "")
+			_ = s.Conn.CloseWithError(0, "")
 		}
 	})
 }
@@ -306,7 +355,7 @@ func (s *portalSession) maxDatagramSize() int {
 	return 1200
 }
 
-func (s *portalSession) getFlow(id uint64) *nowuFlow {
+func (s *portalSession) getFlow(id wire.FlowID) *nowuFlow {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.flows[id]
@@ -320,7 +369,7 @@ const (
 	flowSessionClosed
 )
 
-func (s *portalSession) insertFlow(id uint64, flow *nowuFlow) flowInsertResult {
+func (s *portalSession) insertFlow(id wire.FlowID, flow *nowuFlow) flowInsertResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -333,7 +382,7 @@ func (s *portalSession) insertFlow(id uint64, flow *nowuFlow) flowInsertResult {
 	return flowInserted
 }
 
-func (s *portalSession) putFlow(id uint64, flow *nowuFlow) bool {
+func (s *portalSession) putFlow(id wire.FlowID, flow *nowuFlow) bool {
 	flow.ownsReassembly.Store(true)
 	if s.insertFlow(id, flow) == flowInserted {
 		return true
@@ -342,7 +391,7 @@ func (s *portalSession) putFlow(id uint64, flow *nowuFlow) bool {
 	return false
 }
 
-func (s *portalSession) removeFlow(id uint64, flow *nowuFlow) {
+func (s *portalSession) removeFlow(id wire.FlowID, flow *nowuFlow) {
 	s.mu.Lock()
 	if current := s.flows[id]; current == flow {
 		delete(s.flows, id)
@@ -351,7 +400,7 @@ func (s *portalSession) removeFlow(id uint64, flow *nowuFlow) {
 }
 
 func (s *portalSession) beginPendingUDPControl(header wire.FlowHeader) (*pendingUDPControl, error) {
-	if err := validateFlowTransport(header, wire.CarrierUDP); err != nil {
+	if err := validateFlowTransport(header, wire.CarrierQUIC); err != nil {
 		return nil, err
 	}
 	if header.Role == wire.FlowRoleAttach {
@@ -381,7 +430,7 @@ func (s *portalSession) beginPendingUDPControl(header wire.FlowHeader) (*pending
 	return pending, nil
 }
 
-func (s *portalSession) cancelPendingUDPControl(flowID uint64, pending *pendingUDPControl) {
+func (s *portalSession) cancelPendingUDPControl(flowID wire.FlowID, pending *pendingUDPControl) {
 	if pending == nil {
 		return
 	}
@@ -431,7 +480,7 @@ func (s *portalSession) expirePendingControlsLocked(now time.Time) {
 	}
 }
 
-func (s *portalSession) removePendingControlLocked(flowID uint64, pending *pendingUDPControl) {
+func (s *portalSession) removePendingControlLocked(flowID wire.FlowID, pending *pendingUDPControl) {
 	if s.pendingControls[flowID] != pending {
 		return
 	}
@@ -494,7 +543,7 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 		return fmt.Errorf("%w: nil quic connection", ErrInvalidHandler)
 	}
 	taskCtx, finish, err := h.tasks.StartTransport(parent, func(error) {
-		_ = conn.CloseWithError(uint64(wire.CloseErrCodeOK), "")
+		_ = conn.CloseWithError(0, "")
 	})
 	if err != nil {
 		_ = conn.CloseWithError(1, "access denied")
@@ -513,11 +562,18 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 
 	ctx, cancel := context.WithCancelCause(taskCtx)
 	defer cancel(nil)
+	pump := newQUICDatagramPump(conn)
+	go pump.run(ctx)
+	defer pump.stop()
 
-	session, pending, err := h.authenticateQuic(ctx, conn)
+	session, firstStream, err := h.authenticateQuic(ctx, conn)
 	if err != nil {
 		_ = conn.CloseWithError(1, "access denied")
 		h.emit(ctx, diagnostic.LevelError, "auth_failed", source, "", wire.SessionID{}, 0, err)
+		return err
+	}
+	if err := conn.SetMaxIncomingStreamLimits(int64(h.config.limits.PendingFlowsPerSession), 0); err != nil {
+		_ = conn.CloseWithError(1, "access denied")
 		return err
 	}
 	releaseAdmission()
@@ -529,21 +585,25 @@ func (h *Handler) ServeQUIC(parent context.Context, conn QuicConn) error {
 	defer h.sessions.Unregister(session)
 	defer session.Close()
 	session.startReassemblyExpiry()
+	pump.activate(session)
 
 	h.emit(ctx, diagnostic.LevelInfo, "session_started", source, "", session.ID, 0, nil)
-	go session.datagramLoop(ctx, pending)
+	if firstStream != nil {
+		go session.handleStream(ctx, firstStream, true)
+	}
 	session.acceptStreams(ctx)
 	return nil
 }
 
-func (h *Handler) authenticateQuic(ctx context.Context, conn QuicConn) (*portalSession, [][]byte, error) {
+func (h *Handler) authenticateQuic(ctx context.Context, conn QuicConn) (*portalSession, QuicStream, error) {
 	deadline := h.authDeadline()
 	authCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
 	type authResult struct {
-		id  wire.SessionID
-		err error
+		id     wire.SessionID
+		stream QuicStream
+		err    error
 	}
 	authCh := make(chan authResult, 1)
 	go func() {
@@ -553,80 +613,26 @@ func (h *Handler) authenticateQuic(ctx context.Context, conn QuicConn) (*portalS
 			return
 		}
 		_ = stream.SetReadDeadline(deadline)
-		id, err := wire.ReadAuthFrame(stream, h.config.key, h.config.spec)
+		exporter, err := conn.TLSExporter()
 		if err == nil {
-			var trailing [1]byte
-			n, tailErr := stream.Read(trailing[:])
-			if n != 0 || !errors.Is(tailErr, io.EOF) {
-				err = wire.ErrInvalidFrame
-			}
+			id, err := wire.ReadAuthFrame(stream, h.config.credentials, wire.AuthTransportQUIC, exporter)
+			authCh <- authResult{id: id, stream: stream, err: err}
+			return
 		}
-		stream.CancelWrite(uint64(wire.CloseErrCodeOK))
 		_ = stream.Close()
-		authCh <- authResult{id: id, err: err}
+		authCh <- authResult{err: err}
 	}()
 
-	type dgramResult struct {
-		data []byte
-		err  error
-	}
-	dgramCh := make(chan dgramResult, 1)
-	dgramDone := make(chan struct{})
-	go func() {
-		defer close(dgramDone)
-		for {
-			data, err := conn.ReceiveDatagram(authCtx)
-			if err != nil {
-				select {
-				case dgramCh <- dgramResult{err: err}:
-				case <-authCtx.Done():
-				}
-				return
-			}
-			cp := make([]byte, len(data))
-			copy(cp, data)
-			select {
-			case dgramCh <- dgramResult{data: cp}:
-			case <-authCtx.Done():
-				return
-			}
-		}
-	}()
-
-	var pending [][]byte
-	pendingBytes := 0
-	for {
-		select {
-		case res := <-authCh:
-			cancel()
-			<-dgramDone
-			for {
-				select {
-				case d := <-dgramCh:
-					if d.err == nil && pendingBytes+len(d.data) <= preAuthDatagramBudget {
-						pending = append(pending, d.data)
-						pendingBytes += len(d.data)
-					}
-				default:
-					if res.err != nil {
-						h.waitAuthFailure(ctx, deadline)
-						return nil, nil, res.err
-					}
-					return newPortalSession(res.id, conn, h, conn.RemoteAddr()), pending, nil
-				}
-			}
-		case d := <-dgramCh:
-			if d.err != nil {
-				continue
-			}
-			if pendingBytes+len(d.data) <= preAuthDatagramBudget {
-				pending = append(pending, d.data)
-				pendingBytes += len(d.data)
-			}
-		case <-authCtx.Done():
+	select {
+	case res := <-authCh:
+		if res.err != nil {
 			h.waitAuthFailure(ctx, deadline)
-			return nil, nil, authCtx.Err()
+			return nil, nil, res.err
 		}
+		return newPortalSession(res.id, conn, h, conn.RemoteAddr()), res.stream, nil
+	case <-authCtx.Done():
+		h.waitAuthFailure(ctx, deadline)
+		return nil, nil, authCtx.Err()
 	}
 }
 
@@ -636,11 +642,11 @@ func (s *portalSession) acceptStreams(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		go s.handleStream(ctx, stream)
+		go s.handleStream(ctx, stream, false)
 	}
 }
 
-func (s *portalSession) handleStream(ctx context.Context, stream QuicStream) {
+func (s *portalSession) handleStream(ctx context.Context, stream QuicStream, first bool) {
 	conn := wrapQuicStream(stream, s.Conn.LocalAddr(), s.Conn.RemoteAddr())
 	source := s.Source
 	_ = conn.SetReadDeadline(s.Handler.now().Add(s.Handler.config.timeouts.RequestIdle))
@@ -648,12 +654,15 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream) {
 	header, err := wire.ReadFlowHeader(conn)
 	if err != nil {
 		_ = conn.Close()
+		if first && errors.Is(err, io.EOF) {
+			return
+		}
 		s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, "", s.ID, 0, err)
 		return
 	}
 	target, err := s.Handler.readFlowTarget(conn, header)
 	if err != nil {
-		s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.FlowErrorCodeInvalidRequest)
+		s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.SetupResultInvalidRequest)
 		_ = conn.Close()
 		s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, "", s.ID, header.FlowID, err)
 		return
@@ -668,7 +677,7 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream) {
 				s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, setupFailureCode(err))
 			}
 			_ = conn.Close()
-			s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, target, s.ID, header.FlowID, err)
+			s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, targetAddress(target), s.ID, header.FlowID, err)
 			return
 		}
 		defer s.cancelPendingUDPControl(header.FlowID, pending)
@@ -678,9 +687,9 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream) {
 		n, tailErr := conn.Read(trailing[:])
 		if n != 0 || !errors.Is(tailErr, io.EOF) {
 			err = wire.ErrInvalidFrame
-			s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.FlowErrorCodeInvalidRequest)
+			s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.SetupResultInvalidRequest)
 			_ = conn.Close()
-			s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, target, s.ID, header.FlowID, err)
+			s.Handler.emit(ctx, diagnostic.LevelError, "request_read_failed", source, targetAddress(target), s.ID, header.FlowID, err)
 			return
 		}
 	}
@@ -689,16 +698,16 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream) {
 	if header.Kind == wire.FlowKindUDP {
 		err = s.handleUDPControl(ctx, conn, source, header, target, pending)
 	} else {
-		err = s.Handler.handleFlowGeneration(ctx, conn, source, s.ID, s.Generation, true, header, target, wire.CarrierUDP)
+		err = s.Handler.handleFlowGeneration(ctx, conn, source, s.ID, s.Generation, true, header, target, wire.CarrierQUIC)
 	}
 	if err != nil && !IsReported(err) {
-		s.Handler.emit(ctx, diagnostic.LevelWarn, "flow_failed", source, target, s.ID, header.FlowID, err)
+		s.Handler.emit(ctx, diagnostic.LevelWarn, "flow_failed", source, targetAddress(target), s.ID, header.FlowID, err)
 	}
 }
 
-func (s *portalSession) handleUDPControl(ctx context.Context, conn net.Conn, source net.Addr, header wire.FlowHeader, target string, pending *pendingUDPControl) error {
-	if err := validateFlowTransport(header, wire.CarrierUDP); err != nil {
-		s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.FlowErrorCodeMetadataConflict)
+func (s *portalSession) handleUDPControl(ctx context.Context, conn net.Conn, source net.Addr, header wire.FlowHeader, target wire.Target, pending *pendingUDPControl) error {
+	if err := validateFlowTransport(header, wire.CarrierQUIC); err != nil {
+		s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.SetupResultMetadataConflict)
 		_ = conn.Close()
 		return err
 	}
@@ -803,27 +812,12 @@ func (s *portalSession) insertNOWUFlow(flow *nowuFlow) error {
 	}
 }
 
-func rejectQUICControl(conn net.Conn, header wire.FlowHeader, code wire.FlowErrorCode) {
-	_ = newSetupResult(conn, header.Kind, wire.CarrierUDP).reject(code)
-}
-
-func (s *portalSession) datagramLoop(ctx context.Context, pending [][]byte) {
-	for _, data := range pending {
-		s.handleDatagram(ctx, data)
-	}
-	for {
-		data, err := s.Conn.ReceiveDatagram(ctx)
-		if err != nil {
-			return
-		}
-		s.handleDatagram(ctx, data)
-	}
+func rejectQUICControl(conn net.Conn, header wire.FlowHeader, code wire.SetupResult) {
+	_ = newSetupResult(conn, header.Kind, wire.CarrierQUIC).reject(code)
 }
 
 func (s *portalSession) handleDatagram(ctx context.Context, data []byte) {
-	if len(data) >= 4 && string(data[:4]) == wire.UDPFrameMagic {
-		s.handleNowu(ctx, data)
-	}
+	s.handleNowu(ctx, data)
 }
 
 func (s *portalSession) handleNowu(ctx context.Context, data []byte) {
@@ -832,14 +826,15 @@ func (s *portalSession) handleNowu(ctx context.Context, data []byte) {
 		return
 	}
 	switch frame.Type {
-	case wire.UDPFrameData:
+	case wire.UDPFrameTypeData:
+		if flow := s.getFlow(frame.FlowID); flow != nil {
+			flow.deliver(frame.Payload)
+		}
+	case wire.UDPFrameTypeFragment:
 		if flow := s.getFlow(frame.FlowID); flow != nil {
 			flow.deliverFragment(frame.Fragment)
-		} else {
-			// Only a validated control already waiting for FIN may preactivate DATA.
-			_ = s.bufferPendingUDPData(frame, len(data))
 		}
-	case wire.UDPFrameClose:
+	case wire.UDPFrameTypeClose:
 		if flow := s.getFlow(frame.FlowID); flow != nil {
 			flow.shutdown(io.EOF)
 		}
@@ -850,8 +845,8 @@ func (s *portalSession) handleNowu(ctx context.Context, data []byte) {
 
 type nowuFlow struct {
 	session        *portalSession
-	flowID         uint64
-	target         string
+	flowID         wire.FlowID
+	target         wire.Target
 	dest           net.Addr
 	waiter         chan nowuQueuedPacket
 	done           chan struct{}
@@ -871,12 +866,12 @@ type nowuQueuedPacket struct {
 	release func()
 }
 
-func newNowuFlow(session *portalSession, flowID uint64, target string) *nowuFlow {
+func newNowuFlow(session *portalSession, flowID wire.FlowID, target wire.Target) *nowuFlow {
 	flow := &nowuFlow{
 		session: session,
 		flowID:  flowID,
 		target:  target,
-		dest:    parseTargetAddr(target),
+		dest:    targetNetAddr(target),
 		waiter:  make(chan nowuQueuedPacket, session.Handler.config.limits.UDPQueuePackets),
 		done:    make(chan struct{}),
 	}
@@ -1098,7 +1093,7 @@ func (c *quicStreamConn) RemoteAddr() net.Addr {
 func (c *quicStreamConn) Close() error {
 	var err error
 	c.once.Do(func() {
-		c.CancelRead(uint64(wire.CloseErrCodeOK))
+		c.CancelRead(0)
 		err = c.QuicStream.Close()
 	})
 	return err

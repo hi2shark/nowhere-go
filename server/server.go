@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/hi2shark/nowhere-go/diagnostic"
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 var errTCPListenerConflict = errors.New("nowhere: TCP listener already installed")
@@ -65,12 +66,20 @@ func NewServer(options ServerOptions) (*Server, error) {
 	handshake := options.TLSHandshake
 	if handshake == nil && options.TLS != nil {
 		tlsConfig := options.TLS.Clone()
-		handshake = func(ctx context.Context, raw net.Conn) (net.Conn, error) {
+		handshake = func(ctx context.Context, raw net.Conn) (wire.HandshakedConn, error) {
 			conn := tls.Server(raw, tlsConfig.Clone())
 			if err := conn.HandshakeContext(ctx); err != nil {
-				return nil, err
+				return wire.HandshakedConn{}, err
 			}
-			return conn, nil
+			state := conn.ConnectionState()
+			exported, err := state.ExportKeyingMaterial(wire.TLSExporterLabel, wire.EmptyTLSExporterContext(), wire.TLSExporterLen)
+			if err != nil {
+				_ = conn.Close()
+				return wire.HandshakedConn{}, err
+			}
+			var exporter wire.TLSExporter
+			copy(exporter[:], exported)
+			return wire.HandshakedConn{Conn: conn, Exporter: exporter}, nil
 		}
 	}
 	return &Server{

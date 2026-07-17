@@ -9,8 +9,8 @@ import (
 // big-endian uint32 flow id.
 const FlowHeaderLen = 5
 
-// FlowID identifies one logical flow scoped to a session. It is a uint32, not
-// the uint64 carried by Nowhere 1.4.
+// FlowID identifies one logical flow scoped to a session. Nowhere 1.5 carries
+// it as a non-zero uint32.
 type FlowID = uint32
 
 // FlowRole is the relationship of the current physical lane to a logical flow.

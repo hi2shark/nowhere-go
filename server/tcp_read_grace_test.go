@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 func TestDialUpstreamUsesConfiguredTCPReadGrace(t *testing.T) {
@@ -18,12 +20,14 @@ func TestDialUpstreamUsesConfiguredTCPReadGrace(t *testing.T) {
 		{name: "longer", grace: 80 * time.Millisecond},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			credentials, err := wire.NewCredentials("secret")
+			if err != nil {
+				t.Fatalf("NewCredentials: %v", err)
+			}
 			config, err := NewConfig(ConfigOptions{
-				Password: "secret",
-				Spec:     "auto",
-				ALPN:     "now/1",
-				Networks: []Network{NetworkTCP},
-				Timeouts: Timeouts{TCPReadGrace: test.grace},
+				Credentials: credentials,
+				Networks:    []Network{NetworkTCP},
+				Timeouts:    Timeouts{TCPReadGrace: test.grace},
 			})
 			if err != nil {
 				t.Fatalf("NewConfig: %v", err)
@@ -39,9 +43,13 @@ func TestDialUpstreamUsesConfiguredTCPReadGrace(t *testing.T) {
 			}
 
 			done := make(chan error, 1)
+			target, err := wire.NewDomainTarget("example.com", 443)
+			if err != nil {
+				t.Fatalf("NewDomainTarget: %v", err)
+			}
 			go func() {
 				done <- handler.upstream.HandleStream(
-					context.Background(), graceEOFConn{}, nil, "example.com:443", graceReadiness{},
+					context.Background(), graceEOFConn{}, nil, target, graceReadiness{},
 				)
 			}()
 			awaitGraceSignal(t, remote.closeWriteCalled, "half-close")

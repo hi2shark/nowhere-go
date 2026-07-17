@@ -14,17 +14,41 @@ import (
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
-// flowSetup holds the bytes and metadata for a prepared flow half.
+// flowSetup holds the metadata for a prepared flow half. In 1.5 the wire bytes
+// are assembled from the header and an optional typed target; there is no
+// protocol specification object to thread through.
 type flowSetup struct {
 	header wire.FlowHeader
-	dest   string
+	target wire.Target
 }
 
-func (s *flowSetup) bytes(spec *wire.EffectiveSpec) ([]byte, error) {
-	return wire.EncodeFlowSetup(s.header, s.dest, spec)
+// bytes encodes the flow header and, when the role carries a target, the
+// SOCKS5 target bytes.
+func (s flowSetup) bytes() ([]byte, error) {
+	return encodeFlowSetupBytes(s.header, s.target)
 }
 
-func (b *CarrierBundle) newFlowSetup(kind wire.FlowKind, role wire.FlowRole, dest string) (flowSetup, error) {
+func encodeFlowSetupBytes(header wire.FlowHeader, target wire.Target) ([]byte, error) {
+	hdr, err := wire.WriteFlowHeader(header)
+	if err != nil {
+		return nil, err
+	}
+	if !header.CarriesTarget() {
+		out := make([]byte, wire.FlowHeaderLen)
+		copy(out, hdr[:])
+		return out, nil
+	}
+	targetBytes, err := wire.EncodeTarget(target)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, wire.FlowHeaderLen+len(targetBytes))
+	out = append(out, hdr[:]...)
+	out = append(out, targetBytes...)
+	return out, nil
+}
+
+func (b *CarrierBundle) newFlowSetup(kind wire.FlowKind, role wire.FlowRole, target wire.Target) (flowSetup, error) {
 	flowID, err := b.allocFlowID()
 	if err != nil {
 		return flowSetup{}, err
@@ -37,16 +61,16 @@ func (b *CarrierBundle) newFlowSetup(kind wire.FlowKind, role wire.FlowRole, des
 			Uplink:   b.cfg.up,
 			Downlink: b.cfg.down,
 		},
-		dest: dest,
+		target: target,
 	}, nil
 }
 
-func (b *CarrierBundle) newDuplexSetup(kind wire.FlowKind, dest string) (flowSetup, error) {
-	return b.newFlowSetup(kind, wire.FlowRoleDuplex, dest)
+func (b *CarrierBundle) newDuplexSetup(kind wire.FlowKind, target wire.Target) (flowSetup, error) {
+	return b.newFlowSetup(kind, wire.FlowRoleDuplex, target)
 }
 
 // prepareTCPHalf acquires an authenticated TLS/TCP carrier for the given header.
-func (b *CarrierBundle) prepareTCPHalf(ctx context.Context, dest string, header wire.FlowHeader) (*tcptls.PreparedFlowHalf, error) {
+func (b *CarrierBundle) prepareTCPHalf(ctx context.Context, target wire.Target, header wire.FlowHeader) (*tcptls.PreparedFlowHalf, error) {
 	pool, err := b.tcpPool()
 	if err != nil {
 		return nil, err
@@ -54,7 +78,7 @@ func (b *CarrierBundle) prepareTCPHalf(ctx context.Context, dest string, header 
 	if pool == nil {
 		return nil, errors.New("nowhere: tcp carrier unavailable")
 	}
-	return pool.PrepareFlowHalf(ctx, dest, header)
+	return pool.PrepareFlowHalf(ctx, target, header)
 }
 
 // quicPreparedStream wraps carrier/quic.PreparedStream with session lifetime.
@@ -62,10 +86,10 @@ type quicPreparedStream struct {
 	client  carrier.QuicBackend
 	session carrier.QuicSession
 	stream  quic.PreparedStream
-	id      uint64
+	id      wire.FlowID
 }
 
-func (b *CarrierBundle) prepareQUICStream(ctx context.Context, flowID uint64) (*quicPreparedStream, error) {
+func (b *CarrierBundle) prepareQUICStream(ctx context.Context, flowID wire.FlowID) (*quicPreparedStream, error) {
 	client, err := b.quicClient()
 	if err != nil {
 		return nil, err
@@ -91,7 +115,7 @@ func (b *CarrierBundle) prepareQUICStream(ctx context.Context, flowID uint64) (*
 	return nil, errors.New("nowhere: quic stream unavailable")
 }
 
-func (p *quicPreparedStream) flowID() uint64 {
+func (p *quicPreparedStream) flowID() wire.FlowID {
 	if p == nil {
 		return 0
 	}
@@ -144,13 +168,31 @@ func (p *quicPreparedStream) LocalAddr() net.Addr {
 	return p.session.LocalAddr()
 }
 
-// readFlowResult reads and validates a FLOW_RESULT frame from the selected downlink.
-func readFlowResult(r io.Reader) error {
-	result, err := wire.ReadFlowResult(r)
+// readSetupResult reads the single-byte SetupResult from the selected downlink
+// and returns an error if the server rejected the flow. Nowhere 1.5 collapses
+// the former F2 and UoT setup-result formats into one byte.
+func readSetupResult(r io.Reader) error {
+	result, err := wire.ReadSetupResult(r)
 	if err != nil {
 		return err
 	}
-	return result.Err(true)
+	if !result.IsReady() {
+		return fmt.Errorf("nowhere: flow rejected: %s", result.String())
+	}
+	return nil
+}
+
+// setupResultError reads the SetupResult and maps non-ready outcomes to a typed
+// error so UDP lanes can distinguish rejection from a clean close.
+func setupResultError(r io.Reader) error {
+	result, err := wire.ReadSetupResult(r)
+	if err != nil {
+		return err
+	}
+	if result.IsReady() {
+		return nil
+	}
+	return fmt.Errorf("nowhere: flow rejected: %s", result.String())
 }
 
 // splicedConn joins an independent reader and writer into net.Conn.
@@ -195,13 +237,13 @@ func (c *splicedConn) SetWriteDeadline(t time.Time) error {
 
 var _ net.Conn = (*splicedConn)(nil)
 
-// commitTCPFlow writes the FLOW setup on a TCP half and reads FLOW_RESULT.
+// commitTCPFlow writes the FLOW setup on a TCP half and reads the SetupResult.
 func commitTCPFlow(half *tcptls.PreparedFlowHalf) (net.Conn, error) {
 	conn, err := half.Commit()
 	if err != nil {
 		return nil, err
 	}
-	if err := readFlowResult(conn); err != nil {
+	if err := readSetupResult(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -213,13 +255,13 @@ func commitQUICHalf(ctx context.Context, prep *quicPreparedStream, setup []byte,
 	return prep.commit(ctx, setup, finishWrite)
 }
 
-// commitQUICFlow writes a control-only setup and reads FLOW_RESULT.
+// commitQUICFlow writes a control-only setup and reads the SetupResult.
 func commitQUICFlow(ctx context.Context, prep *quicPreparedStream, setup []byte) (net.Conn, error) {
 	conn, err := prep.Commit(ctx, setup)
 	if err != nil {
 		return nil, err
 	}
-	if err := readFlowResult(conn); err != nil {
+	if err := readSetupResult(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -227,10 +269,10 @@ func commitQUICFlow(ctx context.Context, prep *quicPreparedStream, setup []byte)
 }
 
 func asymmetricCarrierIDs(up, down wire.Carrier, tcpIsOpen bool, tcpCarrierID uint64) (upID, downID uint64) {
-	if up == wire.CarrierTCP {
+	if up == wire.CarrierTLSTCP {
 		upID = tcpCarrierID
 	}
-	if down == wire.CarrierTCP {
+	if down == wire.CarrierTLSTCP {
 		downID = tcpCarrierID
 	}
 	_ = tcpIsOpen
@@ -239,7 +281,7 @@ func asymmetricCarrierIDs(up, down wire.Carrier, tcpIsOpen bool, tcpCarrierID ui
 
 func carrierTransportName(c wire.Carrier) string {
 	switch c {
-	case wire.CarrierUDP:
+	case wire.CarrierQUIC:
 		return "quic"
 	default:
 		return "tcp"

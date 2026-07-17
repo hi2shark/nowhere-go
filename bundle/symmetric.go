@@ -9,61 +9,67 @@ import (
 )
 
 // OpenTCP opens a TCP logical flow using the configured carrier matrix.
-func (b *CarrierBundle) OpenTCP(ctx context.Context, dest string) (net.Conn, error) {
+func (b *CarrierBundle) OpenTCP(ctx context.Context, target wire.Target) (net.Conn, error) {
+	if err := target.Validate(); err != nil {
+		return nil, err
+	}
 	if b.cfg.up != b.cfg.down {
-		return b.openAsymmetricTCP(ctx, dest)
+		return b.openAsymmetricTCP(ctx, target)
 	}
 	switch b.cfg.up {
-	case wire.CarrierTCP:
-		return b.openSymmetricTCPTCP(ctx, dest)
-	case wire.CarrierUDP:
-		return b.openSymmetricUDPQUIC(ctx, dest)
+	case wire.CarrierTLSTCP:
+		return b.openSymmetricTCPTCP(ctx, target)
+	case wire.CarrierQUIC:
+		return b.openSymmetricUDPQUIC(ctx, target)
 	default:
 		return nil, errors.New("nowhere: invalid carrier")
 	}
 }
 
 // OpenUDP opens a UDP logical flow using the configured carrier matrix.
-func (b *CarrierBundle) OpenUDP(ctx context.Context, dest string) (net.PacketConn, error) {
+func (b *CarrierBundle) OpenUDP(ctx context.Context, target wire.Target) (net.PacketConn, error) {
+	if err := target.Validate(); err != nil {
+		return nil, err
+	}
 	if b.cfg.up != b.cfg.down {
-		return b.openAsymmetricUDP(ctx, dest)
+		return b.openAsymmetricUDP(ctx, target)
 	}
 	switch b.cfg.up {
-	case wire.CarrierTCP:
-		return b.openSymmetricTCPUDP(ctx, dest)
-	case wire.CarrierUDP:
-		return b.openSymmetricUDPQUICUDP(ctx, dest)
+	case wire.CarrierTLSTCP:
+		return b.openSymmetricTCPUDP(ctx, target)
+	case wire.CarrierQUIC:
+		return b.openSymmetricUDPQUICUDP(ctx, target)
 	default:
 		return nil, errors.New("nowhere: invalid carrier")
 	}
 }
 
-func (b *CarrierBundle) openSymmetricTCPTCP(ctx context.Context, dest string) (net.Conn, error) {
-	setup, err := b.newDuplexSetup(wire.FlowKindTCP, dest)
+func (b *CarrierBundle) openSymmetricTCPTCP(ctx context.Context, target wire.Target) (net.Conn, error) {
+	setup, err := b.newDuplexSetup(wire.FlowKindTCP, target)
 	if err != nil {
 		return nil, err
 	}
-	half, err := b.prepareTCPHalf(ctx, dest, setup.header)
+	half, err := b.prepareTCPHalf(ctx, target, setup.header)
 	if err != nil {
 		return nil, fmtError("prepare tcp duplex", err)
 	}
 	return commitTCPFlow(half)
 }
 
-func (b *CarrierBundle) openSymmetricUDPQUIC(ctx context.Context, dest string) (net.Conn, error) {
-	setup, err := b.newDuplexSetup(wire.FlowKindTCP, dest)
+func (b *CarrierBundle) openSymmetricUDPQUIC(ctx context.Context, target wire.Target) (net.Conn, error) {
+	setup, err := b.newDuplexSetup(wire.FlowKindTCP, target)
 	if err != nil {
 		return nil, err
 	}
 	return b.openQUICDuplexStream(ctx, setup)
 }
 
-func (b *CarrierBundle) openSymmetricTCPUDP(ctx context.Context, dest string) (net.PacketConn, error) {
-	setup, err := b.newDuplexSetup(wire.FlowKindUDP, dest)
+func (b *CarrierBundle) openSymmetricTCPUDP(ctx context.Context, target wire.Target) (net.PacketConn, error) {
+	setup, err := b.newDuplexSetup(wire.FlowKindUDP, target)
 	if err != nil {
 		return nil, err
 	}
-	half, err := b.prepareTCPHalf(ctx, dest, setup.header)
+	half, err := b.prepareTCPHalf(ctx, target, setup.header)
 	if err != nil {
 		return nil, fmtError("prepare tcp uot duplex", err)
 	}
@@ -71,15 +77,15 @@ func (b *CarrierBundle) openSymmetricTCPUDP(ctx context.Context, dest string) (n
 	if err != nil {
 		return nil, err
 	}
-	if err := readUOTSetupResult(conn); err != nil {
+	if err := readSetupResult(conn); err != nil {
 		_ = conn.Close()
 		return nil, fmtError("read tcp uot setup result", err)
 	}
-	return newUOTPacketConn(conn, parseTargetAddr(dest)), nil
+	return newUOTPacketConn(conn, targetToAddr(target)), nil
 }
 
-func (b *CarrierBundle) openSymmetricUDPQUICUDP(ctx context.Context, dest string) (net.PacketConn, error) {
-	setup, err := b.newDuplexSetup(wire.FlowKindUDP, dest)
+func (b *CarrierBundle) openSymmetricUDPQUICUDP(ctx context.Context, target wire.Target) (net.PacketConn, error) {
+	setup, err := b.newDuplexSetup(wire.FlowKindUDP, target)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +93,7 @@ func (b *CarrierBundle) openSymmetricUDPQUICUDP(ctx context.Context, dest string
 	if err != nil {
 		return nil, fmtError("prepare quic udp duplex", err)
 	}
-	setupBytes, err := setup.bytes(b.cfg.tcp.Spec())
+	setupBytes, err := setup.bytes()
 	if err != nil {
 		_ = prep.Close()
 		return nil, fmtError("encode udp duplex setup", err)
@@ -97,7 +103,7 @@ func (b *CarrierBundle) openSymmetricUDPQUICUDP(ctx context.Context, dest string
 		_ = prep.Close()
 		return nil, err
 	}
-	return newQUICPacketConn(prep, conn, dest), nil
+	return newQUICPacketConn(prep, conn, target), nil
 }
 
 func (b *CarrierBundle) openQUICDuplexStream(ctx context.Context, setup flowSetup) (net.Conn, error) {
@@ -105,7 +111,7 @@ func (b *CarrierBundle) openQUICDuplexStream(ctx context.Context, setup flowSetu
 	if err != nil {
 		return nil, fmtError("prepare quic duplex", err)
 	}
-	setupBytes, err := setup.bytes(b.cfg.tcp.Spec())
+	setupBytes, err := setup.bytes()
 	if err != nil {
 		_ = prep.Close()
 		return nil, fmtError("encode duplex setup", err)
@@ -115,7 +121,7 @@ func (b *CarrierBundle) openQUICDuplexStream(ctx context.Context, setup flowSetu
 		_ = prep.Close()
 		return nil, err
 	}
-	if err := readFlowResult(conn); err != nil {
+	if err := readSetupResult(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}

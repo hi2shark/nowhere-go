@@ -50,6 +50,16 @@ func TestParseCarrierLogStripsPrefix(t *testing.T) {
 	}
 }
 
+func TestParseCarrierLogFlowIDIsUint32(t *testing.T) {
+	ev := ParseCarrierLog("[Nowhere] [carrier] relay_end flow_id=4294967295")
+	if ev.FlowID != 0xffffffff {
+		t.Fatalf("max FlowID = %d, want 4294967295", ev.FlowID)
+	}
+	if ev := ParseCarrierLog("[Nowhere] [carrier] relay_end flow_id=4294967296"); ev.FlowID != 0 {
+		t.Fatalf("oversized FlowID = %d, want 0", ev.FlowID)
+	}
+}
+
 func TestFormatEventPairTimeoutKeys(t *testing.T) {
 	got := FormatEvent(Event{
 		Component:         "server",

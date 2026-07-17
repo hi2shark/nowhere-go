@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -13,7 +14,7 @@ import (
 
 type claimKey struct {
 	sessionID wire.SessionID
-	flowID    uint64
+	flowID    wire.FlowID
 }
 
 type claimMetadata struct {
@@ -28,13 +29,13 @@ func (m claimMetadata) equal(other claimMetadata) bool {
 
 type flowClaim struct {
 	SessionID       wire.SessionID
-	FlowID          uint64
+	FlowID          wire.FlowID
 	Generation      uint64
 	BoundGeneration bool
 	Role            wire.FlowRole
 	Carrier         wire.Carrier
 	Metadata        claimMetadata
-	Target          string
+	Target          wire.Target
 	Stream          net.Conn
 	UDP             udpHalf
 	Source          net.Addr
@@ -71,7 +72,7 @@ type claimEntry struct {
 	key              claimKey
 	generation       uint64
 	metadata         claimMetadata
-	target           string
+	target           wire.Target
 	open             *flowClaim
 	attach           *flowClaim
 	duplex           *flowClaim
@@ -88,7 +89,7 @@ type claimEntry struct {
 
 type claimedFlow struct {
 	Metadata  claimMetadata
-	Target    string
+	Target    wire.Target
 	Open      *flowClaim
 	Attach    *flowClaim
 	Duplex    *flowClaim
@@ -185,7 +186,7 @@ func (c *sessionReplacementCleanup) run() {
 	}
 	for _, failure := range c.pending {
 		if failure.selected != nil {
-			_ = failure.selected.reject(wire.FlowErrorCodeSessionReplaced)
+			_ = failure.selected.reject(wire.SetupResultSessionReplaced)
 		}
 		for _, claim := range failure.claims {
 			claim.close(c.cause)
@@ -329,7 +330,7 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	if claim.BoundGeneration && claim.Generation == 0 {
 		err := fmt.Errorf("%w: zero bound generation", ErrCarrierMismatch)
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.FlowErrorCodeMetadataConflict)
+			_ = result.reject(wire.SetupResultMetadataConflict)
 		}
 		claim.close(err)
 		return nil, err
@@ -339,7 +340,7 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	}
 	if err := validateClaim(claim); err != nil {
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.FlowErrorCodeMetadataConflict)
+			_ = result.reject(wire.SetupResultMetadataConflict)
 		}
 		claim.close(err)
 		return nil, err
@@ -350,7 +351,7 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	if r.closed {
 		r.mu.Unlock()
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.FlowErrorCodeSessionReplaced)
+			_ = result.reject(wire.SetupResultSessionReplaced)
 		}
 		claim.close(ErrClosed)
 		return nil, ErrClosed
@@ -374,7 +375,7 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 		r.mu.Unlock()
 		err := fmt.Errorf("%w: stale generation %d, current %d", ErrCarrierMismatch, claim.Generation, generation)
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.FlowErrorCodeMetadataConflict)
+			_ = result.reject(wire.SetupResultMetadataConflict)
 		}
 		claim.close(err)
 		return nil, err
@@ -388,7 +389,7 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	if err != nil {
 		r.mu.Unlock()
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.FlowErrorCodeFlowLimit)
+			_ = result.reject(wire.SetupResultFlowLimit)
 		}
 		claim.close(err)
 		return nil, err
@@ -410,20 +411,20 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	}
 
 	if r.pending[claim.SessionID] >= r.limits.PendingFlowsPerSession ||
-		(claim.Carrier == wire.CarrierTCP && r.idleTCP >= r.limits.AuthenticatedTCPIdleConnections) {
+		(claim.Carrier == wire.CarrierTLSTCP && r.idleTCP >= r.limits.AuthenticatedTCPIdleConnections) {
 		r.maybeCleanupGenerationLocked(claim.SessionID)
 		r.mu.Unlock()
 		permit.Release()
 		err := fmt.Errorf("%w: pending flow budget", ErrPairLimit)
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.FlowErrorCodeFlowLimit)
+			_ = result.reject(wire.SetupResultFlowLimit)
 		}
 		claim.close(err)
 		return nil, err
 	}
 	entry.state = claimPending
 	entry.selected = setupResultForClaim(claim)
-	entry.pendingTCP = claim.Carrier == wire.CarrierTCP
+	entry.pendingTCP = claim.Carrier == wire.CarrierTLSTCP
 	if claim.Role == wire.FlowRoleOpen {
 		entry.open = cloneFlowClaim(claim)
 		entry.target = claim.Target
@@ -463,7 +464,7 @@ func (r *claimRegistry) submitExistingLocked(ctx context.Context, entry *claimEn
 		result := setupResultForClaim(claim)
 		r.mu.Unlock()
 		if result != nil {
-			_ = result.reject(wire.FlowErrorCodeMetadataConflict)
+			_ = result.reject(wire.SetupResultMetadataConflict)
 		}
 		claim.close(err)
 		return nil, err
@@ -481,7 +482,7 @@ func (r *claimRegistry) submitExistingLocked(ctx context.Context, entry *claimEn
 		}
 		r.mu.Unlock()
 		if selected != nil {
-			_ = selected.reject(wire.FlowErrorCodeMetadataConflict)
+			_ = selected.reject(wire.SetupResultMetadataConflict)
 		}
 		for _, existing := range claims {
 			existing.close(err)
@@ -566,7 +567,7 @@ func (r *claimRegistry) timeout(entry *claimEntry) {
 	r.mu.Unlock()
 	r.emitPair(context.Background(), timeoutEvent)
 	if selected != nil {
-		_ = selected.reject(wire.FlowErrorCodePairTimeout)
+		_ = selected.reject(wire.SetupResultPairTimeout)
 	}
 	for _, claim := range claims {
 		claim.close(err)
@@ -574,22 +575,22 @@ func (r *claimRegistry) timeout(entry *claimEntry) {
 	permit.Release()
 }
 
-func (r *claimRegistry) Reject(sessionID wire.SessionID, flowID, generation uint64, cause error) {
+func (r *claimRegistry) Reject(sessionID wire.SessionID, flowID wire.FlowID, generation uint64, cause error) {
 	_, _ = r.reject(sessionID, flowID, generation, false, cause)
 }
 
-func (r *claimRegistry) reject(sessionID wire.SessionID, flowID, generation uint64, boundGeneration bool, cause error) (bool, wire.FlowErrorCode) {
+func (r *claimRegistry) reject(sessionID wire.SessionID, flowID wire.FlowID, generation uint64, boundGeneration bool, cause error) (bool, wire.SetupResult) {
 	if boundGeneration && generation == 0 {
-		return false, wire.FlowErrorCodeMetadataConflict
+		return false, wire.SetupResultMetadataConflict
 	}
 	if cause == nil {
-		cause = &wire.FlowError{Code: wire.FlowErrorCodeInvalidRequest}
+		cause = errors.New("nowhere: invalid request")
 	}
 	key := claimKey{sessionID: sessionID, flowID: flowID}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return false, wire.FlowErrorCodeSessionReplaced
+		return false, wire.SetupResultSessionReplaced
 	}
 	current := r.generations[sessionID]
 	if current == 0 && !boundGeneration {
@@ -608,7 +609,7 @@ func (r *claimRegistry) reject(sessionID wire.SessionID, flowID, generation uint
 	registered := r.registered[sessionGeneration{sessionID: sessionID, generation: generation}] > 0
 	if current == 0 || generation != current || (boundGeneration && !registered) {
 		r.mu.Unlock()
-		return false, wire.FlowErrorCodeMetadataConflict
+		return false, wire.SetupResultMetadataConflict
 	}
 	entry := r.entries[key]
 	if entry == nil {
@@ -623,7 +624,7 @@ func (r *claimRegistry) reject(sessionID wire.SessionID, flowID, generation uint
 	}
 	if entry.generation != generation {
 		r.mu.Unlock()
-		return false, wire.FlowErrorCodeMetadataConflict
+		return false, wire.SetupResultMetadataConflict
 	}
 	if entry.state == claimTerminal {
 		r.mu.Unlock()
@@ -779,7 +780,7 @@ func (r *claimRegistry) CloseContextCause(ctx context.Context, cause error) erro
 	for _, closing := range entries {
 		entry := closing.entry
 		if entry.selected != nil {
-			_ = entry.selected.rejectContext(ctx, wire.FlowErrorCodeSessionReplaced)
+			_ = entry.selected.rejectContext(ctx, wire.SetupResultSessionReplaced)
 		}
 		if entry.active != nil {
 			_ = entry.active.Readiness.Reject(cause)
@@ -834,7 +835,7 @@ func newClaimAbort(entry *claimEntry) *claimAbort {
 func (r *claimRegistry) activateLocked(entry *claimEntry) *claimedFlow {
 	selectedClaim := selectedClaim(entry)
 	ready := func() error { return nil }
-	reject := func(wire.FlowErrorCode) error { return nil }
+	reject := func(wire.SetupResult) error { return nil }
 	if entry.selected != nil {
 		ready = entry.selected.ready
 		reject = entry.selected.reject
@@ -934,10 +935,10 @@ func validateClaim(claim flowClaim) error {
 	if claim.Metadata.Kind != wire.FlowKindTCP && claim.Metadata.Kind != wire.FlowKindUDP {
 		return fmt.Errorf("%w: invalid flow kind", ErrCarrierMismatch)
 	}
-	if claim.Metadata.Uplink != wire.CarrierTCP && claim.Metadata.Uplink != wire.CarrierUDP {
+	if claim.Metadata.Uplink != wire.CarrierTLSTCP && claim.Metadata.Uplink != wire.CarrierQUIC {
 		return fmt.Errorf("%w: invalid uplink", ErrCarrierMismatch)
 	}
-	if claim.Metadata.Downlink != wire.CarrierTCP && claim.Metadata.Downlink != wire.CarrierUDP {
+	if claim.Metadata.Downlink != wire.CarrierTLSTCP && claim.Metadata.Downlink != wire.CarrierQUIC {
 		return fmt.Errorf("%w: invalid downlink", ErrCarrierMismatch)
 	}
 	switch claim.Role {
@@ -1001,7 +1002,7 @@ func claimPairEvent(code string, entry *claimEntry, received *flowClaim, cause e
 		Level:             diagnostic.LevelDebug,
 		Code:              code,
 		Component:         "server",
-		Target:            entry.target,
+		Target:            targetAddress(entry.target),
 		SessionID:         entry.key.sessionID,
 		FlowID:            entry.key.flowID,
 		UplinkTransport:   carrierTransportName(entry.metadata.Uplink),

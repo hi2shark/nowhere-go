@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // QuicStream is one bidirectional QUIC stream.
@@ -27,6 +29,11 @@ type QuicStream interface {
 // create a CloseWithError <-> operation wait cycle. Host conformance is enforced
 // by adapters separately from this interface contract.
 type QuicConn interface {
+	TLSExporter() (wire.TLSExporter, error)
+	// SetMaxIncomingStreamLimits raises the peer-advertised incoming stream
+	// limits after the TLS 1-RTT handshake. Implementations must reject a
+	// decrease and must not apply a limit before 1-RTT is available.
+	SetMaxIncomingStreamLimits(maxBidi, maxUni int64) error
 	AcceptStream(ctx context.Context) (QuicStream, error)
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
 	SendDatagram(b []byte) error

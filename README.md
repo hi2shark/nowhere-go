@@ -1,6 +1,6 @@
 # Nowhere-Go
 
-Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). This tree targets upstream **v1.4.0** at commit `3e20354ebfe70b1639a94055810581d966dbe44e`.
+Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). This tree targets upstream **v1.5.0** at commit `c7c4b013234d264c60252a21c35c0316e6076e7c`.
 
 This is a library, not a standalone proxy. Hosts such as [sing-box](https://github.com/SagerNet/sing-box) or [mihomo](https://github.com/MetaCubeX/mihomo) import it and supply platform pieces: TLS material, dialers, QUIC stacks, and routing.
 
@@ -16,7 +16,7 @@ go 1.20
 
 License: **GPL-3.0** (same family as upstream Nowhere).
 
-> **Lockstep upgrade required:** Nowhere 1.4 keeps ALPN `now/1`; it does not negotiate the 1.3/1.4 data-plane format. Upgrade the Rust Portal and every client together. Mixed 1.3.x/1.4.0 deployments can authenticate and then fail when opening flows.
+> **Lockstep upgrade required:** Nowhere 1.5 uses connection-bound TLS exporter authentication and does not accept the 1.4 data plane. Upgrade the Rust Portal and every client together.
 
 ---
 
@@ -24,7 +24,7 @@ License: **GPL-3.0** (same family as upstream Nowhere).
 
 | Side | Packages | Responsibility |
 |---|---|---|
-| Shared wire | `wire` | Spec derivation, auth, FLOW/FLOW_RESULT, NOWU fragmentation, typed UoT |
+| Shared wire | `wire` | Credentials, exporter-bound auth, FLOW/setup results, NOWU fragmentation, typed UoT |
 | Outbound | `carrier/tcptls`, `carrier/quic`, `bundle` | Connection pool, injected QUIC dial backend, four-matrix session orchestration |
 | Inbound | `server` | Listen / accept orchestration, auth, flow pairing, NOWU/UoT state, QUIC session loop, upstream handoff |
 
@@ -40,7 +40,7 @@ Hosts keep:
 
 ```text
 nowhere-go/
-├── wire/                       # shared 1.4 codec + EffectiveSpec
+├── wire/                       # shared 1.5 codec, credentials, and typed targets
 ├── carrier/
 │   ├── tcptls/                 # TLS/TCP pool (TCPDialer / TLSDialer injected)
 │   └── quic/                   # outbound QuicBackend interfaces (no implementation)
@@ -59,7 +59,7 @@ Prefer importing subpackages. The root package only re-exports a few `wire` symb
 
 Typical path used by mihomo / sing-box outbound adapters:
 
-1. Build `wire.EffectiveSpec` from shared password, `spec`, and ALPN.
+1. Build `wire.Credentials` from the shared password and use typed `wire.Target` values.
 2. Build an immutable `tcptls.Config` with host dialers.
 3. If either direction is UDP, inject a `carrier.QuicBackend`.
 4. Open flows through `bundle.CarrierBundle`.
@@ -71,27 +71,27 @@ import (
     "github.com/hi2shark/nowhere-go/wire"
 )
 
-spec, err := wire.BuildEffectiveSpec(password, userSpec, wire.DefaultALPN)
+credentials, err := wire.NewCredentials(password)
 if err != nil {
     return err
 }
 
 tcp, err := tcptls.NewConfig(tcptls.TCPOptions{
-	Address:   serverAddr,
-	Spec:      spec,
-	Key:       password,
-	Dialer:    hostTCPDialer,
-	TLSDialer: hostTLSDialer,
-	Observer:  hostObserver,
+	Address:     serverAddr,
+	Credentials: credentials,
+	Transport:   wire.AuthTransportTLSTCP,
+	Dialer:      hostTCPDialer,
+	TLSDialer:   hostTLSDialer,
+	Observer:    hostObserver,
 })
 if err != nil {
 	return err
 }
 
-up, down := wire.CarrierTCP, wire.CarrierUDP
+up, down := wire.CarrierTLSTCP, wire.CarrierQUIC
 b, err := bundle.NewCarrierBundle(bundle.BundleOptions{
 	TCP:      tcp,
-	QUIC:     hostQuicBackend, // required when Up or Down is CarrierUDP
+	QUIC:     hostQuicBackend, // required when Up or Down is CarrierQUIC
 	PoolSize: pool,            // meaningful for tcp/tcp; UDP matrices use 0
 	Up:       up,
 	Down:     down,
@@ -101,16 +101,20 @@ if err != nil {
 }
 defer b.Close()
 
-conn, err := b.OpenTCP(ctx, "example.com:443")
+target, err := wire.NewDomainTarget("example.com", 443)
+if err != nil {
+    return err
+}
+conn, err := b.OpenTCP(ctx, target)
 ```
 
-Supported `Up`/`Down` pairs: `tcp/tcp`, `udp/udp`, `tcp/udp`, `udp/tcp`. In Nowhere 1.4 every logical TCP or UDP flow starts with a FLOW envelope; symmetric flows use `DUPLEX`, while mixed-carrier flows use `OPEN` plus `ATTACH`.
+Supported `Up`/`Down` pairs: `tcp/tcp`, `udp/udp`, `tcp/udp`, `udp/tcp`. Every logical TCP or UDP flow starts with a typed FLOW envelope; symmetric flows use `DUPLEX`, while mixed-carrier flows use `OPEN` plus `ATTACH`.
 
 ---
 
 ## Inbound (server)
 
-The `server` package is a full inbound implementation: auth, FLOW/FLOW_RESULT handling, typed UoT, mixed-carrier pairing, NOWU reassembly, QUIC session replacement, and upstream handoff.
+The `server` package is a full inbound implementation: auth, FLOW/setup-result handling, typed UoT, mixed-carrier pairing, NOWU reassembly, QUIC session replacement, and upstream handoff.
 
 Two integration styles:
 
@@ -126,10 +130,8 @@ import (
 )
 
 cfg, err := server.NewConfig(server.ConfigOptions{
-	Password: password,
-	Spec:     userSpec,
-	ALPN:     "now/1",
-	Networks: []server.Network{server.NetworkTCP},
+	Credentials: credentials,
+	Networks:    []server.Network{server.NetworkTCP},
 })
 if err != nil {
     return err
@@ -173,12 +175,12 @@ QUIC: adapt your connection to `server.QuicConn` / `server.QuicListener`, then c
 
 ```go
 type Upstream interface {
-    HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string, readiness FlowReadiness) error
-    HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string, readiness FlowReadiness) error
+    HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target wire.Target, readiness FlowReadiness) error
+    HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target wire.Target, readiness FlowReadiness) error
 }
 ```
 
-The Upstream calls `readiness.Ready()` only after the target route is established, or `readiness.Reject(err)` when setup fails. The selected downlink carries the resulting FLOW_RESULT (or typed UoT result for TCP-carried UDP).
+The Upstream calls `readiness.Ready()` only after the target route is established, or `readiness.Reject(err)` when setup fails. The selected downlink carries the resulting typed setup result.
 
 On success the Upstream owns the wrapped connection lifecycle. Closing the wrapper or invoking the context `CloseHandler` closes every physical carrier and invokes each host callback exactly once. Normal close passes `nil`; terminal failures pass their cause. Callbacks run synchronously after close, must not block, and panics are isolated and reported to the Observer.
 
@@ -218,7 +220,7 @@ go work init ./nowhere-go ./sing-box ./sing-box/test ./mihomo ./mihomo/test
 # or: go work use ./nowhere-go ./sing-box ...
 ```
 
-Host `go.mod` keeps only a published `nowhere-go` version that targets the same Nowhere 1.4 protocol baseline. Push/CI resolve that module; local edits to `nowhere-go/` are picked up via `go.work`.
+Host `go.mod` keeps only a published `nowhere-go` version that targets the same Nowhere 1.5 protocol baseline. Push/CI resolve that module; local edits to `nowhere-go/` are picked up via `go.work`.
 
 Temporarily ignore the workspace:
 

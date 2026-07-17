@@ -3,6 +3,8 @@ package diagnostic
 import (
 	"strconv"
 	"strings"
+
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // ParseCarrierLog converts legacy "[Nowhere] [carrier] <event> k=v ..." printf
@@ -35,7 +37,7 @@ func ParseCarrierLog(msg string) Event {
 		}
 		switch key {
 		case "flow_id":
-			ev.FlowID = parseUint(val)
+			ev.FlowID = parseFlowID(val)
 		case "carrier_id":
 			ev.CarrierID = parseUint(val)
 		case "target":
@@ -118,6 +120,14 @@ func (e errString) Error() string { return string(e) }
 func parseUint(s string) uint64 {
 	n, _ := strconv.ParseUint(s, 10, 64)
 	return n
+}
+
+func parseFlowID(s string) wire.FlowID {
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return wire.FlowID(n)
 }
 
 func parseInt64(s string) int64 {

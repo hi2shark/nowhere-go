@@ -75,9 +75,7 @@ type Limits struct {
 
 // ConfigOptions builds an immutable server Config.
 type ConfigOptions struct {
-	Password string
-	Spec     string
-	ALPN     string
+	Credentials *wire.Credentials
 	Networks []Network
 	Timeouts Timeouts
 	Limits   Limits
@@ -85,8 +83,7 @@ type ConfigOptions struct {
 
 // Config is normalized and immutable after construction.
 type Config struct {
-	key       string
-	spec      *wire.EffectiveSpec
+	credentials *wire.Credentials
 	networks  []Network
 	enableTCP bool
 	enableUDP bool
@@ -96,9 +93,8 @@ type Config struct {
 
 // NewConfig validates and normalizes server configuration.
 func NewConfig(options ConfigOptions) (*Config, error) {
-	es, err := wire.BuildEffectiveSpec(options.Password, options.Spec, options.ALPN)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	if options.Credentials == nil {
+		return nil, fmt.Errorf("%w: nil credentials", ErrInvalidConfig)
 	}
 	timeouts, err := normalizeTimeouts(options.Timeouts)
 	if err != nil {
@@ -114,8 +110,7 @@ func NewConfig(options ConfigOptions) (*Config, error) {
 	}
 	seen := make(map[Network]struct{}, len(networks))
 	cfg := &Config{
-		key:      options.Password,
-		spec:     es,
+		credentials: options.Credentials,
 		timeouts: timeouts,
 		limits:   limits,
 		networks: append([]Network(nil), networks...),
@@ -226,28 +221,12 @@ func (c *Config) Networks() []Network {
 	return append([]Network(nil), c.networks...)
 }
 
-// EffectiveSpec returns the immutable derived protocol specification.
-func (c *Config) EffectiveSpec() *wire.EffectiveSpec {
+// Credentials returns the immutable credentials used for connection-bound auth.
+func (c *Config) Credentials() *wire.Credentials {
 	if c == nil {
 		return nil
 	}
-	return c.spec
-}
-
-// ALPN returns the normalized application protocol identifier.
-func (c *Config) ALPN() string {
-	if c == nil || c.spec == nil {
-		return ""
-	}
-	return c.spec.ALPN()
-}
-
-// SpecID returns the derived protocol specification identifier.
-func (c *Config) SpecID() string {
-	if c == nil || c.spec == nil {
-		return ""
-	}
-	return c.spec.SpecID()
+	return c.credentials
 }
 
 // Timeouts returns the normalized timeout values by value.

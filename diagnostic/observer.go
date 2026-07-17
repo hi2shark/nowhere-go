@@ -45,51 +45,51 @@ const (
 // Event is a structured diagnostic emitted by the protocol core.
 // Zero-valued fields are omitted by host adapters.
 type Event struct {
-	Level     Level
-	Code      string // event name, e.g. flow_open / pair_timeout
-	Component string // server | tcptls | quic | ...
-	Carrier   string // tcp_tls | quic
-	Source    net.Addr
-	Target    string
-	SessionID wire.SessionID
-	FlowID    uint64
-	CarrierID uint64
-	State     string
-	Outcome   string
-	Result    string // ok | canceled | timeout | failed
+	Level      Level
+	Code       string // event name, e.g. flow_open / pair_timeout
+	Component  string // server | tcptls | quic | ...
+	Carrier    string // tcp_tls | quic
+	Source     net.Addr
+	Target     string
+	SessionID  wire.SessionID
+	FlowID     wire.FlowID
+	CarrierID  uint64
+	State      string
+	Outcome    string
+	Result     string // ok | canceled | timeout | failed
 	ErrorClass string
-	Count     int
-	Bytes     uint64
-	Duration  time.Duration
-	Err       error
+	Count      int
+	Bytes      uint64
+	Duration   time.Duration
+	Err        error
 
 	// Half / pair correlation fields (asymmetric flows).
-	HalfRole           string // open | attach (received role)
-	MissingHalf        string
-	Transport          string // received transport tcp|quic|udp
-	ExpectedTransport  string
-	ReceivedHalf       string // alias clarity for pair diagnostics
-	UplinkCarrierID    uint64
-	DownlinkCarrierID  uint64
-	UplinkTransport    string
-	DownlinkTransport  string
-	Stage              string
-	ContextCause       string
-	CloseReason        string
-	Server             string // portal dial address (distinct from business Target)
-	DialQueueMs        int64
-	RawDialMs          int64
-	TLSms              int64
-	AuthMs             int64
-	PairWaitMs         int64
-	FirstByteMs        int64
-	AcquireWaitMs      int64
-	OpenTotalMs        int64
-	PoolIdle           int
-	PoolPreparing      int
-	PoolTarget         int
-	RxBytes            uint64
-	TxBytes            uint64
+	HalfRole          string // open | attach (received role)
+	MissingHalf       string
+	Transport         string // received transport tcp|quic|udp
+	ExpectedTransport string
+	ReceivedHalf      string // alias clarity for pair diagnostics
+	UplinkCarrierID   uint64
+	DownlinkCarrierID uint64
+	UplinkTransport   string
+	DownlinkTransport string
+	Stage             string
+	ContextCause      string
+	CloseReason       string
+	Server            string // portal dial address (distinct from business Target)
+	DialQueueMs       int64
+	RawDialMs         int64
+	TLSms             int64
+	AuthMs            int64
+	PairWaitMs        int64
+	FirstByteMs       int64
+	AcquireWaitMs     int64
+	OpenTotalMs       int64
+	PoolIdle          int
+	PoolPreparing     int
+	PoolTarget        int
+	RxBytes           uint64
+	TxBytes           uint64
 }
 
 // Observer receives diagnostic events. Implementations must return promptly.

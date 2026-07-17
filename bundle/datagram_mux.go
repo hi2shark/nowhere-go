@@ -11,15 +11,12 @@ import (
 	"time"
 
 	"github.com/hi2shark/nowhere-go/carrier"
-	"github.com/hi2shark/nowhere-go/internal/udpassembly"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
 const (
 	quicDatagramFlowQueue = 64
 	quicSendQueue         = 1
-	quicReassemblySlots   = 64
-	quicReassemblyTTL     = 10 * time.Second
 	quicReassemblySweep   = time.Second
 )
 
@@ -61,25 +58,30 @@ func (r *quicSendRequest) finish(err error) {
 	r.result <- err
 }
 
+// quicAuthenticator binds a fresh physical QUIC session to the bundle identity
+// by writing the connection-bound auth frame on the session's first stream. It
+// is supplied by the bundle (which owns the Credentials + Transport + Session
+// ID) and called exactly once per physical session, the first time the mux
+// sees it.
+type quicAuthenticator func(ctx context.Context, session carrier.QuicSession) error
+
 // quicMuxBackend owns one receive loop and one bounded send owner for every
 // physical QUIC session returned by the injected backend.
 type quicMuxBackend struct {
 	backend carrier.QuicBackend
+	auth    quicAuthenticator
 
 	mu       sync.Mutex
 	sessions map[carrier.QuicSession]*quicSessionMux
 	closed   bool
 }
 
-func newQUICMuxBackend(backend carrier.QuicBackend) *quicMuxBackend {
+func newQUICMuxBackend(backend carrier.QuicBackend, auth quicAuthenticator) *quicMuxBackend {
 	return &quicMuxBackend{
 		backend:  backend,
+		auth:     auth,
 		sessions: make(map[carrier.QuicSession]*quicSessionMux),
 	}
-}
-
-func (b *quicMuxBackend) SetSessionID(id wire.SessionID) {
-	b.backend.SetSessionID(id)
 }
 
 func (b *quicMuxBackend) AcquireSession(ctx context.Context) (carrier.QuicSession, error) {
@@ -110,6 +112,18 @@ func (b *quicMuxBackend) AcquireSession(ctx context.Context) (carrier.QuicSessio
 			}
 			b.mu.Unlock()
 			return session, nil
+		}
+		// First time the mux sees this physical session: authenticate it.
+		// In Nowhere 1.5 the bundle owns the QUIC auth handshake (read the
+		// exporter off the session, open the first stream, write the auth
+		// frame). The injected backend never learns the Session ID.
+		if b.auth != nil {
+			authErr := b.auth(ctx, raw)
+			if authErr != nil {
+				b.mu.Unlock()
+				b.backend.InvalidateSession(raw)
+				return nil, authErr
+			}
 		}
 		session := newQUICSessionMux(b, raw)
 		b.sessions[raw] = session
@@ -175,20 +189,11 @@ func (b *quicMuxBackend) remove(session *quicSessionMux) {
 
 var _ carrier.QuicBackend = (*quicMuxBackend)(nil)
 
-type quicReassemblyKey struct {
-	flowID   uint64
-	packetID uint32
-}
-
-type quicReassemblyPacket struct {
-	packet    *udpassembly.Packet
-	createdAt time.Time
-}
-
-// quicSessionMux presents one carrier session, runs the single NOWU receive
-// loop, and owns every raw SendDatagram call. DATA retains bounded native
+// quicSessionMux presents one carrier session, runs the single receive loop,
+// and owns every raw SendDatagram call. DATA retains bounded native
 // backpressure; CLOSE uses a reliable in-memory queue so flow teardown cannot
-// be lost while the DATA queue or raw sender is blocked.
+// be lost while the DATA queue or raw sender is blocked. Fragment reassembly
+// delegates to the wire.DatagramReassembler (matches the Rust oracle).
 type quicSessionMux struct {
 	backend *quicMuxBackend
 	raw     carrier.QuicSession
@@ -196,8 +201,8 @@ type quicSessionMux struct {
 	cancel  context.CancelFunc
 
 	mu         sync.Mutex
-	flows      map[uint64]*quicDatagramFlow
-	assemblies map[quicReassemblyKey]quicReassemblyPacket
+	flows      map[wire.FlowID]*quicDatagramFlow
+	reassembler *wire.DatagramReassembler
 	closeQueue [][]byte
 	started    bool
 	closed     bool
@@ -222,8 +227,8 @@ func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession) *quicSe
 		raw:              raw,
 		ctx:              ctx,
 		cancel:           cancel,
-		flows:            make(map[uint64]*quicDatagramFlow),
-		assemblies:       make(map[quicReassemblyKey]quicReassemblyPacket),
+		flows:            make(map[wire.FlowID]*quicDatagramFlow),
+		reassembler:      wire.NewDatagramReassembler(wire.DefaultReassemblyConfig()),
 		invalidationDone: make(chan struct{}),
 		done:             make(chan struct{}),
 		loopDone:         make(chan struct{}),
@@ -237,6 +242,14 @@ func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession) *quicSe
 
 func (s *quicSessionMux) PrepareStream(ctx context.Context) (carrier.QuicPreparedStream, error) {
 	return s.raw.PrepareStream(ctx)
+}
+
+// TLSExporter delegates to the underlying physical session. The bundle reads
+// it once during authentication (before the mux caches the session), so this
+// method exists primarily to satisfy the carrier.QuicSession interface for the
+// cached wrapper.
+func (s *quicSessionMux) TLSExporter() (wire.TLSExporter, error) {
+	return s.raw.TLSExporter()
 }
 
 func (s *quicSessionMux) ReceiveDatagram(context.Context) ([]byte, error) {
@@ -419,7 +432,7 @@ func (s *quicSessionMux) terminalError() error {
 	return err
 }
 
-func (s *quicSessionMux) register(flowID uint64) (*quicDatagramFlow, error) {
+func (s *quicSessionMux) register(flowID wire.FlowID) (*quicDatagramFlow, error) {
 	if flowID == 0 {
 		return nil, errors.New("nowhere: zero flow id")
 	}
@@ -444,18 +457,14 @@ func (s *quicSessionMux) register(flowID uint64) (*quicDatagramFlow, error) {
 	return flow, nil
 }
 
-func (s *quicSessionMux) unregister(flowID uint64, flow *quicDatagramFlow, cause error) {
+func (s *quicSessionMux) unregister(flowID wire.FlowID, flow *quicDatagramFlow, cause error) {
 	s.mu.Lock()
 	if s.flows[flowID] != flow {
 		s.mu.Unlock()
 		return
 	}
 	delete(s.flows, flowID)
-	for key := range s.assemblies {
-		if key.flowID == flowID {
-			delete(s.assemblies, key)
-		}
-	}
+	s.reassembler.RemoveFlow(flowID)
 	s.mu.Unlock()
 	flow.finish(cause)
 }
@@ -469,7 +478,7 @@ func (s *quicSessionMux) receiveLoop() {
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) && s.ctx.Err() == nil {
 				s.mu.Lock()
-				s.expireAssembliesLocked(time.Now())
+				s.reassembler.Expire(time.Now())
 				s.mu.Unlock()
 				continue
 			}
@@ -484,15 +493,28 @@ func (s *quicSessionMux) receiveLoop() {
 			continue
 		}
 		switch frame.Type {
-		case wire.UDPFrameData:
+		case wire.UDPFrameTypeData:
+			// Unfragmented DATA: deliver immediately (zero-length is legal).
+			s.deliver(frame.FlowID, frame.Payload)
+		case wire.UDPFrameTypeFragment:
 			s.handleFragment(frame.FlowID, frame.Fragment)
-		case wire.UDPFrameClose:
+		case wire.UDPFrameTypeClose:
 			s.closeFlow(frame.FlowID)
 		}
 	}
 }
 
-func (s *quicSessionMux) handleFragment(flowID uint64, fragment wire.UDPFragment) {
+// deliver hands an already-complete UDP payload to its flow if registered.
+func (s *quicSessionMux) deliver(flowID wire.FlowID, payload []byte) {
+	s.mu.Lock()
+	flow := s.flows[flowID]
+	s.mu.Unlock()
+	if flow != nil {
+		flow.enqueue(bytes.Clone(payload))
+	}
+}
+
+func (s *quicSessionMux) handleFragment(flowID wire.FlowID, fragment wire.UDPFragment) {
 	now := time.Now()
 	s.mu.Lock()
 	flow := s.flows[flowID]
@@ -500,80 +522,28 @@ func (s *quicSessionMux) handleFragment(flowID uint64, fragment wire.UDPFragment
 		s.mu.Unlock()
 		return
 	}
-	s.expireAssembliesLocked(now)
-	key := quicReassemblyKey{flowID: flowID, packetID: fragment.PacketID}
-	state, exists := s.assemblies[key]
-	fragment.Payload = bytes.Clone(fragment.Payload)
-	if !exists {
-		if len(s.assemblies) >= quicReassemblySlots {
-			s.evictOldestAssemblyLocked()
-		}
-		packet, result, err := udpassembly.NewPacket(fragment)
-		if err != nil {
-			s.mu.Unlock()
-			return
-		}
-		if result.Complete {
-			payload, err := packet.Assemble()
-			s.mu.Unlock()
-			if err == nil {
-				flow.enqueue(payload)
-			}
-			return
-		}
-		s.assemblies[key] = quicReassemblyPacket{packet: packet, createdAt: now}
-		s.mu.Unlock()
-		return
+	// Hand the fragment to the wire reassembler (it owns slot/byte/TTL limits,
+	// identical-duplicate handling, and metadata-conflict drops).
+	owned := wire.UDPFragment{
+		PacketID:      fragment.PacketID,
+		FragmentIndex: fragment.FragmentIndex,
+		FragmentCount: fragment.FragmentCount,
+		TotalLen:      fragment.TotalLen,
+		Payload:       bytes.Clone(fragment.Payload),
 	}
-
-	result, err := state.packet.Push(fragment)
-	if err != nil {
-		delete(s.assemblies, key)
-		s.mu.Unlock()
-		return
-	}
-	if !result.Complete {
-		s.mu.Unlock()
-		return
-	}
-	delete(s.assemblies, key)
-	payload, err := state.packet.Assemble()
+	outcome := s.reassembler.Push(flowID, owned, now)
 	s.mu.Unlock()
-	if err == nil {
-		flow.enqueue(payload)
+	if outcome.Done {
+		flow.enqueue(outcome.Payload)
 	}
 }
 
-func (s *quicSessionMux) closeFlow(flowID uint64) {
+func (s *quicSessionMux) closeFlow(flowID wire.FlowID) {
 	s.mu.Lock()
 	flow := s.flows[flowID]
 	s.mu.Unlock()
 	if flow != nil {
 		s.unregister(flowID, flow, io.EOF)
-	}
-}
-
-func (s *quicSessionMux) expireAssembliesLocked(now time.Time) {
-	for key, state := range s.assemblies {
-		if now.Sub(state.createdAt) >= quicReassemblyTTL {
-			delete(s.assemblies, key)
-		}
-	}
-}
-
-func (s *quicSessionMux) evictOldestAssemblyLocked() {
-	var oldestKey quicReassemblyKey
-	var oldestTime time.Time
-	found := false
-	for key, state := range s.assemblies {
-		if !found || state.createdAt.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = state.createdAt
-			found = true
-		}
-	}
-	if found {
-		delete(s.assemblies, oldestKey)
 	}
 }
 
@@ -622,8 +592,8 @@ func (s *quicSessionMux) close(cause error) {
 		for _, flow := range s.flows {
 			flows = append(flows, flow)
 		}
-		s.flows = make(map[uint64]*quicDatagramFlow)
-		s.assemblies = make(map[quicReassemblyKey]quicReassemblyPacket)
+		s.flows = make(map[wire.FlowID]*quicDatagramFlow)
+		s.reassembler.Clear()
 		s.closeQueue = nil
 		started := s.started
 		s.mu.Unlock()
@@ -642,7 +612,7 @@ var _ carrier.QuicSession = (*quicSessionMux)(nil)
 
 type quicDatagramFlow struct {
 	session *quicSessionMux
-	flowID  uint64
+	flowID  wire.FlowID
 	packets chan []byte
 	done    chan struct{}
 
@@ -652,7 +622,7 @@ type quicDatagramFlow struct {
 	finishOnce sync.Once
 }
 
-func newQUICDatagramFlow(session *quicSessionMux, flowID uint64) *quicDatagramFlow {
+func newQUICDatagramFlow(session *quicSessionMux, flowID wire.FlowID) *quicDatagramFlow {
 	return &quicDatagramFlow{
 		session: session,
 		flowID:  flowID,

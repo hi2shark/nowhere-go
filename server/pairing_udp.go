@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	nowuDataHeaderLen    = 4 + 1 + 8 + 4 + 1 + 1 + 2 // NOWU DATA frame header length
+	nowuDataHeaderLen    = wire.UDPFragmentHeaderLen
 	udpCloseWriteTimeout = 100 * time.Millisecond
 )
 
@@ -39,8 +39,8 @@ type udpDownlink interface {
 
 // pairedUDP is a completed UDP flow ready for routing.
 type pairedUDP struct {
-	FlowID      uint64
-	Target      string
+	FlowID      wire.FlowID
+	Target      wire.Target
 	Uplink      udpUplink
 	Downlink    udpDownlink
 	IdleTimeout time.Duration
@@ -51,23 +51,23 @@ type pairedUDP struct {
 
 // SubmitUDP caches or pairs a UDP half. Completing half returns *pairedUDP;
 // waiting half returns (nil, nil).
-func (r *claimRegistry) SubmitUDP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf) (*pairedUDP, error) {
+func (r *claimRegistry) SubmitUDP(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target wire.Target, half udpHalf) (*pairedUDP, error) {
 	return r.SubmitUDPWithSource(ctx, sessionID, header, target, half, nil, udpHalfTransport(header, half))
 }
 
 // SubmitUDPWithSource is SubmitUDP with optional source/transport diagnostics.
-func (r *claimRegistry) SubmitUDPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target string, half udpHalf, source net.Addr, transport string) (*pairedUDP, error) {
+func (r *claimRegistry) SubmitUDPWithSource(ctx context.Context, sessionID wire.SessionID, header wire.FlowHeader, target wire.Target, half udpHalf, source net.Addr, transport string) (*pairedUDP, error) {
 	return r.SubmitUDPWithGeneration(ctx, sessionID, r.CurrentGeneration(sessionID), false, header, target, half, source, transport)
 }
 
-func (r *claimRegistry) SubmitUDPWithGeneration(ctx context.Context, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target string, half udpHalf, source net.Addr, _ string) (*pairedUDP, error) {
+func (r *claimRegistry) SubmitUDPWithGeneration(ctx context.Context, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target wire.Target, half udpHalf, source net.Addr, _ string) (*pairedUDP, error) {
 	if header.Kind != wire.FlowKindUDP || header.FlowID == 0 {
 		return nil, fmt.Errorf("%w: invalid UDP flow header", ErrUnsupportedFlow)
 	}
 	carrier := header.Uplink
 	if header.Role == wire.FlowRoleAttach {
 		carrier = header.Downlink
-		target = ""
+		target = wire.Target{}
 	}
 	claim := flowClaim{
 		SessionID: sessionID, FlowID: header.FlowID, Generation: generation, BoundGeneration: boundGeneration,
@@ -115,7 +115,7 @@ func udpHalfTransport(header wire.FlowHeader, half udpHalf) string {
 		carrier = header.Downlink
 	}
 	switch carrier {
-	case wire.CarrierUDP:
+	case wire.CarrierQUIC:
 		if half.Role == wire.FlowRoleAttach {
 			return "quic"
 		}
@@ -154,28 +154,14 @@ func newTCPUDPUplink(conn net.Conn) udpUplink { return &tcpUDPUplink{conn: conn}
 func (u *tcpUDPUplink) ReadPacket() ([]byte, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	for {
-		frame, err := wire.ReadUOTFrame(u.conn)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil, io.EOF
-			}
-			return nil, err
-		}
-		switch frame.Kind {
-		case wire.UOTFrameData:
-			if frame.Payload == nil {
-				return []byte{}, nil
-			}
-			return frame.Payload, nil
-		case wire.UOTFrameClose:
-			return nil, io.EOF
-		case wire.UOTFrameReady, wire.UOTFrameReject:
-			return nil, wire.ErrInvalidUOTFrame
-		default:
-			return nil, wire.ErrInvalidUOTFrame
-		}
+	payload, err := wire.ReadUDPPacket(u.conn)
+	if err != nil {
+		return nil, err
 	}
+	if payload == nil {
+		return nil, io.EOF
+	}
+	return payload, nil
 }
 
 func (u *tcpUDPUplink) Close() error { return u.conn.Close() }
@@ -190,25 +176,16 @@ func newTCPUDPDownlink(conn net.Conn) udpDownlink { return &tcpUDPDownlink{conn:
 func (d *tcpUDPDownlink) WritePacket(p []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameData, Payload: p})
-	if err != nil {
-		return err
-	}
-	_, err = d.conn.Write(frame)
-	return err
+	return wire.WriteUDPPacket(d.conn, p)
 }
 
 func (d *tcpUDPDownlink) WriteClose() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	frame, err := wire.EncodeUOTFrame(wire.UOTFrame{Kind: wire.UOTFrameClose})
-	if err != nil {
-		return err
+	if closer, ok := d.conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
 	}
-	_ = d.conn.SetWriteDeadline(time.Now().Add(udpCloseWriteTimeout))
-	defer d.conn.SetWriteDeadline(time.Time{})
-	_, err = d.conn.Write(frame)
-	return err
+	return d.conn.Close()
 }
 
 func (d *tcpUDPDownlink) Close() error { return d.conn.Close() }
@@ -251,7 +228,7 @@ func (d *quicUDPDownlink) closeControl() (err error) {
 }
 
 type quicUDPDownlinkBound struct {
-	flowID          uint64
+	flowID          wire.FlowID
 	base            *quicUDPDownlink
 	maxDatagramSize func() int
 	nextPacketID    atomic.Uint32
@@ -387,7 +364,7 @@ func (d *quicUDPDownlinkBound) runTerminal(cause error, graceful, forced bool, f
 		if encodeErr != nil {
 			err = encodeErr
 		} else {
-			err = d.sendGracefulClose(frame, force)
+			err = d.sendGracefulClose(frame[:], force)
 		}
 	}
 	if d.base != nil {
@@ -449,7 +426,7 @@ func (d *quicUDPDownlinkBound) sendGate() chan struct{} {
 
 // pairedUDPConn exposes a pairedUDP as net.PacketConn.
 type pairedUDPConn struct {
-	flowID      uint64
+	flowID      wire.FlowID
 	dest        net.Addr
 	uplink      udpUplink
 	downlink    udpDownlink
@@ -471,7 +448,7 @@ func newPairedUDPConn(paired *pairedUDP) net.PacketConn {
 	if q, ok := down.(*quicUDPDownlink); ok {
 		down = &quicUDPDownlinkBound{flowID: paired.FlowID, base: q, maxDatagramSize: q.maxDatagramSize}
 	}
-	dest := parseTargetAddr(paired.Target)
+	dest := targetNetAddr(paired.Target)
 	conn := &pairedUDPConn{
 		flowID: paired.FlowID, dest: dest, uplink: paired.Uplink, downlink: down,
 		release: paired.Release, idleTimeout: paired.IdleTimeout,

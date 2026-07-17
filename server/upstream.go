@@ -5,14 +5,18 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"strconv"
 	"time"
+
+	"github.com/hi2shark/nowhere-go/wire"
 )
 
 // Upstream receives decoded Nowhere streams / packet flows after auth + framing.
 // On success the Upstream owns conn/pc lifecycle (including any CloseHandler in ctx).
 type Upstream interface {
-	HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target string, readiness FlowReadiness) error
-	HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target string, readiness FlowReadiness) error
+	HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target wire.Target, readiness FlowReadiness) error
+	HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target wire.Target, readiness FlowReadiness) error
 }
 
 type ctxKeyClose struct{}
@@ -56,8 +60,8 @@ func (u *DialUpstream) withTCPReadGrace(grace time.Duration) *DialUpstream {
 	return &clone
 }
 
-func (u *DialUpstream) HandleStream(ctx context.Context, conn net.Conn, _ net.Addr, target string, readiness FlowReadiness) error {
-	remote, err := u.Dialer.DialContext(ctx, "tcp", target)
+func (u *DialUpstream) HandleStream(ctx context.Context, conn net.Conn, _ net.Addr, target wire.Target, readiness FlowReadiness) error {
+	remote, err := u.Dialer.DialContext(ctx, "tcp", targetAddress(target))
 	if err != nil {
 		if readiness != nil {
 			return errors.Join(err, readiness.Reject(err))
@@ -77,8 +81,8 @@ func (u *DialUpstream) HandleStream(ctx context.Context, conn net.Conn, _ net.Ad
 	return nil
 }
 
-func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ net.Addr, target string, readiness FlowReadiness) error {
-	remote, err := u.Dialer.DialContext(ctx, "udp", target)
+func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ net.Addr, target wire.Target, readiness FlowReadiness) error {
+	remote, err := u.Dialer.DialContext(ctx, "udp", targetAddress(target))
 	if err != nil {
 		if readiness != nil {
 			return errors.Join(err, readiness.Reject(err))
@@ -94,7 +98,7 @@ func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ ne
 
 	destination := remote.RemoteAddr()
 	if destination == nil {
-		destination = parseTargetAddr(target)
+		destination = targetNetAddr(target)
 	}
 	done := make(chan error, 2)
 	go func() {
@@ -147,6 +151,21 @@ func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ ne
 		onClose(retErr)
 	}
 	return nil
+}
+
+func targetAddress(target wire.Target) string {
+	host := target.Host
+	if target.Type != wire.TargetTypeDomain {
+		host = target.Addr.String()
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(target.Port)))
+}
+
+func targetNetAddr(target wire.Target) net.Addr {
+	if target.Type != wire.TargetTypeDomain && target.Addr.IsValid() {
+		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(target.Addr, target.Port))
+	}
+	return &net.UDPAddr{}
 }
 
 func relay(a, b net.Conn, readGrace time.Duration) error {
