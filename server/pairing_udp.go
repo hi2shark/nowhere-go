@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	nowuDataHeaderLen    = wire.UDPFragmentHeaderLen
-	udpCloseWriteTimeout = 100 * time.Millisecond
+	nowuDataHeaderLen      = wire.UDPFragmentHeaderLen
+	defaultMaxDatagramSize = 1200
+	udpCloseWriteTimeout   = 100 * time.Millisecond
 )
 
 // udpHalf is one side of an asymmetric UDP flow.
@@ -196,17 +197,18 @@ type quicUDPDownlink struct {
 	control         net.Conn
 	send            func([]byte) error
 	maxDatagramSize func() int
+	probe           *carrierquic.DatagramProber
 	abort           func(error)
 	closeOnce       sync.Once
 }
 
-func newQUICUDPDownlink(control net.Conn, send func([]byte) error, maxDatagramSize func() int, abort ...func(error)) *quicUDPDownlink {
+func newQUICUDPDownlink(control net.Conn, send func([]byte) error, maxDatagramSize func() int, probe *carrierquic.DatagramProber, abort ...func(error)) *quicUDPDownlink {
 	var abortSession func(error)
 	if len(abort) > 0 {
 		abortSession = abort[0]
 	}
 	return &quicUDPDownlink{
-		control: control, send: send, maxDatagramSize: maxDatagramSize, abort: abortSession,
+		control: control, send: send, maxDatagramSize: maxDatagramSize, probe: probe, abort: abortSession,
 	}
 }
 
@@ -231,6 +233,7 @@ type quicUDPDownlinkBound struct {
 	flowID          wire.FlowID
 	base            *quicUDPDownlink
 	maxDatagramSize func() int
+	probe           *carrierquic.DatagramProber
 	nextPacketID    atomic.Uint32
 	stateMu         sync.Mutex
 	closed          bool
@@ -255,11 +258,15 @@ func (d *quicUDPDownlinkBound) WritePacket(p []byte) error {
 		return net.ErrClosed
 	}
 	currentMax := d.maxDatagramSize
-	if currentMax == nil {
+	if currentMax == nil && d.base != nil {
 		currentMax = d.base.maxDatagramSize
 	}
+	prober := d.probe
+	if prober == nil && d.base != nil {
+		prober = d.base.probe
+	}
 	for attempt := 0; attempt < 2; attempt++ {
-		max := 1200
+		max := defaultMaxDatagramSize
 		if currentMax != nil {
 			if size := currentMax(); size > nowuDataHeaderLen {
 				max = size
@@ -269,7 +276,14 @@ func (d *quicUDPDownlinkBound) WritePacket(p []byte) error {
 		if packetID == 0 {
 			packetID = d.nextPacketID.Add(1)
 		}
-		frames, err := wire.EncodeUDPDataFragments(d.flowID, packetID, p, max)
+		var frames [][]byte
+		var probeSize int
+		var err error
+		if prober != nil {
+			frames, probeSize, err = prober.EncodeUDPDataFragments(d.flowID, packetID, p)
+		} else {
+			frames, err = wire.EncodeUDPDataFragments(d.flowID, packetID, p, max)
+		}
 		if err != nil {
 			return err
 		}
@@ -280,12 +294,19 @@ func (d *quicUDPDownlinkBound) WritePacket(p []byte) error {
 				if !errors.As(err, &tooLarge) {
 					return err
 				}
+				if probeSize > 0 {
+					prober.NoteProbeFailure()
+					probeSize = 0
+				}
 				if attempt == 0 {
 					retry = true
 					break
 				}
 				return nil
 			}
+		}
+		if probeSize > 0 {
+			prober.NoteProbeSuccess(probeSize)
 		}
 		if !retry {
 			return nil
@@ -446,7 +467,7 @@ type pairedUDPConn struct {
 func newPairedUDPConn(paired *pairedUDP) net.PacketConn {
 	down := paired.Downlink
 	if q, ok := down.(*quicUDPDownlink); ok {
-		down = &quicUDPDownlinkBound{flowID: paired.FlowID, base: q, maxDatagramSize: q.maxDatagramSize}
+		down = &quicUDPDownlinkBound{flowID: paired.FlowID, base: q, maxDatagramSize: q.maxDatagramSize, probe: q.probe}
 	}
 	dest := targetNetAddr(paired.Target)
 	conn := &pairedUDPConn{

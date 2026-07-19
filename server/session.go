@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	carrierquic "github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
@@ -167,6 +168,7 @@ type portalSession struct {
 	pendingBytes    int
 	queuedBytes     int
 	budget          *byteBudget
+	prober          *carrierquic.DatagramProber
 	reassembler     *udpReassembler
 	expiryCancel    context.CancelFunc
 	expiryDone      chan struct{}
@@ -230,7 +232,7 @@ func newPortalSession(id wire.SessionID, conn QuicConn, handler *Handler, source
 		queueBytes = handler.config.limits.UDPQueueBytes
 	}
 	budget := &byteBudget{limit: queueBytes}
-	return &portalSession{
+	session := &portalSession{
 		ID:              id,
 		Conn:            conn,
 		Handler:         handler,
@@ -240,6 +242,8 @@ func newPortalSession(id wire.SessionID, conn QuicConn, handler *Handler, source
 		budget:          budget,
 		reassembler:     newUDPReassembler(nowuPartialLimit, nowuPartialTTL, budget),
 	}
+	session.prober = carrierquic.NewDatagramProber(session.transportMaxDatagramSize)
+	return session
 }
 
 func (s *portalSession) Close() {
@@ -340,7 +344,8 @@ func (s *portalSession) SendDatagram(b []byte) error {
 	return s.Conn.SendDatagram(b)
 }
 
-func (s *portalSession) maxDatagramSize() int {
+// transportMaxDatagramSize reads the live transport-reported DATAGRAM limit.
+func (s *portalSession) transportMaxDatagramSize() int {
 	if s != nil && s.Conn != nil {
 		if provider, ok := s.Conn.(interface{ CurrentMaxDatagramSize() int }); ok {
 			if size := provider.CurrentMaxDatagramSize(); size > nowuDataHeaderLen {
@@ -348,7 +353,17 @@ func (s *portalSession) maxDatagramSize() int {
 			}
 		}
 	}
-	return 1200
+	return defaultMaxDatagramSize
+}
+
+// maxDatagramSize is the prober-adjusted limit: the transport value raised by
+// successful optimistic probes, so large packets stop fragmenting once the
+// path proves it can carry them.
+func (s *portalSession) maxDatagramSize() int {
+	if s != nil && s.prober != nil {
+		return s.prober.MaxDatagramSize()
+	}
+	return s.transportMaxDatagramSize()
 }
 
 func (s *portalSession) getFlow(id wire.FlowID) *nowuFlow {
@@ -667,7 +682,7 @@ func (s *portalSession) handleUDPControl(ctx context.Context, conn net.Conn, sou
 		_ = conn.Close()
 		return err
 	case wire.FlowRoleAttach:
-		half.Downlink = newQUICUDPDownlink(conn, s.SendDatagram, s.maxDatagramSize, s.closeTransport)
+		half.Downlink = newQUICUDPDownlink(conn, s.SendDatagram, s.maxDatagramSize, s.prober, s.closeTransport)
 		return s.Handler.submitAndRouteUDPGeneration(ctx, source, s.ID, s.Generation, true, header, target, half)
 	case wire.FlowRoleDuplex:
 		flow := newNowuFlow(s, header.FlowID, target)
@@ -678,7 +693,7 @@ func (s *portalSession) handleUDPControl(ctx context.Context, conn net.Conn, sou
 			return err
 		}
 		half.Uplink = flow
-		half.Downlink = newQUICUDPDownlink(conn, s.SendDatagram, s.maxDatagramSize, s.closeTransport)
+		half.Downlink = newQUICUDPDownlink(conn, s.SendDatagram, s.maxDatagramSize, s.prober, s.closeTransport)
 		return s.Handler.submitAndRouteUDPGeneration(ctx, source, s.ID, s.Generation, true, header, target, half)
 	default:
 		_ = conn.Close()
@@ -914,17 +929,48 @@ func (f *nowuFlow) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 		return 0, deadlineError()
 	default:
 	}
-	packetID := f.nextPacketID.Add(1)
-	if packetID == 0 {
-		packetID = f.nextPacketID.Add(1)
-	}
-	frames, err := wire.EncodeUDPDataFragments(f.flowID, packetID, p, 1200)
-	if err != nil {
-		return 0, err
-	}
-	for _, frame := range frames {
-		if err := f.session.SendDatagram(frame); err != nil {
+	prober := f.session.prober
+	for attempt := 0; attempt < 2; attempt++ {
+		packetID := f.nextPacketID.Add(1)
+		if packetID == 0 {
+			packetID = f.nextPacketID.Add(1)
+		}
+		var frames [][]byte
+		var probeSize int
+		var err error
+		if prober != nil {
+			frames, probeSize, err = prober.EncodeUDPDataFragments(f.flowID, packetID, p)
+		} else {
+			frames, err = wire.EncodeUDPDataFragments(f.flowID, packetID, p, defaultMaxDatagramSize)
+		}
+		if err != nil {
 			return 0, err
+		}
+		retry := false
+		for _, frame := range frames {
+			if err := f.session.SendDatagram(frame); err != nil {
+				var tooLarge *carrierquic.DatagramTooLargeError
+				if !errors.As(err, &tooLarge) {
+					return 0, err
+				}
+				if probeSize > 0 {
+					prober.NoteProbeFailure()
+					probeSize = 0
+				}
+				if attempt == 0 {
+					retry = true
+					break
+				}
+				f.resetIdle()
+				return len(p), nil
+			}
+		}
+		if probeSize > 0 {
+			prober.NoteProbeSuccess(probeSize)
+		}
+		if !retry {
+			f.resetIdle()
+			return len(p), nil
 		}
 	}
 	f.resetIdle()

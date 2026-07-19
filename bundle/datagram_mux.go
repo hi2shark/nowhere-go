@@ -11,11 +11,12 @@ import (
 	"time"
 
 	"github.com/hi2shark/nowhere-go/carrier"
+	carrierquic "github.com/hi2shark/nowhere-go/carrier/quic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
 const (
-	quicDatagramFlowQueue = 64
+	quicDatagramFlowQueue = 1024
 	quicSendQueue         = 1
 	quicReassemblySweep   = time.Second
 )
@@ -212,6 +213,7 @@ type quicSessionMux struct {
 	mu          sync.Mutex
 	flows       map[wire.FlowID]*quicDatagramFlow
 	reassembler *wire.DatagramReassembler
+	prober      *carrierquic.DatagramProber
 	closeQueue  [][]byte
 	started     bool
 	closed      bool
@@ -247,6 +249,7 @@ func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession, authFra
 		closeReady:       make(chan struct{}, 1),
 		sendLoopDone:     make(chan struct{}),
 	}
+	session.prober = carrierquic.NewDatagramProber(raw.CurrentMaxDatagramSize)
 	go session.sendLoop()
 	return session
 }
@@ -378,7 +381,12 @@ func (s *quicSessionMux) ReceiveDatagram(context.Context) ([]byte, error) {
 	return nil, errManagedDatagramReceive
 }
 
-func (s *quicSessionMux) CurrentMaxDatagramSize() int { return s.raw.CurrentMaxDatagramSize() }
+func (s *quicSessionMux) CurrentMaxDatagramSize() int {
+	if s.prober != nil {
+		return s.prober.MaxDatagramSize()
+	}
+	return s.raw.CurrentMaxDatagramSize()
+}
 func (s *quicSessionMux) SendDatagram(frame []byte) error {
 	return s.sendDatagram(nil, frame, nil)
 }

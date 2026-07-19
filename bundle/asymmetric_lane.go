@@ -242,6 +242,19 @@ func newQUICSendHandle(prep *quicPreparedStream, flowID wire.FlowID) *qSessionHa
 	return newQSessionHandle(prep, nil, flowID, nil)
 }
 
+// datagramProber exposes the per-session DATAGRAM size prober when the handle
+// rides on a bundle-managed mux. Other carriers keep the transport default.
+func (h *qSessionHandle) datagramProber() *quic.DatagramProber {
+	if h == nil || h.quic == nil {
+		return nil
+	}
+	mux, ok := h.quic.session.(*quicSessionMux)
+	if !ok || mux == nil {
+		return nil
+	}
+	return mux.prober
+}
+
 func newQUICPacketConn(prep *quicPreparedStream, control net.Conn, target wire.Target) *quicPacketConn {
 	flowID := wire.FlowID(0)
 	if prep != nil {
@@ -279,12 +292,20 @@ func writeQUICUDPPacket(session *qSessionHandle, flowID wire.FlowID, nextPacketI
 	if err := session.stateError(); err != nil {
 		return 0, err
 	}
+	prober := session.datagramProber()
 	for attempt := 0; attempt < 2; attempt++ {
 		packetID := nextPacketID.Add(1)
 		if packetID == 0 {
 			packetID = nextPacketID.Add(1)
 		}
-		frames, err := wire.EncodeUDPDataFragments(flowID, packetID, payload, session.quic.MaxDatagramSize())
+		var frames [][]byte
+		var probeSize int
+		var err error
+		if prober != nil {
+			frames, probeSize, err = prober.EncodeUDPDataFragments(flowID, packetID, payload)
+		} else {
+			frames, err = wire.EncodeUDPDataFragments(flowID, packetID, payload, session.quic.MaxDatagramSize())
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -295,12 +316,19 @@ func writeQUICUDPPacket(session *qSessionHandle, flowID wire.FlowID, nextPacketI
 				if !errors.As(err, &tooLarge) {
 					return 0, err
 				}
+				if probeSize > 0 {
+					prober.NoteProbeFailure()
+					probeSize = 0
+				}
 				if attempt == 0 {
 					retry = true
 					break
 				}
 				return len(payload), nil
 			}
+		}
+		if probeSize > 0 {
+			prober.NoteProbeSuccess(probeSize)
 		}
 		if retry {
 			continue

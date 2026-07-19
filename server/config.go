@@ -32,7 +32,7 @@ const (
 	// DefaultUDPQueueBytes is the shared datagram queue byte budget per session.
 	DefaultUDPQueueBytes = 4 * 1024 * 1024
 	// DefaultUDPQueuePackets limits queued datagrams per flow.
-	DefaultUDPQueuePackets = 64
+	DefaultUDPQueuePackets = 1024
 	// DefaultActiveQUICSessions limits authenticated QUIC sessions.
 	DefaultActiveQUICSessions = 1024
 	// DefaultAuthenticatedTCPIdleConnections limits authenticated TCP halves awaiting use.
