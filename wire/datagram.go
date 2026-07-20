@@ -142,16 +142,6 @@ func EncodeUDPDataFragmentsYield(flowID FlowID, packetID uint32, payload []byte,
 	return yieldUDPFragments(flowID, packetID, payload, maxDatagramSize, yield)
 }
 
-// collectUDPFragments is the non-lazy collector used by EncodeUDPDataFragments.
-func collectUDPFragments(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int) ([][]byte, error) {
-	frames := make([][]byte, 0, 2)
-	err := yieldUDPFragments(flowID, packetID, payload, maxDatagramSize, func(frame []byte) error {
-		frames = append(frames, frame)
-		return nil
-	})
-	return frames, err
-}
-
 func yieldUDPFragments(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int, yield func([]byte) error) error {
 	capacity := maxDatagramSize - UDPFragmentHeaderLen
 	if capacity <= 0 {
