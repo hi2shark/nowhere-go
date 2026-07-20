@@ -33,6 +33,28 @@ func FuzzReadFlowHeader(f *testing.F) {
 	})
 }
 
+func FuzzTarget(f *testing.F) {
+	f.Add([]byte{TargetIPv4, 127, 0, 0, 1, 0, 80})
+	f.Add([]byte{TargetDomain, 3, 'a', '.', 'b', 1, 187})
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, input []byte) {
+		target, consumed, err := DecodeTarget(input)
+		if err != nil {
+			return
+		}
+		encoded, err := EncodeTarget(target)
+		if err != nil {
+			t.Fatalf("re-encode decoded target: %v", err)
+		}
+		if consumed <= 0 || consumed > len(input) {
+			t.Fatalf("invalid consumed length %d for %d bytes", consumed, len(input))
+		}
+		if !bytes.Equal(encoded, input[:consumed]) {
+			t.Fatalf("target round trip mismatch: got %x want %x", encoded, input[:consumed])
+		}
+	})
+}
+
 func FuzzDecodeUDPFrame(f *testing.F) {
 	f.Add([]byte{byte(UDPFrameTypeData), 0, 0, 0, 1})
 	f.Add([]byte{})
