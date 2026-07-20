@@ -64,3 +64,24 @@ jobs:
           go-version: stable
           cache: true
       - run: go test -race -shuffle=on -count=20 ./...
+
+  fuzz:
+    name: wire fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Auth
+        run: go test ./wire -run=^$ -fuzz=^FuzzValidateAuthFrame$ -fuzztime=30s
+      - name: Flow
+        run: go test ./wire -run=^$ -fuzz=^FuzzReadFlowHeader$ -fuzztime=30s
+      - name: Target
+        run: go test ./wire -run=^$ -fuzz=^FuzzTarget$ -fuzztime=30s
+      - name: UoT
+        run: go test ./wire -run=^$ -fuzz=^FuzzReadUDPPacket$ -fuzztime=30s
+      - name: DATAGRAM
+        run: go test ./wire -run=^$ -fuzz=^FuzzDecodeUDPFrame$ -fuzztime=30s
