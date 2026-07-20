@@ -1,6 +1,9 @@
 package server
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	// ErrInvalidConfig identifies rejected configuration input.
@@ -11,10 +14,13 @@ var (
 	ErrPairTimeout = errors.New("nowhere: flow pair timeout")
 	// ErrPairLimit identifies an exhausted pending-pair budget.
 	ErrPairLimit = errors.New("nowhere: pending flow pair limit reached")
-	// ErrCarrierMismatch identifies inconsistent metadata between flow halves.
-	ErrCarrierMismatch = errors.New("nowhere: flow carrier metadata mismatch")
+	// ErrCarrierMismatch identifies a FLOW header that disagrees with the
+	// physical carrier it arrived on.
+	ErrCarrierMismatch = errors.New("nowhere: flow physical carrier mismatch")
+	// ErrMetadataConflict identifies incompatible OPEN/ATTACH flow metadata.
+	ErrMetadataConflict = errors.New("nowhere: flow metadata conflict")
 	// ErrDuplicateHalf identifies two halves claiming the same role.
-	ErrDuplicateHalf = errors.New("nowhere: duplicate flow half")
+	ErrDuplicateHalf = fmt.Errorf("%w: duplicate flow half", ErrMetadataConflict)
 	// ErrSessionLimit identifies an exhausted active-session budget.
 	ErrSessionLimit = errors.New("nowhere: active session limit reached")
 	// ErrAdmissionLimit identifies an exhausted pre-authentication admission budget.

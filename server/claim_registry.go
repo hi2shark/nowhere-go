@@ -330,7 +330,7 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	if claim.BoundGeneration && claim.Generation == 0 {
 		err := fmt.Errorf("%w: zero bound generation", ErrCarrierMismatch)
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.SetupResultMetadataConflict)
+			_ = result.reject(wire.SetupResultInvalidRequest)
 		}
 		claim.close(err)
 		return nil, err
@@ -340,7 +340,7 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	}
 	if err := validateClaim(claim); err != nil {
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.SetupResultMetadataConflict)
+			_ = result.reject(setupFailureCode(err))
 		}
 		claim.close(err)
 		return nil, err
@@ -373,9 +373,9 @@ func (r *claimRegistry) Submit(ctx context.Context, claim flowClaim) (*claimedFl
 	registered := r.registered[sessionGeneration{sessionID: claim.SessionID, generation: claim.Generation}] > 0
 	if generation == 0 || claim.Generation != generation || (claim.BoundGeneration && !registered) {
 		r.mu.Unlock()
-		err := fmt.Errorf("%w: stale generation %d, current %d", ErrCarrierMismatch, claim.Generation, generation)
+		err := fmt.Errorf("%w: stale generation %d, current %d", ErrClosed, claim.Generation, generation)
 		if result := setupResultForClaim(claim); result != nil {
-			_ = result.reject(wire.SetupResultMetadataConflict)
+			_ = result.reject(wire.SetupResultSessionReplaced)
 		}
 		claim.close(err)
 		return nil, err
@@ -460,7 +460,7 @@ func (r *claimRegistry) submitExistingLocked(ctx context.Context, entry *claimEn
 	}
 
 	if entry.state == claimActive {
-		err := fmt.Errorf("%w: conflicting active flow claim", ErrCarrierMismatch)
+		err := fmt.Errorf("%w: conflicting active flow claim", ErrMetadataConflict)
 		result := setupResultForClaim(claim)
 		r.mu.Unlock()
 		if result != nil {
@@ -470,10 +470,15 @@ func (r *claimRegistry) submitExistingLocked(ctx context.Context, entry *claimEn
 		return nil, err
 	}
 
-	if entry.generation != claim.Generation || !entry.metadata.equal(claim.Metadata) ||
-		(entry.open != nil && claim.Role == wire.FlowRoleOpen) ||
-		(entry.attach != nil && claim.Role == wire.FlowRoleAttach) || claim.Role == wire.FlowRoleDuplex {
-		err := fmt.Errorf("%w: conflicting flow claim", ErrCarrierMismatch)
+	metadataConflict := entry.generation != claim.Generation || !entry.metadata.equal(claim.Metadata)
+	duplicateHalf := (entry.open != nil && claim.Role == wire.FlowRoleOpen) ||
+		(entry.attach != nil && claim.Role == wire.FlowRoleAttach) || claim.Role == wire.FlowRoleDuplex
+	if metadataConflict || duplicateHalf {
+		cause := ErrMetadataConflict
+		if duplicateHalf && !metadataConflict {
+			cause = ErrDuplicateHalf
+		}
+		err := fmt.Errorf("%w: conflicting flow claim", cause)
 		claims, selected, permit := r.failPendingLocked(entry, err, true)
 		currentResult := setupResultForClaim(claim)
 		if currentResult != nil && selected == nil {

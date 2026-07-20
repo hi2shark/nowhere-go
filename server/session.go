@@ -175,6 +175,14 @@ type portalSession struct {
 	closeDone       chan struct{}
 	closed          bool
 	transportOnce   sync.Once
+
+	dropMu        sync.Mutex
+	dropCount     int
+	dropBytes     uint64
+	dropFlowID    wire.FlowID
+	dropDirection string
+	dropReason    string
+	dropLastEmit  time.Time
 }
 
 // quicDatagramPump is the single owner of ReceiveDatagram for a QUIC
@@ -247,6 +255,10 @@ func newPortalSession(id wire.SessionID, conn QuicConn, handler *Handler, source
 }
 
 func (s *portalSession) Close() {
+	s.shutdownSession(markForcedTermination(ErrClosed))
+}
+
+func (s *portalSession) shutdownSession(cause error) {
 	if s == nil {
 		return
 	}
@@ -270,7 +282,9 @@ func (s *portalSession) Close() {
 	expiryDone := s.expiryDone
 	s.mu.Unlock()
 
-	cause := markForcedTermination(ErrClosed)
+	if cause == nil {
+		cause = markForcedTermination(ErrClosed)
+	}
 	if cancel != nil {
 		cancel(cause)
 	}
@@ -286,6 +300,7 @@ func (s *portalSession) Close() {
 	if s.reassembler != nil {
 		s.reassembler.Close()
 	}
+	s.flushUDPDrop()
 	s.closeTransport(cause)
 	close(done)
 }
@@ -342,6 +357,61 @@ func (s *portalSession) startReassemblyExpiry() {
 
 func (s *portalSession) SendDatagram(ctx context.Context, b []byte) error {
 	return s.Conn.SendDatagram(ctx, b)
+}
+
+func (s *portalSession) recordUDPDrop(flowID wire.FlowID, bytes int, direction, reason string) {
+	now := time.Now()
+	if s.Handler != nil && s.Handler.now != nil {
+		now = s.Handler.now()
+	}
+	s.dropMu.Lock()
+	s.dropCount++
+	if bytes > 0 {
+		s.dropBytes += uint64(bytes)
+	}
+	s.dropFlowID = flowID
+	s.dropDirection = direction
+	s.dropReason = reason
+	if s.dropLastEmit.IsZero() {
+		s.dropLastEmit = now
+		s.dropMu.Unlock()
+		return
+	}
+	if now.Sub(s.dropLastEmit) < time.Second {
+		s.dropMu.Unlock()
+		return
+	}
+	event := s.takeUDPDropLocked(now)
+	s.dropMu.Unlock()
+	if s.Handler != nil {
+		diagnostic.Emit(context.Background(), s.Handler.observer, event)
+	}
+}
+
+func (s *portalSession) flushUDPDrop() {
+	s.dropMu.Lock()
+	event := s.takeUDPDropLocked(time.Now())
+	s.dropMu.Unlock()
+	if event.Count > 0 && s.Handler != nil {
+		diagnostic.Emit(context.Background(), s.Handler.observer, event)
+	}
+}
+
+func (s *portalSession) takeUDPDropLocked(now time.Time) diagnostic.Event {
+	if s.dropCount == 0 {
+		return diagnostic.Event{}
+	}
+	event := diagnostic.Event{
+		Level: diagnostic.LevelWarn, Code: "udp_queue_drop_total",
+		Component: "server", Carrier: diagnostic.CarrierQUIC,
+		Source: s.Source, SessionID: s.ID, FlowID: s.dropFlowID,
+		State: s.dropDirection, Outcome: s.dropReason,
+		Count: s.dropCount, Bytes: s.dropBytes,
+	}
+	s.dropCount = 0
+	s.dropBytes = 0
+	s.dropLastEmit = now
+	return event
 }
 
 // transportMaxDatagramSize reads the live transport-reported DATAGRAM limit.
@@ -554,6 +624,13 @@ func (h *Handler) authenticateQuic(ctx context.Context, conn QuicConn) (*portalS
 	deadline := h.authDeadline()
 	authCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	handshake, err := conn.TLSHandshakeInfo()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := handshake.Validate(h.config.alpn); err != nil {
+		return nil, nil, err
+	}
 
 	type authResult struct {
 		id     wire.SessionID
@@ -568,14 +645,8 @@ func (h *Handler) authenticateQuic(ctx context.Context, conn QuicConn) (*portalS
 			return
 		}
 		_ = stream.SetReadDeadline(deadline)
-		exporter, err := conn.TLSExporter()
-		if err == nil {
-			id, err := wire.ReadAuthFrame(stream, h.config.credentials, wire.AuthTransportQUIC, exporter)
-			authCh <- authResult{id: id, stream: stream, err: err}
-			return
-		}
-		_ = stream.Close()
-		authCh <- authResult{err: err}
+		id, err := wire.ReadAuthFrame(stream, h.config.credentials, wire.AuthTransportQUIC, handshake.Exporter)
+		authCh <- authResult{id: id, stream: stream, err: err}
 	}()
 
 	select {
@@ -662,7 +733,7 @@ func (s *portalSession) handleStream(ctx context.Context, stream QuicStream, fir
 
 func (s *portalSession) handleUDPControl(ctx context.Context, conn net.Conn, source net.Addr, header wire.FlowHeader, target wire.Target, pending *pendingUDPControl) error {
 	if err := validateFlowTransport(header, wire.CarrierQUIC); err != nil {
-		s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, wire.SetupResultMetadataConflict)
+		s.Handler.rejectFlowSetupGeneration(conn, s.ID, s.Generation, true, header, setupFailureCode(err))
 		_ = conn.Close()
 		return err
 	}
@@ -710,27 +781,10 @@ func (s *portalSession) activateNOWUFlow(flow *nowuFlow, pending *pendingUDPCont
 		flow.mu.Unlock()
 		return err
 	}
-	queued := false
 	for _, frame := range frames {
-		outcome := flow.pushFragmentLocked(frame.Fragment)
-		if !outcome.Complete {
-			continue
-		}
-		release := outcome.Release
-		if release == nil {
-			release = func() {}
-		}
-		select {
-		case flow.waiter <- nowuQueuedPacket{payload: outcome.Packet, release: release}:
-			queued = true
-		default:
-			release()
-		}
+		s.recordUDPDrop(flow.flowID, len(frame.Fragment.Payload), "uplink", "before_ready")
 	}
 	flow.mu.Unlock()
-	if queued {
-		flow.resetIdle()
-	}
 	return nil
 }
 
@@ -770,10 +824,14 @@ func (s *portalSession) handleNowu(ctx context.Context, data []byte) {
 	case wire.UDPFrameTypeData:
 		if flow := s.getFlow(frame.FlowID); flow != nil {
 			flow.deliver(frame.Payload)
+		} else {
+			s.recordUDPDrop(frame.FlowID, len(frame.Payload), "uplink", "unknown_flow")
 		}
 	case wire.UDPFrameTypeFragment:
 		if flow := s.getFlow(frame.FlowID); flow != nil {
 			flow.deliverFragment(frame.Fragment)
+		} else {
+			s.recordUDPDrop(frame.FlowID, len(frame.Fragment.Payload), "uplink", "unknown_flow")
 		}
 	case wire.UDPFrameTypeClose:
 		if flow := s.getFlow(frame.FlowID); flow != nil {
@@ -795,6 +853,7 @@ type nowuFlow struct {
 	closed         bool
 	closeErr       error
 	closeOnce      sync.Once
+	ready          atomic.Bool
 	readDL         deadlineSignal
 	writeDL        deadlineSignal
 	idle           *time.Timer
@@ -826,6 +885,10 @@ const (
 )
 
 func (f *nowuFlow) deliverFragment(fragment wire.UDPFragment) {
+	if !f.ready.Load() {
+		f.session.recordUDPDrop(f.flowID, len(fragment.Payload), "uplink", "before_ready")
+		return
+	}
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
@@ -835,6 +898,8 @@ func (f *nowuFlow) deliverFragment(fragment wire.UDPFragment) {
 	f.mu.Unlock()
 	if outcome.Complete {
 		f.enqueue(outcome.Packet, outcome.Release)
+	} else if outcome.Dropped {
+		f.session.recordUDPDrop(f.flowID, len(fragment.Payload), "uplink", "reassembly")
 	}
 }
 
@@ -847,11 +912,21 @@ func (f *nowuFlow) pushFragmentLocked(fragment wire.UDPFragment) reassemblyOutco
 }
 
 func (f *nowuFlow) deliver(payload []byte) {
-	if !f.session.reserveQueueBytes(len(payload)) {
+	if !f.ready.Load() {
+		f.session.recordUDPDrop(f.flowID, len(payload), "uplink", "before_ready")
 		return
 	}
-	copyPayload := append([]byte(nil), payload...)
-	f.enqueue(copyPayload, func() { f.session.releaseQueueBytes(len(copyPayload)) })
+	if !f.session.reserveQueueBytes(len(payload)) {
+		f.session.recordUDPDrop(f.flowID, len(payload), "uplink", "byte_limit")
+		return
+	}
+	f.enqueue(payload, func() { f.session.releaseQueueBytes(len(payload)) })
+}
+
+func (f *nowuFlow) markReady() {
+	if f != nil {
+		f.ready.Store(true)
+	}
 }
 
 func (f *nowuFlow) enqueue(payload []byte, release func()) {
@@ -872,6 +947,7 @@ func (f *nowuFlow) enqueue(payload []byte, release func()) {
 	default:
 		f.mu.Unlock()
 		release()
+		f.session.recordUDPDrop(f.flowID, len(payload), "uplink", "queue_full")
 	}
 }
 
@@ -930,48 +1006,44 @@ func (f *nowuFlow) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	default:
 	}
 	prober := f.session.prober
-	for attempt := 0; attempt < 2; attempt++ {
+	if prober == nil {
+		prober = carrierquic.NewDatagramProber(func() int { return defaultMaxDatagramSize })
+	}
+	nextPacketID := func() uint32 {
 		packetID := f.nextPacketID.Add(1)
 		if packetID == 0 {
 			packetID = f.nextPacketID.Add(1)
 		}
-		var frames [][]byte
-		var probeSize int
-		var err error
-		if prober != nil {
-			frames, probeSize, err = prober.EncodeUDPDataFragments(f.flowID, packetID, p)
-		} else {
-			frames, err = wire.EncodeUDPDataFragments(f.flowID, packetID, p, defaultMaxDatagramSize)
+		return packetID
+	}
+	ctx := context.Background()
+	cancel := func() {}
+	if done := f.session.Conn.Context().Done(); done != nil {
+		ctx, cancel = context.WithCancel(f.session.Conn.Context())
+	}
+	if deadline := f.writeDL.wait(); deadline != nil {
+		parent := ctx
+		var deadlineCancel context.CancelFunc
+		ctx, deadlineCancel = context.WithCancel(parent)
+		previousCancel := cancel
+		cancel = func() {
+			deadlineCancel()
+			previousCancel()
 		}
-		if err != nil {
-			return 0, err
-		}
-		retry := false
-		for _, frame := range frames {
-			if err := f.session.SendDatagram(frame); err != nil {
-				var tooLarge *carrierquic.DatagramTooLargeError
-				if !errors.As(err, &tooLarge) {
-					return 0, err
-				}
-				if probeSize > 0 {
-					prober.NoteProbeFailure()
-					probeSize = 0
-				}
-				if attempt == 0 {
-					retry = true
-					break
-				}
-				f.resetIdle()
-				return len(p), nil
+		go func() {
+			select {
+			case <-deadline:
+				deadlineCancel()
+			case <-ctx.Done():
 			}
+		}()
+	}
+	defer cancel()
+	if err := carrierquic.SendUDPData(ctx, f.session.SendDatagram, prober, f.flowID, nextPacketID, p); err != nil {
+		if ctx.Err() != nil && f.writeDL.wait() != nil {
+			return 0, deadlineError()
 		}
-		if probeSize > 0 {
-			prober.NoteProbeSuccess(probeSize)
-		}
-		if !retry {
-			f.resetIdle()
-			return len(p), nil
-		}
+		return 0, err
 	}
 	f.resetIdle()
 	return len(p), nil

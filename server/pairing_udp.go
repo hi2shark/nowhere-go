@@ -357,34 +357,34 @@ func (d *quicUDPDownlinkBound) runTerminal(cause error, graceful, forced bool, f
 		}
 	}
 	if d.base != nil {
-		if closeErr := d.base.Close(); err == nil {
-			err = closeErr
-		}
+		err = errors.Join(err, d.base.Close())
 	}
 	return err
 }
 
 func (d *quicUDPDownlinkBound) sendGracefulClose(frame []byte, force <-chan struct{}) error {
-	sendDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), udpCloseWriteTimeout)
+	defer cancel()
+	done := make(chan struct{})
 	go func() {
-		sendDone <- d.base.send(frame)
-	}()
-	timer := time.NewTimer(udpCloseWriteTimeout)
-	defer timer.Stop()
-	select {
-	case err := <-sendDone:
-		return err
-	case <-force:
-		if d.base.abort != nil {
-			d.base.abort(markForcedTermination(ErrClosed))
+		select {
+		case <-force:
+			if d.base.abort != nil {
+				d.base.abort(markForcedTermination(ErrClosed))
+			}
+			cancel()
+		case <-ctx.Done():
+		case <-done:
 		}
-		return <-sendDone
-	case <-timer.C:
+	}()
+	err := d.base.send(ctx, frame)
+	close(done)
+	if errors.Is(err, context.DeadlineExceeded) && d.base.abort != nil {
 		if d.base.abort != nil {
 			d.base.abort(markForcedTermination(context.DeadlineExceeded))
 		}
-		return <-sendDone
 	}
+	return err
 }
 
 func (d *quicUDPDownlinkBound) forceTerminalLocked() {

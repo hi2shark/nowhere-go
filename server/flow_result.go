@@ -176,7 +176,9 @@ func setupFailureCode(err error) wire.SetupResult {
 		return setupErr.code
 	}
 	switch {
-	case errors.Is(err, ErrCarrierMismatch), errors.Is(err, ErrDuplicateHalf):
+	case errors.Is(err, ErrCarrierMismatch), errors.Is(err, wire.ErrInvalidFlowHeader), errors.Is(err, wire.ErrInvalidFrame):
+		return wire.SetupResultInvalidRequest
+	case errors.Is(err, ErrMetadataConflict), errors.Is(err, ErrDuplicateHalf):
 		return wire.SetupResultMetadataConflict
 	case errors.Is(err, ErrPairTimeout):
 		return wire.SetupResultPairTimeout

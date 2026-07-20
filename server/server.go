@@ -66,6 +66,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 	handshake := options.TLSHandshake
 	if handshake == nil && options.TLS != nil {
 		tlsConfig := options.TLS.Clone()
+		tlsConfig.MinVersion = tls.VersionTLS13
+		tlsConfig.MaxVersion = tls.VersionTLS13
+		tlsConfig.NextProtos = []string{options.Config.ALPN()}
 		handshake = func(ctx context.Context, raw net.Conn) (wire.HandshakedConn, error) {
 			conn := tls.Server(raw, tlsConfig.Clone())
 			if err := conn.HandshakeContext(ctx); err != nil {
@@ -79,7 +82,12 @@ func NewServer(options ServerOptions) (*Server, error) {
 			}
 			var exporter wire.TLSExporter
 			copy(exporter[:], exported)
-			return wire.HandshakedConn{Conn: conn, Exporter: exporter}, nil
+			return wire.HandshakedConn{
+				Conn: conn,
+				TLSHandshakeInfo: wire.TLSHandshakeInfo{
+					TLSVersion: state.Version, NegotiatedALPN: state.NegotiatedProtocol, Exporter: exporter,
+				},
+			}, nil
 		}
 	}
 	return &Server{

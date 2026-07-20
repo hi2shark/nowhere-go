@@ -48,7 +48,10 @@ func TestServeQUICAuthFailureReportsQUICCarrier(t *testing.T) {
 
 	var exporter wire.TLSExporter
 	exporter[0] = 5
-	auth := wire.EncodeAuthFrame(invalidCredentials, wire.AuthTransportQUIC, exporter, wire.SessionID{1})
+	auth, err := wire.EncodeAuthFrame(invalidCredentials, wire.AuthTransportQUIC, exporter, wire.SessionID{1})
+	if err != nil {
+		t.Fatal(err)
+	}
 	conn := newV15QUICConn(exporter, &v15QuicStream{Reader: bytes.NewReader(auth[:])})
 	if err := handler.ServeQUIC(context.Background(), conn); err == nil {
 		t.Fatal("ServeQUIC accepted invalid authentication")
@@ -80,7 +83,10 @@ func TestServeQUICAuthOnlyNotifiesAdapterAfterAuthentication(t *testing.T) {
 	var exporter wire.TLSExporter
 	exporter[0] = 7
 	id := wire.SessionID{1}
-	auth := wire.EncodeAuthFrame(credentials, wire.AuthTransportQUIC, exporter, id)
+	auth, err := wire.EncodeAuthFrame(credentials, wire.AuthTransportQUIC, exporter, id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	conn := newV15QUICConn(exporter, &v15QuicStream{Reader: bytes.NewReader(auth[:])})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -120,7 +126,10 @@ func TestServeQUICRoutesFirstFlowCoalescedWithAuthentication(t *testing.T) {
 	var exporter wire.TLSExporter
 	exporter[0] = 9
 	id := wire.SessionID{2}
-	auth := wire.EncodeAuthFrame(credentials, wire.AuthTransportQUIC, exporter, id)
+	auth, err := wire.EncodeAuthFrame(credentials, wire.AuthTransportQUIC, exporter, id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	target, err := wire.NewIPTarget(netip.MustParseAddr("192.0.2.1"), 443)
 	if err != nil {
 		t.Fatal(err)
@@ -206,8 +215,12 @@ func newV15QUICConn(exporter wire.TLSExporter, stream QuicStream) *v15QUICConn {
 	return &v15QUICConn{exporter: exporter, stream: stream, ctx: ctx, cancel: cancel, authenticated: make(chan struct{})}
 }
 
-func (c *v15QUICConn) TLSExporter() (wire.TLSExporter, error) { return c.exporter, nil }
-func (c *v15QUICConn) MarkAuthenticated()                     { c.authOnce.Do(func() { close(c.authenticated) }) }
+func (c *v15QUICConn) TLSHandshakeInfo() (wire.TLSHandshakeInfo, error) {
+	return wire.TLSHandshakeInfo{
+		TLSVersion: 0x0304, NegotiatedALPN: wire.DefaultALPN, Exporter: c.exporter,
+	}, nil
+}
+func (c *v15QUICConn) MarkAuthenticated() { c.authOnce.Do(func() { close(c.authenticated) }) }
 func (c *v15QUICConn) AcceptStream(ctx context.Context) (QuicStream, error) {
 	if c.accepted.CompareAndSwap(false, true) {
 		return c.stream, nil
@@ -227,12 +240,12 @@ func (c *v15QUICConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 		return nil, net.ErrClosed
 	}
 }
-func (c *v15QUICConn) SendDatagram([]byte) error           { return nil }
-func (c *v15QUICConn) CloseWithError(uint64, string) error { c.cancel(); return nil }
-func (c *v15QUICConn) Close() error                        { c.cancel(); return nil }
-func (c *v15QUICConn) Context() context.Context            { return c.ctx }
-func (*v15QUICConn) LocalAddr() net.Addr                   { return &net.UDPAddr{} }
-func (*v15QUICConn) RemoteAddr() net.Addr                  { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+func (c *v15QUICConn) SendDatagram(context.Context, []byte) error { return nil }
+func (c *v15QUICConn) CloseWithError(uint64, string) error        { c.cancel(); return nil }
+func (c *v15QUICConn) Close() error                               { c.cancel(); return nil }
+func (c *v15QUICConn) Context() context.Context                   { return c.ctx }
+func (*v15QUICConn) LocalAddr() net.Addr                          { return &net.UDPAddr{} }
+func (*v15QUICConn) RemoteAddr() net.Addr                         { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)} }
 
 type v15QuicStream struct {
 	*bytes.Reader

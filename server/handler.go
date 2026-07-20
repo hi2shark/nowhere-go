@@ -240,6 +240,11 @@ func (h *Handler) ServeTCP(ctx context.Context, raw net.Conn, source net.Addr, h
 		life.Close(err)
 		return err
 	}
+	if err := handshaked.TLSHandshakeInfo.Validate(h.config.alpn); err != nil {
+		life.Close(err)
+		h.emit(taskCtx, classifyTLSHandshake(err), "tls_handshake_failed", source, "", wire.SessionID{}, 0, err)
+		return report(err)
+	}
 	transportMu.Lock()
 	transport = handshaked.Conn
 	transportMu.Unlock()
@@ -323,7 +328,7 @@ func (h *Handler) handleFlow(ctx context.Context, conn net.Conn, source net.Addr
 
 func (h *Handler) handleFlowGeneration(ctx context.Context, conn net.Conn, source net.Addr, sessionID wire.SessionID, generation uint64, boundGeneration bool, header wire.FlowHeader, target wire.Target, physical wire.Carrier) error {
 	if err := validateFlowTransport(header, physical); err != nil {
-		h.rejectFlowSetupGeneration(conn, sessionID, generation, boundGeneration, header, wire.SetupResultMetadataConflict)
+		h.rejectFlowSetupGeneration(conn, sessionID, generation, boundGeneration, header, setupFailureCode(err))
 		closeConnWithError(conn, err)
 		return err
 	}

@@ -32,7 +32,7 @@ const (
 	// DefaultUDPQueueBytes is the shared datagram queue byte budget per session.
 	DefaultUDPQueueBytes = 4 * 1024 * 1024
 	// DefaultUDPQueuePackets limits queued datagrams per flow.
-	DefaultUDPQueuePackets = 1024
+	DefaultUDPQueuePackets = 64
 	// DefaultActiveQUICSessions limits authenticated QUIC sessions.
 	DefaultActiveQUICSessions = 1024
 	// DefaultAuthenticatedTCPIdleConnections limits authenticated TCP halves awaiting use.
@@ -76,25 +76,31 @@ type Limits struct {
 // ConfigOptions builds an immutable server Config.
 type ConfigOptions struct {
 	Credentials *wire.Credentials
-	Networks []Network
-	Timeouts Timeouts
-	Limits   Limits
+	ALPN        string
+	Networks    []Network
+	Timeouts    Timeouts
+	Limits      Limits
 }
 
 // Config is normalized and immutable after construction.
 type Config struct {
 	credentials *wire.Credentials
-	networks  []Network
-	enableTCP bool
-	enableUDP bool
-	timeouts  Timeouts
-	limits    Limits
+	alpn        string
+	networks    []Network
+	enableTCP   bool
+	enableUDP   bool
+	timeouts    Timeouts
+	limits      Limits
 }
 
 // NewConfig validates and normalizes server configuration.
 func NewConfig(options ConfigOptions) (*Config, error) {
 	if options.Credentials == nil {
 		return nil, fmt.Errorf("%w: nil credentials", ErrInvalidConfig)
+	}
+	alpn, err := wire.NormalizeALPN(options.ALPN)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	timeouts, err := normalizeTimeouts(options.Timeouts)
 	if err != nil {
@@ -111,9 +117,10 @@ func NewConfig(options ConfigOptions) (*Config, error) {
 	seen := make(map[Network]struct{}, len(networks))
 	cfg := &Config{
 		credentials: options.Credentials,
-		timeouts: timeouts,
-		limits:   limits,
-		networks: append([]Network(nil), networks...),
+		alpn:        alpn,
+		timeouts:    timeouts,
+		limits:      limits,
+		networks:    append([]Network(nil), networks...),
 	}
 	for _, network := range networks {
 		if _, exists := seen[network]; exists {
@@ -227,6 +234,14 @@ func (c *Config) Credentials() *wire.Credentials {
 		return nil
 	}
 	return c.credentials
+}
+
+// ALPN returns the normalized single expected application protocol.
+func (c *Config) ALPN() string {
+	if c == nil {
+		return wire.DefaultALPN
+	}
+	return c.alpn
 }
 
 // Timeouts returns the normalized timeout values by value.
