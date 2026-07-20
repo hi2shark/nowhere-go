@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -113,11 +114,13 @@ func (c *splicedConn) Read(p []byte) (int, error)  { return c.reader.Read(p) }
 func (c *splicedConn) Write(p []byte) (int, error) { return c.writer.Write(p) }
 func (c *splicedConn) Close() (err error) {
 	c.once.Do(func() {
+		var errs []error
 		for _, closer := range c.closer {
-			if closeErr := closer.Close(); closeErr != nil && err == nil {
-				err = closeErr
+			if closeErr := closer.Close(); closeErr != nil {
+				errs = append(errs, closeErr)
 			}
 		}
+		err = errors.Join(errs...)
 		if c.onClose != nil {
 			c.onClose()
 		}

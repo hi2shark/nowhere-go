@@ -40,16 +40,12 @@ func (w *uotStreamWriter) WritePacket(p []byte) (int, error) {
 	if w.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	frame, err := wire.EncodeUDPPacket(p)
-	if err != nil {
-		return 0, err
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	if _, err := w.conn.Write(frame); err != nil {
+	if err := wire.WriteUDPPacket(w.conn, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -234,6 +230,10 @@ func newQUICDatagramHandle(prep *quicPreparedStream, flowID wire.FlowID) (*qSess
 	flow, err := session.register(flowID)
 	if err != nil {
 		return nil, err
+	}
+	if !flow.markReady() {
+		session.unregister(flowID, flow, net.ErrClosed)
+		return nil, net.ErrClosed
 	}
 	return newQSessionHandle(prep, flow, flowID, nil), nil
 }
@@ -486,12 +486,8 @@ func (h *qSessionHandle) closePacket() error {
 	if h.quic == nil || h.quic.session == nil || h.flowID == 0 {
 		return nil
 	}
-	closeFrame, err := wire.EncodeUDPClose(h.flowID)
-	if err != nil {
-		return err
-	}
 	if session, ok := h.quic.session.(*quicSessionMux); ok {
-		return session.enqueueClose(closeFrame[:])
+		return session.enqueueClose(h.flowID)
 	}
 	return nil
 }

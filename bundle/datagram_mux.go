@@ -1,7 +1,6 @@
 package bundle
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,11 +11,12 @@ import (
 
 	"github.com/hi2shark/nowhere-go/carrier"
 	carrierquic "github.com/hi2shark/nowhere-go/carrier/quic"
+	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
 const (
-	quicDatagramFlowQueue = 1024
+	quicDatagramFlowQueue = 64
 	quicSendQueue         = 1
 	quicReassemblySweep   = time.Second
 )
@@ -33,6 +33,49 @@ const (
 var errManagedDatagramReceive = errors.New("nowhere: quic datagram receive is bundle managed")
 var errQUICAuthenticationAborted = errors.New("nowhere: first quic stream closed before authentication")
 
+// ErrPendingCloseLimit prevents unbounded reliable CLOSE retention. Overflow
+// invalidates the physical QUIC session so the peer cannot retain leaked flows.
+var ErrPendingCloseLimit = errors.New("nowhere: pending QUIC CLOSE limit exceeded")
+
+type quicByteBudget struct {
+	mu    sync.Mutex
+	limit int
+	used  int
+}
+
+func (b *quicByteBudget) reserve(count int) (wire.ByteReservation, bool) {
+	if b == nil || count < 0 {
+		return nil, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit > 0 && b.used+count > b.limit {
+		return nil, false
+	}
+	b.used += count
+	return &quicByteReservation{budget: b, count: count}, true
+}
+
+type quicByteReservation struct {
+	once   sync.Once
+	budget *quicByteBudget
+	count  int
+}
+
+func (r *quicByteReservation) Release() {
+	if r == nil {
+		return
+	}
+	r.once.Do(func() {
+		r.budget.mu.Lock()
+		r.budget.used -= r.count
+		if r.budget.used < 0 {
+			r.budget.used = 0
+		}
+		r.budget.mu.Unlock()
+	})
+}
+
 const (
 	quicSendQueued uint32 = iota
 	quicSendStarted
@@ -42,6 +85,7 @@ const (
 
 type quicSendRequest struct {
 	owner  *qSessionHandle
+	ctx    context.Context
 	frame  []byte
 	result chan error
 	state  atomic.Uint32
@@ -69,19 +113,31 @@ type quicAuthFrameBuilder func(ctx context.Context, session carrier.QuicSession)
 // quicMuxBackend owns one receive loop and one bounded send owner for every
 // physical QUIC session returned by the injected backend.
 type quicMuxBackend struct {
-	backend carrier.QuicBackend
-	auth    quicAuthFrameBuilder
+	backend          carrier.QuicBackend
+	auth             quicAuthFrameBuilder
+	maxUDPQueueBytes int
+	maxPendingCloses int
+	observer         diagnostic.Observer
 
 	mu       sync.Mutex
 	sessions map[carrier.QuicSession]*quicSessionMux
 	closed   bool
 }
 
-func newQUICMuxBackend(backend carrier.QuicBackend, auth quicAuthFrameBuilder) *quicMuxBackend {
+func newQUICMuxBackend(
+	backend carrier.QuicBackend,
+	auth quicAuthFrameBuilder,
+	maxUDPQueueBytes int,
+	maxPendingCloses int,
+	observer diagnostic.Observer,
+) *quicMuxBackend {
 	return &quicMuxBackend{
-		backend:  backend,
-		auth:     auth,
-		sessions: make(map[carrier.QuicSession]*quicSessionMux),
+		backend:          backend,
+		auth:             auth,
+		maxUDPQueueBytes: maxUDPQueueBytes,
+		maxPendingCloses: maxPendingCloses,
+		observer:         observer,
+		sessions:         make(map[carrier.QuicSession]*quicSessionMux),
 	}
 }
 
@@ -128,7 +184,12 @@ func (b *quicMuxBackend) AcquireSession(ctx context.Context) (carrier.QuicSessio
 			b.backend.InvalidateSession(raw)
 			return nil, authErr
 		}
-		session := newQUICSessionMux(b, raw, authFrame)
+		session, err := newQUICSessionMux(b, raw, authFrame)
+		if err != nil {
+			b.mu.Unlock()
+			b.backend.InvalidateSession(raw)
+			return nil, err
+		}
 		b.sessions[raw] = session
 		b.mu.Unlock()
 		return session, nil
@@ -210,14 +271,19 @@ type quicSessionMux struct {
 	authErr      error
 	authDone     chan struct{}
 
-	mu          sync.Mutex
-	flows       map[wire.FlowID]*quicDatagramFlow
-	reassembler *wire.DatagramReassembler
-	prober      *carrierquic.DatagramProber
-	closeQueue  [][]byte
-	started     bool
-	closed      bool
-	cause       error
+	mu               sync.Mutex
+	flows            map[wire.FlowID]*quicDatagramFlow
+	reassembler      *wire.DatagramReassembler
+	budget           *quicByteBudget
+	prober           *carrierquic.DatagramProber
+	closeQueue       []wire.FlowID
+	closeSet         map[wire.FlowID]struct{}
+	maxPendingCloses int
+	observer         diagnostic.Observer
+	sessionID        wire.SessionID
+	started          bool
+	closed           bool
+	cause            error
 
 	startOnce        sync.Once
 	closeOnce        sync.Once
@@ -229,10 +295,23 @@ type quicSessionMux struct {
 	sendQueue        chan *quicSendRequest
 	closeReady       chan struct{}
 	sendLoopDone     chan struct{}
+
+	dropMu        sync.Mutex
+	dropCount     int
+	dropBytes     uint64
+	dropFlowID    wire.FlowID
+	dropDirection string
+	dropReason    string
+	dropLastEmit  time.Time
 }
 
-func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession, authFrame wire.AuthFrame) *quicSessionMux {
+func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession, authFrame wire.AuthFrame) (*quicSessionMux, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	reassembler, err := wire.NewDatagramReassembler(wire.DefaultReassemblyConfig())
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	session := &quicSessionMux{
 		backend:          backend,
 		raw:              raw,
@@ -241,7 +320,11 @@ func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession, authFra
 		authFrame:        authFrame,
 		authDone:         make(chan struct{}),
 		flows:            make(map[wire.FlowID]*quicDatagramFlow),
-		reassembler:      wire.NewDatagramReassembler(wire.DefaultReassemblyConfig()),
+		reassembler:      reassembler,
+		budget:           &quicByteBudget{limit: backend.maxUDPQueueBytes},
+		closeSet:         make(map[wire.FlowID]struct{}),
+		maxPendingCloses: backend.maxPendingCloses,
+		observer:         backend.observer,
 		invalidationDone: make(chan struct{}),
 		done:             make(chan struct{}),
 		loopDone:         make(chan struct{}),
@@ -249,9 +332,10 @@ func newQUICSessionMux(backend *quicMuxBackend, raw carrier.QuicSession, authFra
 		closeReady:       make(chan struct{}, 1),
 		sendLoopDone:     make(chan struct{}),
 	}
+	copy(session.sessionID[:], authFrame[:wire.SessionIDLen])
 	session.prober = carrierquic.NewDatagramProber(raw.CurrentMaxDatagramSize)
 	go session.sendLoop()
-	return session
+	return session, nil
 }
 
 func (s *quicSessionMux) PrepareStream(ctx context.Context) (carrier.QuicPreparedStream, error) {
@@ -369,12 +453,12 @@ func (p *quicAuthPreparedStream) Close() error {
 	return err
 }
 
-// TLSExporter delegates to the underlying physical session. The bundle reads
-// it once during authentication (before the mux caches the session), so this
+// TLSHandshakeInfo delegates to the underlying physical session. The bundle
+// reads it once during authentication (before the mux caches the session), so this
 // method exists primarily to satisfy the carrier.QuicSession interface for the
 // cached wrapper.
-func (s *quicSessionMux) TLSExporter() (wire.TLSExporter, error) {
-	return s.raw.TLSExporter()
+func (s *quicSessionMux) TLSHandshakeInfo() (wire.TLSHandshakeInfo, error) {
+	return s.raw.TLSHandshakeInfo()
 }
 
 func (s *quicSessionMux) ReceiveDatagram(context.Context) ([]byte, error) {
@@ -387,13 +471,16 @@ func (s *quicSessionMux) CurrentMaxDatagramSize() int {
 	}
 	return s.raw.CurrentMaxDatagramSize()
 }
-func (s *quicSessionMux) SendDatagram(frame []byte) error {
-	return s.sendDatagram(nil, frame, nil)
+func (s *quicSessionMux) SendDatagram(ctx context.Context, frame []byte) error {
+	return s.sendDatagram(ctx, nil, frame, nil)
 }
 func (s *quicSessionMux) LocalAddr() net.Addr { return s.raw.LocalAddr() }
 
-func (s *quicSessionMux) sendDatagram(owner *qSessionHandle, frame []byte, deadline *datagramDeadline) error {
-	request := &quicSendRequest{owner: owner, frame: frame, result: make(chan error, 1)}
+func (s *quicSessionMux) sendDatagram(ctx context.Context, owner *qSessionHandle, frame []byte, deadline *datagramDeadline) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	request := &quicSendRequest{owner: owner, ctx: ctx, frame: frame, result: make(chan error, 1)}
 	var ownerDone <-chan struct{}
 	if owner != nil {
 		ownerDone = owner.doneSignal()
@@ -413,6 +500,8 @@ func (s *quicSessionMux) sendDatagram(owner *qSessionHandle, frame []byte, deadl
 			continue
 		case <-ownerDone:
 			return net.ErrClosed
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-s.done:
 			return s.terminalError()
 		}
@@ -469,6 +558,11 @@ queued:
 				return <-request.result
 			}
 			return net.ErrClosed
+		case <-ctx.Done():
+			if request.cancel() {
+				return ctx.Err()
+			}
+			return ctx.Err()
 		case <-s.done:
 			request.cancel()
 			return s.terminalError()
@@ -476,7 +570,10 @@ queued:
 	}
 }
 
-func (s *quicSessionMux) enqueueClose(frame []byte) error {
+func (s *quicSessionMux) enqueueClose(flowID wire.FlowID) error {
+	if flowID == 0 {
+		return errors.New("nowhere: zero CLOSE flow id")
+	}
 	s.mu.Lock()
 	if s.closed {
 		cause := s.cause
@@ -486,7 +583,17 @@ func (s *quicSessionMux) enqueueClose(frame []byte) error {
 		}
 		return cause
 	}
-	s.closeQueue = append(s.closeQueue, bytes.Clone(frame))
+	if _, exists := s.closeSet[flowID]; exists {
+		s.mu.Unlock()
+		return nil
+	}
+	if len(s.closeQueue) >= s.maxPendingCloses {
+		s.mu.Unlock()
+		s.invalidateRaw(ErrPendingCloseLimit)
+		return ErrPendingCloseLimit
+	}
+	s.closeSet[flowID] = struct{}{}
+	s.closeQueue = append(s.closeQueue, flowID)
 	select {
 	case s.closeReady <- struct{}{}:
 	default:
@@ -495,22 +602,22 @@ func (s *quicSessionMux) enqueueClose(frame []byte) error {
 	return nil
 }
 
-func (s *quicSessionMux) popClose() []byte {
+func (s *quicSessionMux) popClose() (wire.FlowID, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.closeQueue) == 0 {
-		return nil
+		return 0, false
 	}
-	frame := s.closeQueue[0]
-	s.closeQueue[0] = nil
+	flowID := s.closeQueue[0]
 	s.closeQueue = s.closeQueue[1:]
+	delete(s.closeSet, flowID)
 	if len(s.closeQueue) > 0 {
 		select {
 		case s.closeReady <- struct{}{}:
 		default:
 		}
 	}
-	return frame
+	return flowID, true
 }
 
 func (s *quicSessionMux) sendLoop() {
@@ -521,8 +628,16 @@ func (s *quicSessionMux) sendLoop() {
 			return
 		default:
 		}
-		if frame := s.popClose(); frame != nil {
-			if err := s.raw.SendDatagram(frame); err != nil {
+		if flowID, ok := s.popClose(); ok {
+			frame, encodeErr := wire.EncodeUDPClose(flowID)
+			if encodeErr != nil {
+				s.invalidateRaw(encodeErr)
+				return
+			}
+			ctx, cancel := context.WithTimeout(s.ctx, 100*time.Millisecond)
+			err := s.raw.SendDatagram(ctx, frame[:])
+			cancel()
+			if err != nil {
 				select {
 				case <-s.done:
 					return
@@ -544,7 +659,7 @@ func (s *quicSessionMux) sendLoop() {
 					continue
 				}
 			}
-			request.finish(s.raw.SendDatagram(request.frame))
+			request.finish(s.raw.SendDatagram(request.ctx, request.frame))
 		case <-s.closeReady:
 		case <-s.done:
 			return
@@ -560,6 +675,56 @@ func (s *quicSessionMux) terminalError() error {
 		return net.ErrClosed
 	}
 	return err
+}
+
+func (s *quicSessionMux) recordUDPDrop(flowID wire.FlowID, bytes int, direction, reason string) {
+	now := time.Now()
+	s.dropMu.Lock()
+	s.dropCount++
+	if bytes > 0 {
+		s.dropBytes += uint64(bytes)
+	}
+	s.dropFlowID = flowID
+	s.dropDirection = direction
+	s.dropReason = reason
+	if s.dropLastEmit.IsZero() {
+		s.dropLastEmit = now
+		s.dropMu.Unlock()
+		return
+	}
+	if now.Sub(s.dropLastEmit) < time.Second {
+		s.dropMu.Unlock()
+		return
+	}
+	event := s.takeUDPDropLocked(now)
+	s.dropMu.Unlock()
+	diagnostic.Emit(context.Background(), s.observer, event)
+}
+
+func (s *quicSessionMux) flushUDPDrop() {
+	s.dropMu.Lock()
+	event := s.takeUDPDropLocked(time.Now())
+	s.dropMu.Unlock()
+	if event.Count > 0 {
+		diagnostic.Emit(context.Background(), s.observer, event)
+	}
+}
+
+func (s *quicSessionMux) takeUDPDropLocked(now time.Time) diagnostic.Event {
+	if s.dropCount == 0 {
+		return diagnostic.Event{}
+	}
+	event := diagnostic.Event{
+		Level: diagnostic.LevelWarn, Code: "udp_queue_drop_total",
+		Component: "bundle", Carrier: diagnostic.CarrierQUIC,
+		SessionID: s.sessionID, FlowID: s.dropFlowID,
+		State: s.dropDirection, Outcome: s.dropReason,
+		Count: s.dropCount, Bytes: s.dropBytes,
+	}
+	s.dropCount = 0
+	s.dropBytes = 0
+	s.dropLastEmit = now
+	return event
 }
 
 func (s *quicSessionMux) register(flowID wire.FlowID) (*quicDatagramFlow, error) {
@@ -639,8 +804,21 @@ func (s *quicSessionMux) deliver(flowID wire.FlowID, payload []byte) {
 	s.mu.Lock()
 	flow := s.flows[flowID]
 	s.mu.Unlock()
-	if flow != nil {
-		flow.enqueue(bytes.Clone(payload))
+	if flow == nil {
+		s.recordUDPDrop(flowID, len(payload), "downlink", "unknown_flow")
+		return
+	}
+	if !flow.ready() {
+		s.recordUDPDrop(flowID, len(payload), "downlink", "before_ready")
+		return
+	}
+	reservation, ok := s.budget.reserve(len(payload))
+	if !ok {
+		s.recordUDPDrop(flowID, len(payload), "downlink", "byte_limit")
+		return
+	}
+	if !flow.enqueue(payload, reservation) {
+		s.recordUDPDrop(flowID, len(payload), "downlink", "queue_full")
 	}
 }
 
@@ -648,23 +826,26 @@ func (s *quicSessionMux) handleFragment(flowID wire.FlowID, fragment wire.UDPFra
 	now := time.Now()
 	s.mu.Lock()
 	flow := s.flows[flowID]
-	if flow == nil || s.closed {
-		s.mu.Unlock()
+	closed := s.closed
+	s.mu.Unlock()
+	if flow == nil || closed {
+		s.recordUDPDrop(flowID, len(fragment.Payload), "downlink", "unknown_flow")
+		return
+	}
+	if !flow.ready() {
+		s.recordUDPDrop(flowID, len(fragment.Payload), "downlink", "before_ready")
 		return
 	}
 	// Hand the fragment to the wire reassembler (it owns slot/byte/TTL limits,
 	// identical-duplicate handling, and metadata-conflict drops).
-	owned := wire.UDPFragment{
-		PacketID:      fragment.PacketID,
-		FragmentIndex: fragment.FragmentIndex,
-		FragmentCount: fragment.FragmentCount,
-		TotalLen:      fragment.TotalLen,
-		Payload:       bytes.Clone(fragment.Payload),
+	outcome := s.reassembler.PushWithReservation(flowID, fragment, now, s.budget.reserve)
+	if outcome.DropReason != wire.ReassemblyDropNone {
+		s.recordUDPDrop(flowID, len(fragment.Payload), "downlink", outcome.DropReason.String())
 	}
-	outcome := s.reassembler.Push(flowID, owned, now)
-	s.mu.Unlock()
 	if outcome.Done {
-		flow.enqueue(outcome.Payload)
+		if !flow.enqueue(outcome.Payload, outcome.Reservation) {
+			s.recordUDPDrop(flowID, len(outcome.Payload), "downlink", "queue_full")
+		}
 	}
 }
 
@@ -726,6 +907,7 @@ func (s *quicSessionMux) close(cause error) {
 		s.flows = make(map[wire.FlowID]*quicDatagramFlow)
 		s.reassembler.Clear()
 		s.closeQueue = nil
+		s.closeSet = make(map[wire.FlowID]struct{})
 		started := s.started
 		s.mu.Unlock()
 
@@ -735,6 +917,7 @@ func (s *quicSessionMux) close(cause error) {
 		for _, flow := range flows {
 			flow.finish(cause)
 		}
+		s.flushUDPDrop()
 		close(s.done)
 	})
 }
@@ -742,15 +925,28 @@ func (s *quicSessionMux) close(cause error) {
 var _ carrier.QuicSession = (*quicSessionMux)(nil)
 var _ carrier.QuicPreparedStream = (*quicAuthPreparedStream)(nil)
 
+type quicQueuedPacket struct {
+	payload     []byte
+	reservation wire.ByteReservation
+}
+
+type quicDatagramFlowState uint8
+
+const (
+	quicFlowRegistered quicDatagramFlowState = iota
+	quicFlowReady
+	quicFlowClosed
+)
+
 type quicDatagramFlow struct {
 	session *quicSessionMux
 	flowID  wire.FlowID
-	packets chan []byte
+	packets chan quicQueuedPacket
 	done    chan struct{}
 
 	mu         sync.Mutex
 	cause      error
-	closed     bool
+	state      quicDatagramFlowState
 	finishOnce sync.Once
 }
 
@@ -758,20 +954,44 @@ func newQUICDatagramFlow(session *quicSessionMux, flowID wire.FlowID) *quicDatag
 	return &quicDatagramFlow{
 		session: session,
 		flowID:  flowID,
-		packets: make(chan []byte, quicDatagramFlowQueue),
+		packets: make(chan quicQueuedPacket, quicDatagramFlowQueue),
 		done:    make(chan struct{}),
 	}
 }
 
-func (f *quicDatagramFlow) enqueue(payload []byte) {
+func (f *quicDatagramFlow) markReady() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
-		return
+	if f.state != quicFlowRegistered {
+		return false
+	}
+	f.state = quicFlowReady
+	return true
+}
+
+func (f *quicDatagramFlow) ready() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state == quicFlowReady
+}
+
+func (f *quicDatagramFlow) enqueue(payload []byte, reservation wire.ByteReservation) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state != quicFlowReady {
+		if reservation != nil {
+			reservation.Release()
+		}
+		return false
 	}
 	select {
-	case f.packets <- payload:
+	case f.packets <- quicQueuedPacket{payload: payload, reservation: reservation}:
+		return true
 	default:
+		if reservation != nil {
+			reservation.Release()
+		}
+		return false
 	}
 }
 
@@ -785,27 +1005,36 @@ func (f *quicDatagramFlow) readPacket(ctx context.Context, deadline *datagramDea
 			return nil, errDatagramDeadline
 		}
 		select {
-		case payload := <-f.packets:
+		case packet := <-f.packets:
+			if packet.reservation != nil {
+				packet.reservation.Release()
+			}
 			if deadline.expired() {
 				return nil, errDatagramDeadline
 			}
-			return payload, nil
+			return packet.payload, nil
 		default:
 		}
 		select {
-		case payload := <-f.packets:
+		case packet := <-f.packets:
+			if packet.reservation != nil {
+				packet.reservation.Release()
+			}
 			if deadline.expired() {
 				return nil, errDatagramDeadline
 			}
-			return payload, nil
+			return packet.payload, nil
 		case <-deadlineSignal:
 			continue
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-f.done:
 			select {
-			case payload := <-f.packets:
-				return payload, nil
+			case packet := <-f.packets:
+				if packet.reservation != nil {
+					packet.reservation.Release()
+				}
+				return packet.payload, nil
 			default:
 			}
 			return nil, f.closeCause()
@@ -828,10 +1057,20 @@ func (f *quicDatagramFlow) finish(cause error) {
 			cause = io.EOF
 		}
 		f.mu.Lock()
-		f.closed = true
+		f.state = quicFlowClosed
 		f.cause = cause
 		close(f.done)
 		f.mu.Unlock()
+		for {
+			select {
+			case packet := <-f.packets:
+				if packet.reservation != nil {
+					packet.reservation.Release()
+				}
+			default:
+				return
+			}
+		}
 	})
 }
 

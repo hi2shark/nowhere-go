@@ -12,7 +12,6 @@ import (
 
 	"github.com/hi2shark/nowhere-go/carrier"
 	nquic "github.com/hi2shark/nowhere-go/carrier/quic"
-	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/wire"
 )
 
@@ -195,35 +194,13 @@ func TestBundleInvalidatesQUICSessionWhenExporterFails(t *testing.T) {
 
 func newV15QUICOnlyBundle(t *testing.T, credentials *wire.Credentials, backend carrier.QuicBackend) *CarrierBundle {
 	t.Helper()
-	tcp, err := tcptls.NewConfig(tcptls.TCPOptions{
-		Address:     "portal.example:443",
-		Credentials: credentials,
-		Transport:   wire.AuthTransportTLSTCP,
-		Dialer:      v15NoopTCPDialer{},
-		TLSDialer:   v15NoopTLSDialer{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	b, err := NewCarrierBundle(BundleOptions{
-		TCP: tcp, QUIC: backend, Up: wire.CarrierQUIC, Down: wire.CarrierQUIC,
+		Credentials: credentials, QUIC: backend, Up: wire.CarrierQUIC, Down: wire.CarrierQUIC,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
-}
-
-type v15NoopTCPDialer struct{}
-
-func (v15NoopTCPDialer) DialContext(context.Context, string, string) (net.Conn, error) {
-	return nil, errors.New("unused")
-}
-
-type v15NoopTLSDialer struct{}
-
-func (v15NoopTLSDialer) DialTLSConn(context.Context, net.Conn) (wire.HandshakedConn, error) {
-	return wire.HandshakedConn{}, errors.New("unused")
 }
 
 type v15AuthBackend struct {
@@ -246,7 +223,11 @@ type v15AuthSession struct {
 	prepareCalls int
 }
 
-func (s *v15AuthSession) TLSExporter() (wire.TLSExporter, error) { return s.exporter, s.exporterErr }
+func (s *v15AuthSession) TLSHandshakeInfo() (wire.TLSHandshakeInfo, error) {
+	return wire.TLSHandshakeInfo{
+		TLSVersion: 0x0304, NegotiatedALPN: wire.DefaultALPN, Exporter: s.exporter,
+	}, s.exporterErr
+}
 func (s *v15AuthSession) PrepareStream(context.Context) (nquic.PreparedStream, error) {
 	s.prepareCalls++
 	return &s.stream, nil
@@ -255,9 +236,9 @@ func (*v15AuthSession) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
-func (*v15AuthSession) CurrentMaxDatagramSize() int { return 1200 }
-func (*v15AuthSession) SendDatagram([]byte) error   { return nil }
-func (*v15AuthSession) LocalAddr() net.Addr         { return &net.UDPAddr{} }
+func (*v15AuthSession) CurrentMaxDatagramSize() int                { return 1200 }
+func (*v15AuthSession) SendDatagram(context.Context, []byte) error { return nil }
+func (*v15AuthSession) LocalAddr() net.Addr                        { return &net.UDPAddr{} }
 
 type v15AuthPreparedStream struct {
 	mu          sync.Mutex

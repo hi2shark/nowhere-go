@@ -114,7 +114,6 @@ func (b *CarrierBundle) openTCPUDP(
 		dest:     target,
 		uplink:   uplink,
 		downlink: downlink,
-		upCloser: tcpConn,
 		dnCloser: quicConn,
 	}, nil
 }
@@ -206,7 +205,6 @@ func (b *CarrierBundle) openUDPTCP(
 		uplink:   uplink,
 		downlink: downlink,
 		upCloser: quicConn,
-		dnCloser: tcpConn,
 	}, nil
 }
 
@@ -233,15 +231,16 @@ func (a *asymmetricPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 func (a *asymmetricPacketConn) Close() error {
-	_ = a.uplink.ClosePacket()
+	var errs []error
+	errs = append(errs, a.uplink.ClosePacket())
 	if a.upCloser != nil {
-		_ = a.upCloser.Close()
+		errs = append(errs, a.upCloser.Close())
 	}
-	_ = a.downlink.ClosePacket()
+	errs = append(errs, a.downlink.ClosePacket())
 	if a.dnCloser != nil {
-		_ = a.dnCloser.Close()
+		errs = append(errs, a.dnCloser.Close())
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (a *asymmetricPacketConn) LocalAddr() net.Addr { return &net.UDPAddr{} }

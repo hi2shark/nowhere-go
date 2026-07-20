@@ -5,31 +5,51 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 
 	"github.com/hi2shark/nowhere-go/carrier"
 	"github.com/hi2shark/nowhere-go/carrier/tcptls"
+	"github.com/hi2shark/nowhere-go/diagnostic"
 	"github.com/hi2shark/nowhere-go/wire"
+)
+
+const (
+	// DefaultMaxUDPQueueBytes is the shared DATA/reassembly budget per physical
+	// QUIC session.
+	DefaultMaxUDPQueueBytes = 4 * 1024 * 1024
+	// DefaultMaxPendingCloses bounds reliable, de-duplicated CLOSE delivery.
+	DefaultMaxPendingCloses = 1024
 )
 
 // BundleOptions builds an immutable carrier bundle.
 type BundleOptions struct {
-	QUIC           carrier.QuicBackend
-	TCP            *tcptls.Config
-	PoolSize       int
-	PrewarmOnStart bool
-	Up             wire.Carrier
-	Down           wire.Carrier
+	QUIC             carrier.QuicBackend
+	TCP              *tcptls.Config
+	Credentials      *wire.Credentials
+	ALPN             string
+	Observer         diagnostic.Observer
+	PoolSize         int
+	MaxUDPQueueBytes int
+	MaxPendingCloses int
+	PrewarmOnStart   bool
+	Up               wire.Carrier
+	Down             wire.Carrier
 }
 
 type bundleConfig struct {
-	quic           carrier.QuicBackend
-	tcp            *tcptls.Config
-	poolSize       int
-	prewarmOnStart bool
-	up             wire.Carrier
-	down           wire.Carrier
+	quic             carrier.QuicBackend
+	tcp              *tcptls.Config
+	credentials      *wire.Credentials
+	alpn             string
+	observer         diagnostic.Observer
+	poolSize         int
+	maxUDPQueueBytes int
+	maxPendingCloses int
+	prewarmOnStart   bool
+	up               wire.Carrier
+	down             wire.Carrier
 }
 
 // CarrierBundle shares one session id across carriers and allocates flow ids.
@@ -56,24 +76,57 @@ type CarrierBundle struct {
 	// nextFlowID is the next 1.5 flow id to hand out. Flow ids are uint32 and
 	// must skip zero; the allocator wraps within the nonzero u32 space.
 	nextFlowID atomic.Uint32
+
+	lifecycleMu sync.Mutex
+	closed      bool
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 // NewCarrierBundle validates options and returns an isolated session bundle.
 func NewCarrierBundle(options BundleOptions) (*CarrierBundle, error) {
-	if options.TCP == nil {
-		return nil, errors.New("nowhere: nil TCP carrier config")
-	}
 	if !isCarrier(options.Up) || !isCarrier(options.Down) {
 		return nil, errors.New("nowhere: invalid carrier selector")
+	}
+	if options.Credentials == nil {
+		return nil, wire.ErrMissingCredentials
+	}
+	alpn, err := wire.NormalizeALPN(options.ALPN)
+	if err != nil {
+		return nil, err
+	}
+	usesTCP := options.Up == wire.CarrierTLSTCP || options.Down == wire.CarrierTLSTCP
+	usesQUIC := options.Up == wire.CarrierQUIC || options.Down == wire.CarrierQUIC
+	if usesTCP && options.TCP == nil {
+		return nil, errors.New("nowhere: nil TCP carrier config")
 	}
 	if (options.Up == wire.CarrierQUIC || options.Down == wire.CarrierQUIC) && options.QUIC == nil {
 		return nil, errors.New("nowhere: nil quic backend")
 	}
-	if options.PoolSize < 0 {
-		return nil, errors.New("nowhere: negative pool size")
+	if options.PoolSize < 0 || options.PoolSize > tcptls.MaxPoolSize {
+		return nil, errors.New("nowhere: TCP pool size outside 0..256")
+	}
+	if usesQUIC && options.PoolSize != 0 {
+		return nil, errors.New("nowhere: pool must be zero when either carrier is QUIC")
+	}
+	maxUDPQueueBytes := options.MaxUDPQueueBytes
+	if maxUDPQueueBytes == 0 {
+		maxUDPQueueBytes = DefaultMaxUDPQueueBytes
+	}
+	if maxUDPQueueBytes < 0 {
+		return nil, errors.New("nowhere: negative UDP queue byte limit")
+	}
+	maxPendingCloses := options.MaxPendingCloses
+	if maxPendingCloses == 0 {
+		maxPendingCloses = DefaultMaxPendingCloses
+	}
+	if maxPendingCloses < 0 {
+		return nil, errors.New("nowhere: negative pending CLOSE limit")
 	}
 	bundle := &CarrierBundle{cfg: bundleConfig{
-		quic: options.QUIC, tcp: options.TCP, poolSize: options.PoolSize,
+		quic: options.QUIC, tcp: options.TCP, credentials: options.Credentials,
+		alpn: alpn, observer: options.Observer, poolSize: options.PoolSize,
+		maxUDPQueueBytes: maxUDPQueueBytes, maxPendingCloses: maxPendingCloses,
 		prewarmOnStart: options.PrewarmOnStart,
 		up:             options.Up, down: options.Down,
 	}}
@@ -108,7 +161,9 @@ func (b *CarrierBundle) SessionID() (wire.SessionID, error) {
 		// TCP carrier needs the session id to bind the auth frame to the
 		// bundle identity. The QUIC backend is NOT told the session id; the
 		// bundle reads the exporter and writes the auth frame itself.
-		b.cfg.tcp = b.cfg.tcp.WithSessionID(b.sessionID)
+		if b.cfg.tcp != nil {
+			b.cfg.tcp, b.sessionIDErr = b.cfg.tcp.BindSession(b.cfg.credentials, b.sessionID, b.cfg.alpn)
+		}
 	})
 	return b.sessionID, b.sessionIDErr
 }
@@ -158,20 +213,21 @@ func (b *CarrierBundle) quicClient() (carrier.QuicBackend, error) {
 		return nil, nil
 	}
 	b.quicOnce.Do(func() {
+		b.lifecycleMu.Lock()
+		defer b.lifecycleMu.Unlock()
+		if b.closed {
+			b.quicErr = net.ErrClosed
+			return
+		}
 		sessionID, err := b.SessionID()
 		if err != nil {
 			b.quicErr = err
 			return
 		}
-		creds := b.cfg.tcp.Credentials()
-		if creds == nil {
-			b.quicErr = errors.New("nowhere: missing credentials for quic auth")
-			return
-		}
 		auth := func(_ context.Context, session carrier.QuicSession) (wire.AuthFrame, error) {
-			return buildQUICAuthFrame(session, creds, wire.AuthTransportQUIC, sessionID)
+			return buildQUICAuthFrame(session, b.cfg.credentials, b.cfg.alpn, sessionID)
 		}
-		b.quic = newQUICMuxBackend(b.cfg.quic, auth)
+		b.quic = newQUICMuxBackend(b.cfg.quic, auth, b.cfg.maxUDPQueueBytes, b.cfg.maxPendingCloses, b.cfg.observer)
 	})
 	return b.quic, b.quicErr
 }
@@ -179,15 +235,18 @@ func (b *CarrierBundle) quicClient() (carrier.QuicBackend, error) {
 // buildQUICAuthFrame binds one physical QUIC session to the bundle identity.
 // The returned frame is retained by the mux and prepended atomically when the
 // first flow commits its setup bytes on the first stream.
-func buildQUICAuthFrame(session carrier.QuicSession, creds *wire.Credentials, transport wire.AuthTransport, sessionID wire.SessionID) (wire.AuthFrame, error) {
+func buildQUICAuthFrame(session carrier.QuicSession, creds *wire.Credentials, alpn string, sessionID wire.SessionID) (wire.AuthFrame, error) {
 	if session == nil {
 		return wire.AuthFrame{}, errors.New("nowhere: nil quic session")
 	}
-	exporter, err := session.TLSExporter()
+	handshake, err := session.TLSHandshakeInfo()
 	if err != nil {
 		return wire.AuthFrame{}, err
 	}
-	return wire.EncodeAuthFrame(creds, transport, exporter, sessionID), nil
+	if err := handshake.Validate(alpn); err != nil {
+		return wire.AuthFrame{}, err
+	}
+	return wire.EncodeAuthFrame(creds, wire.AuthTransportQUIC, handshake.Exporter, sessionID)
 }
 
 func (b *CarrierBundle) tcpPool() (*tcptls.TCPPool, error) {
@@ -195,14 +254,18 @@ func (b *CarrierBundle) tcpPool() (*tcptls.TCPPool, error) {
 		return nil, nil
 	}
 	b.tcpOnce.Do(func() {
+		b.lifecycleMu.Lock()
+		defer b.lifecycleMu.Unlock()
+		if b.closed {
+			b.tcpErr = net.ErrClosed
+			return
+		}
 		if _, err := b.SessionID(); err != nil {
 			b.tcpErr = err
 			return
 		}
-		b.tcp = tcptls.NewTCPPool(b.cfg.tcp, b.cfg.poolSize)
-		if b.tcp == nil {
-			b.tcpErr = errors.New("nowhere: invalid TCP pool config")
-		} else if b.cfg.prewarmOnStart && b.cfg.poolSize > 0 {
+		b.tcp, b.tcpErr = tcptls.NewTCPPool(b.cfg.tcp, b.cfg.poolSize)
+		if b.tcpErr == nil && b.cfg.prewarmOnStart && b.cfg.poolSize > 0 {
 			b.tcp.Prewarm()
 		}
 	})
@@ -210,14 +273,24 @@ func (b *CarrierBundle) tcpPool() (*tcptls.TCPPool, error) {
 }
 
 // Close releases initialized carrier resources. It is safe on a nil bundle.
-func (b *CarrierBundle) Close() {
+func (b *CarrierBundle) Close() error {
 	if b == nil {
-		return
+		return nil
 	}
-	if client, _ := b.quicClient(); client != nil {
-		client.Close()
-	}
-	if pool, _ := b.tcpPool(); pool != nil {
-		pool.Close()
-	}
+	b.closeOnce.Do(func() {
+		b.lifecycleMu.Lock()
+		b.closed = true
+		quicClient := b.quic
+		tcpPool := b.tcp
+		b.lifecycleMu.Unlock()
+		var errs []error
+		if quicClient != nil {
+			errs = append(errs, quicClient.Close())
+		}
+		if tcpPool != nil {
+			errs = append(errs, tcpPool.Close())
+		}
+		b.closeErr = errors.Join(errs...)
+	})
+	return b.closeErr
 }

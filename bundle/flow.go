@@ -193,13 +193,14 @@ type splicedConn struct {
 
 func (c *splicedConn) Read(p []byte) (int, error)  { return c.reader.Read(p) }
 func (c *splicedConn) Write(p []byte) (int, error) { return c.writer.Write(p) }
-func (c *splicedConn) Close() (err error) {
+func (c *splicedConn) Close() error {
+	var errs []error
 	for _, cl := range c.closer {
 		if e := cl.Close(); e != nil {
-			err = e
+			errs = append(errs, e)
 		}
 	}
-	return
+	return errors.Join(errs...)
 }
 func (c *splicedConn) LocalAddr() net.Addr  { return c.local }
 func (c *splicedConn) RemoteAddr() net.Addr { return c.remote }
@@ -275,18 +276,18 @@ func carrierTransportName(c wire.Carrier) string {
 	}
 }
 
-// closeAll closes a list of io.Closers, returning the first error.
+// closeAll closes a list of io.Closers and preserves every close failure.
 func closeAll(closers ...io.Closer) error {
-	var first error
+	var errs []error
 	for _, cl := range closers {
 		if cl == nil {
 			continue
 		}
-		if err := cl.Close(); err != nil && first == nil {
-			first = err
+		if err := cl.Close(); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return first
+	return errors.Join(errs...)
 }
 
 // fmtError wraps an error with context.
