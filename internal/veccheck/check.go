@@ -296,6 +296,13 @@ func checkDatagram(path string) (int, error) {
 			if decoded.Type != wire.UDPFrameTypeData || decoded.FlowID != uint32(flowID) {
 				return 0, fmt.Errorf("%s: decoded fields mismatch", tc.ID)
 			}
+			reencoded, err := encodeUDPFrame(decoded)
+			if err != nil {
+				return 0, fmt.Errorf("%s: re-encode: %w", tc.ID, err)
+			}
+			if !bytes.Equal(reencoded, want) {
+				return 0, fmt.Errorf("%s: data decode/re-encode mismatch", tc.ID)
+			}
 		case "close":
 			got, err := wire.EncodeUDPClose(uint32(flowID))
 			if err != nil {
@@ -308,6 +315,17 @@ func checkDatagram(path string) (int, error) {
 			if !bytes.Equal(got[:], want) {
 				return 0, fmt.Errorf("%s: close frame mismatch\n got %x\nwant %x", tc.ID, got[:], want)
 			}
+			decoded, err := wire.DecodeUDPFrame(want)
+			if err != nil {
+				return 0, fmt.Errorf("%s: decode: %w", tc.ID, err)
+			}
+			reencoded, err := encodeUDPFrame(decoded)
+			if err != nil {
+				return 0, fmt.Errorf("%s: re-encode: %w", tc.ID, err)
+			}
+			if !bytes.Equal(reencoded, want) {
+				return 0, fmt.Errorf("%s: close decode/re-encode mismatch", tc.ID)
+			}
 		case "fragment":
 			if err := checkFragmentCase(tc, uint32(flowID)); err != nil {
 				return 0, err
@@ -317,12 +335,21 @@ func checkDatagram(path string) (int, error) {
 			if err != nil {
 				return 0, fmt.Errorf("%s: raw_hex: %w", tc.ID, err)
 			}
-			_, err = wire.DecodeUDPFrame(rawFrame)
+			decoded, err := wire.DecodeUDPFrame(rawFrame)
 			if tc.Valid && err != nil {
 				return 0, fmt.Errorf("%s: decode: %w", tc.ID, err)
 			}
 			if !tc.Valid && err == nil {
 				return 0, fmt.Errorf("%s: expected decode error (%s)", tc.ID, tc.ErrorCode)
+			}
+			if tc.Valid {
+				reencoded, err := encodeUDPFrame(decoded)
+				if err != nil {
+					return 0, fmt.Errorf("%s: re-encode: %w", tc.ID, err)
+				}
+				if !bytes.Equal(reencoded, rawFrame) {
+					return 0, fmt.Errorf("%s: datagram decode/re-encode mismatch", tc.ID)
+				}
 			}
 		default:
 			return 0, fmt.Errorf("%s: unknown datagram operation %q", tc.ID, tc.Operation)
@@ -365,6 +392,13 @@ func checkFragmentCase(tc vectors.DatagramCase, flowID wire.FlowID) error {
 		if decoded.Type != wire.UDPFrameTypeFragment || decoded.FlowID != flowID {
 			return fmt.Errorf("%s: decoded frame[%d] fields mismatch", tc.ID, i)
 		}
+		reencoded, err := encodeUDPFrame(decoded)
+		if err != nil {
+			return fmt.Errorf("%s: re-encode frame[%d]: %w", tc.ID, i, err)
+		}
+		if !bytes.Equal(reencoded, want) {
+			return fmt.Errorf("%s: fragment[%d] decode/re-encode mismatch", tc.ID, i)
+		}
 		outcome := reassembler.Push(flowID, decoded.Fragment, reassemblyTime())
 		if outcome.Done {
 			if !bytes.Equal(outcome.Payload, payload) {
@@ -403,6 +437,17 @@ func checkUOT(path string) (int, error) {
 			}
 			if !bytes.Equal(got, want) {
 				return 0, fmt.Errorf("%s: uot packet mismatch\n got %x\nwant %x", tc.ID, got, want)
+			}
+			decoded, err := wire.ReadUDPPacket(bytes.NewReader(want))
+			if err != nil {
+				return 0, fmt.Errorf("%s: decode: %w", tc.ID, err)
+			}
+			reencoded, err := wire.EncodeUDPPacket(decoded)
+			if err != nil {
+				return 0, fmt.Errorf("%s: re-encode: %w", tc.ID, err)
+			}
+			if !bytes.Equal(reencoded, want) {
+				return 0, fmt.Errorf("%s: uot decode/re-encode mismatch", tc.ID)
 			}
 		case "header":
 			want, err := vectors.DecodeHex(tc.FrameHex)
@@ -488,6 +533,17 @@ func checkResult(path string) (int, error) {
 			}
 			if len(want) != 1 || want[0] != tc.Code {
 				return 0, fmt.Errorf("%s: flow_result wire byte mismatch", tc.ID)
+			}
+			decoded, err := wire.DecodeSetupResult(want)
+			if err != nil {
+				return 0, fmt.Errorf("%s: decode: %w", tc.ID, err)
+			}
+			reencoded, err := wire.EncodeSetupResult(decoded)
+			if err != nil {
+				return 0, fmt.Errorf("%s: re-encode: %w", tc.ID, err)
+			}
+			if !bytes.Equal(reencoded[:], want) {
+				return 0, fmt.Errorf("%s: flow result decode/re-encode mismatch", tc.ID)
 			}
 		default:
 			return 0, fmt.Errorf("%s: unknown result operation %q", tc.ID, tc.Operation)
@@ -593,3 +649,27 @@ func decodeSessionID(hexStr string) (wire.SessionID, error) {
 }
 
 func reassemblyTime() time.Time { return time.Unix(0, 0) }
+
+func encodeUDPFrame(frame wire.UDPFrame) ([]byte, error) {
+	switch frame.Type {
+	case wire.UDPFrameTypeData:
+		return wire.EncodeUDPData(frame.FlowID, frame.Payload)
+	case wire.UDPFrameTypeFragment:
+		header, err := wire.EncodeUDPFragmentHeader(frame.FlowID, frame.Fragment)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]byte, len(header)+len(frame.Fragment.Payload))
+		copy(out, header[:])
+		copy(out[len(header):], frame.Fragment.Payload)
+		return out, nil
+	case wire.UDPFrameTypeClose:
+		encoded, err := wire.EncodeUDPClose(frame.FlowID)
+		if err != nil {
+			return nil, err
+		}
+		return encoded[:], nil
+	default:
+		return nil, fmt.Errorf("unknown UDP frame type %d", frame.Type)
+	}
+}
