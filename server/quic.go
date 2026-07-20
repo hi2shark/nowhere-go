@@ -29,10 +29,10 @@ type QuicStream interface {
 // create a CloseWithError <-> operation wait cycle. Host conformance is enforced
 // by adapters separately from this interface contract.
 type QuicConn interface {
-	TLSExporter() (wire.TLSExporter, error)
+	TLSHandshakeInfo() (wire.TLSHandshakeInfo, error)
 	AcceptStream(ctx context.Context) (QuicStream, error)
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
-	SendDatagram(b []byte) error
+	SendDatagram(ctx context.Context, b []byte) error
 	CloseWithError(code uint64, message string) error
 	Close() error
 	Context() context.Context

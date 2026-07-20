@@ -340,8 +340,8 @@ func (s *portalSession) startReassemblyExpiry() {
 	}()
 }
 
-func (s *portalSession) SendDatagram(b []byte) error {
-	return s.Conn.SendDatagram(b)
+func (s *portalSession) SendDatagram(ctx context.Context, b []byte) error {
+	return s.Conn.SendDatagram(ctx, b)
 }
 
 // transportMaxDatagramSize reads the live transport-reported DATAGRAM limit.

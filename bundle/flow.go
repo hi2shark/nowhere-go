@@ -140,11 +140,11 @@ func (p *quicPreparedStream) Close() error {
 	return p.stream.Close()
 }
 
-func (p *quicPreparedStream) SendDatagram(frame []byte) error {
+func (p *quicPreparedStream) SendDatagram(ctx context.Context, frame []byte) error {
 	if p == nil || p.session == nil {
 		return errors.New("nowhere: nil quic session")
 	}
-	return p.session.SendDatagram(frame)
+	return p.session.SendDatagram(ctx, frame)
 }
 
 func (p *quicPreparedStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {

@@ -1,12 +1,18 @@
 package quic
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/hi2shark/nowhere-go/wire"
 )
+
+// ErrDatagramMTUUnstable reports two consecutive TooLarge results for one UDP
+// packet even after synchronously clamping and re-encoding at the new limit.
+var ErrDatagramMTUUnstable = errors.New("nowhere: QUIC datagram MTU remained unstable after retry")
 
 // DatagramTooLargeError is returned when a DATAGRAM exceeds the current path limit.
 type DatagramTooLargeError struct {
@@ -50,9 +56,10 @@ type DatagramProber struct {
 	current func() int
 	now     func() time.Time
 
-	mu        sync.Mutex
-	probed    int
-	lastProbe time.Time
+	mu         sync.Mutex
+	probed     int
+	upperBound int
+	lastProbe  time.Time
 }
 
 // NewDatagramProber wraps the transport-reported current maximum. current must
@@ -70,9 +77,13 @@ func (p *DatagramProber) MaxDatagramSize() int {
 	}
 	p.mu.Lock()
 	probed := p.probed
+	upperBound := p.upperBound
 	p.mu.Unlock()
 	if probed > current {
-		return probed
+		current = probed
+	}
+	if upperBound > 0 && (current == 0 || current > upperBound) {
+		current = upperBound
 	}
 	return current
 }
@@ -125,6 +136,113 @@ func (p *DatagramProber) NoteProbeFailure() {
 		p.probed = current
 	}
 	p.mu.Unlock()
+}
+
+// NoteTooLarge immediately clamps this session's effective limit, independent
+// of whether the host adapter updates CurrentMaxDatagramSize synchronously.
+func (p *DatagramProber) NoteTooLarge(maxSize int) {
+	if maxSize <= 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.upperBound == 0 || maxSize < p.upperBound {
+		p.upperBound = maxSize
+	}
+	if p.probed > maxSize {
+		p.probed = maxSize
+	}
+	p.mu.Unlock()
+}
+
+// DatagramSendFunc sends one owned DATAGRAM frame.
+type DatagramSendFunc func(context.Context, []byte) error
+
+// PacketIDSource returns a fresh non-zero packet ID whenever fragmentation is
+// actually required.
+type PacketIDSource func() uint32
+
+// SendUDPData is the sole outbound NOWU PMTU state machine. It lazily encodes
+// and sends one frame at a time, clamps on TooLarge, then re-encodes once with
+// a fresh packet ID. A second TooLarge is never treated as success.
+func SendUDPData(
+	ctx context.Context,
+	send DatagramSendFunc,
+	prober *DatagramProber,
+	flowID wire.FlowID,
+	nextPacketID PacketIDSource,
+	payload []byte,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if send == nil {
+		return errors.New("nowhere: nil QUIC datagram sender")
+	}
+	if prober == nil {
+		return errors.New("nowhere: nil QUIC datagram prober")
+	}
+	if nextPacketID == nil {
+		return errors.New("nowhere: nil packet ID source")
+	}
+
+	var firstTooLarge error
+	for attempt := 0; attempt < 2; attempt++ {
+		probedSize, err := prober.sendAttempt(ctx, send, flowID, nextPacketID, payload)
+		if err == nil {
+			if probedSize > 0 {
+				prober.NoteProbeSuccess(probedSize)
+			}
+			return nil
+		}
+		var tooLarge *DatagramTooLargeError
+		if !errors.As(err, &tooLarge) {
+			return err
+		}
+		prober.NoteTooLarge(tooLarge.MaxDatagramSize)
+		if probedSize > 0 {
+			prober.NoteProbeFailure()
+		}
+		if attempt == 0 {
+			firstTooLarge = err
+			continue
+		}
+		return errors.Join(
+			ErrDatagramMTUUnstable,
+			fmt.Errorf("nowhere: initial datagram too large: %w", firstTooLarge),
+			fmt.Errorf("nowhere: datagram retry too large: %w", err),
+		)
+	}
+	return nil
+}
+
+func (p *DatagramProber) sendAttempt(
+	ctx context.Context,
+	send DatagramSendFunc,
+	flowID wire.FlowID,
+	nextPacketID PacketIDSource,
+	payload []byte,
+) (int, error) {
+	maxSize := p.MaxDatagramSize()
+	frameSize := len(payload) + wire.UDPHeaderLen
+	if frameSize <= maxSize {
+		frame, err := wire.EncodeUDPData(flowID, payload)
+		if err != nil {
+			return 0, err
+		}
+		return 0, send(ctx, frame)
+	}
+	if frameSize <= DatagramProbeCeiling && p.allowProbe(frameSize) {
+		frame, err := wire.EncodeUDPData(flowID, payload)
+		if err != nil {
+			return 0, err
+		}
+		return frameSize, send(ctx, frame)
+	}
+	packetID := nextPacketID()
+	err := wire.EncodeUDPDataFragmentsYield(flowID, packetID, payload, maxSize, func(frame []byte) error {
+		return send(ctx, frame)
+	})
+	return 0, err
 }
 
 func (p *DatagramProber) allowProbe(size int) bool {

@@ -36,12 +36,12 @@ type Backend interface {
 
 // Session is one QUIC connection whose TLS 1.3 handshake has completed.
 type Session interface {
-	// TLSExporter returns the keying material exported from this connection's
-	// TLS handshake, used to bind the connection-bound auth frame.
-	TLSExporter() (wire.TLSExporter, error)
+	// TLSHandshakeInfo returns the atomically captured TLS state used before
+	// connection-bound authentication.
+	TLSHandshakeInfo() (wire.TLSHandshakeInfo, error)
 	PrepareStream(ctx context.Context) (PreparedStream, error)
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
 	CurrentMaxDatagramSize() int
-	SendDatagram([]byte) error
+	SendDatagram(ctx context.Context, payload []byte) error
 	LocalAddr() net.Addr
 }

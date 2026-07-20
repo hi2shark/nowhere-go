@@ -293,47 +293,18 @@ func writeQUICUDPPacket(session *qSessionHandle, flowID wire.FlowID, nextPacketI
 		return 0, err
 	}
 	prober := session.datagramProber()
-	for attempt := 0; attempt < 2; attempt++ {
+	if prober == nil {
+		prober = quic.NewDatagramProber(session.quic.MaxDatagramSize)
+	}
+	nextID := func() uint32 {
 		packetID := nextPacketID.Add(1)
 		if packetID == 0 {
 			packetID = nextPacketID.Add(1)
 		}
-		var frames [][]byte
-		var probeSize int
-		var err error
-		if prober != nil {
-			frames, probeSize, err = prober.EncodeUDPDataFragments(flowID, packetID, payload)
-		} else {
-			frames, err = wire.EncodeUDPDataFragments(flowID, packetID, payload, session.quic.MaxDatagramSize())
-		}
-		if err != nil {
-			return 0, err
-		}
-		retry := false
-		for _, frame := range frames {
-			if err := session.sendDatagram(frame); err != nil {
-				var tooLarge *quic.DatagramTooLargeError
-				if !errors.As(err, &tooLarge) {
-					return 0, err
-				}
-				if probeSize > 0 {
-					prober.NoteProbeFailure()
-					probeSize = 0
-				}
-				if attempt == 0 {
-					retry = true
-					break
-				}
-				return len(payload), nil
-			}
-		}
-		if probeSize > 0 {
-			prober.NoteProbeSuccess(probeSize)
-		}
-		if retry {
-			continue
-		}
-		return len(payload), nil
+		return packetID
+	}
+	if err := quic.SendUDPData(context.Background(), session.sendDatagramContext, prober, flowID, nextID, payload); err != nil {
+		return 0, err
 	}
 	return len(payload), nil
 }
@@ -473,7 +444,7 @@ func (h *qSessionHandle) stateError() error {
 	return nil
 }
 
-func (h *qSessionHandle) sendDatagram(frame []byte) error {
+func (h *qSessionHandle) sendDatagramContext(ctx context.Context, frame []byte) error {
 	if err := h.stateError(); err != nil {
 		return err
 	}
@@ -484,9 +455,17 @@ func (h *qSessionHandle) sendDatagram(frame []byte) error {
 		return net.ErrClosed
 	}
 	if session, ok := h.quic.session.(*quicSessionMux); ok {
-		return session.sendDatagram(h, frame, h.writeDeadline)
+		return session.sendDatagram(ctx, h, frame, h.writeDeadline)
 	}
-	if err := h.quic.SendDatagram(frame); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if at, _, _ := h.writeDeadline.snapshot(); !at.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, at)
+		defer cancel()
+	}
+	if err := h.quic.SendDatagram(ctx, frame); err != nil {
 		return err
 	}
 	if h.writeDeadline.expired() {

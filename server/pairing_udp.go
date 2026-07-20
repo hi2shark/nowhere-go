@@ -195,14 +195,14 @@ func (d *tcpUDPDownlink) Close() error { return d.conn.Close() }
 
 type quicUDPDownlink struct {
 	control         net.Conn
-	send            func([]byte) error
+	send            func(context.Context, []byte) error
 	maxDatagramSize func() int
 	probe           *carrierquic.DatagramProber
 	abort           func(error)
 	closeOnce       sync.Once
 }
 
-func newQUICUDPDownlink(control net.Conn, send func([]byte) error, maxDatagramSize func() int, probe *carrierquic.DatagramProber, abort ...func(error)) *quicUDPDownlink {
+func newQUICUDPDownlink(control net.Conn, send func(context.Context, []byte) error, maxDatagramSize func() int, probe *carrierquic.DatagramProber, abort ...func(error)) *quicUDPDownlink {
 	var abortSession func(error)
 	if len(abort) > 0 {
 		abortSession = abort[0]
@@ -265,54 +265,22 @@ func (d *quicUDPDownlinkBound) WritePacket(p []byte) error {
 	if prober == nil && d.base != nil {
 		prober = d.base.probe
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		max := defaultMaxDatagramSize
-		if currentMax != nil {
-			if size := currentMax(); size > nowuDataHeaderLen {
-				max = size
+	if prober == nil {
+		prober = carrierquic.NewDatagramProber(func() int {
+			if currentMax != nil {
+				return currentMax()
 			}
-		}
+			return defaultMaxDatagramSize
+		})
+	}
+	nextPacketID := func() uint32 {
 		packetID := d.nextPacketID.Add(1)
 		if packetID == 0 {
 			packetID = d.nextPacketID.Add(1)
 		}
-		var frames [][]byte
-		var probeSize int
-		var err error
-		if prober != nil {
-			frames, probeSize, err = prober.EncodeUDPDataFragments(d.flowID, packetID, p)
-		} else {
-			frames, err = wire.EncodeUDPDataFragments(d.flowID, packetID, p, max)
-		}
-		if err != nil {
-			return err
-		}
-		retry := false
-		for _, frame := range frames {
-			if err := d.base.send(frame); err != nil {
-				var tooLarge *carrierquic.DatagramTooLargeError
-				if !errors.As(err, &tooLarge) {
-					return err
-				}
-				if probeSize > 0 {
-					prober.NoteProbeFailure()
-					probeSize = 0
-				}
-				if attempt == 0 {
-					retry = true
-					break
-				}
-				return nil
-			}
-		}
-		if probeSize > 0 {
-			prober.NoteProbeSuccess(probeSize)
-		}
-		if !retry {
-			return nil
-		}
+		return packetID
 	}
-	return nil
+	return carrierquic.SendUDPData(context.Background(), d.base.send, prober, d.flowID, nextPacketID, p)
 }
 
 func (d *quicUDPDownlinkBound) WriteClose() error {
@@ -517,6 +485,9 @@ func (c *pairedUDPConn) Close() error {
 func (c *pairedUDPConn) markReady() {
 	if c != nil {
 		c.ready.Store(true)
+		if flow, ok := c.uplink.(*nowuFlow); ok {
+			flow.markReady()
+		}
 	}
 }
 
