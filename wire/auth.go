@@ -18,6 +18,16 @@ const (
 	AuthTransportQUIC AuthTransport = 0x02
 )
 
+// Validate rejects transport values that are not defined by Nowhere v1.
+func (t AuthTransport) Validate() error {
+	switch t {
+	case AuthTransportTLSTCP, AuthTransportQUIC:
+		return nil
+	default:
+		return ErrInvalidAuthTransport
+	}
+}
+
 // TLSExporterLen is the length of a TLS exporter bound to one connection.
 const TLSExporterLen = 32
 
@@ -50,18 +60,30 @@ type AuthFrame = [AuthFrameLen]byte
 // The frame is bound to the shared key, transport, the connection's TLS
 // exporter and the session id, so it cannot be replayed on any other
 // connection.
-func EncodeAuthFrame(creds *Credentials, transport AuthTransport, exporter TLSExporter, sessionID SessionID) AuthFrame {
+func EncodeAuthFrame(creds *Credentials, transport AuthTransport, exporter TLSExporter, sessionID SessionID) (AuthFrame, error) {
+	if creds == nil {
+		return AuthFrame{}, ErrMissingCredentials
+	}
+	if err := transport.Validate(); err != nil {
+		return AuthFrame{}, err
+	}
 	tag := authTag(creds.authKeyBytes(), transport, exporter, sessionID)
 	var frame AuthFrame
 	copy(frame[:SessionIDLen], sessionID[:])
 	copy(frame[SessionIDLen:], tag[:])
-	return frame
+	return frame, nil
 }
 
 // ValidateAuthFrame checks the fixed-length frame and returns the session id
 // embedded in it. The comparison is constant-time and a failure only surfaces
 // a coarse error; callers must apply the common auth deadline before closing.
 func ValidateAuthFrame(frame []byte, creds *Credentials, transport AuthTransport, exporter TLSExporter) (SessionID, error) {
+	if creds == nil {
+		return SessionID{}, ErrMissingCredentials
+	}
+	if err := transport.Validate(); err != nil {
+		return SessionID{}, err
+	}
 	if len(frame) != AuthFrameLen {
 		return SessionID{}, ErrInvalidAuthFrame
 	}
@@ -97,4 +119,4 @@ func authTag(authKey AuthKey, transport AuthTransport, exporter TLSExporter, ses
 
 // encodeUint32BE / decodeUint32BE are small helpers used by flow/datagram.
 func encodeUint32BE(b []byte, v uint32) { binary.BigEndian.PutUint32(b, v) }
-func decodeUint32BE(b []byte) uint32     { return binary.BigEndian.Uint32(b) }
+func decodeUint32BE(b []byte) uint32    { return binary.BigEndian.Uint32(b) }

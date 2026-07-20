@@ -106,7 +106,10 @@ func runSelfCheck() error {
 	for i := range exporter {
 		exporter[i] = byte(i)
 	}
-	authFrame := wire.EncodeAuthFrame(creds, wire.AuthTransportTLSTCP, exporter, wire.SessionID{})
+	authFrame, err := wire.EncodeAuthFrame(creds, wire.AuthTransportTLSTCP, exporter, wire.SessionID{})
+	if err != nil {
+		return err
+	}
 	if _, err := wire.ValidateAuthFrame(authFrame[:], creds, wire.AuthTransportTLSTCP, exporter); err != nil {
 		return err
 	}

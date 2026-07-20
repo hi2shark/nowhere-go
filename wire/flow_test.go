@@ -54,16 +54,16 @@ func TestFlowHeaderFixedVectors(t *testing.T) {
 
 func TestFlowHeaderRejectsInvalid(t *testing.T) {
 	invalids := [][]byte{
-		{},                         // empty
-		{0, 0, 0, 0},               // short
-		{0, 0, 0, 0, 0, 0},         // long
-		{0, 0, 0, 0, 0},            // zero flow id
-		{0x20, 0, 0, 0, 1},         // reserved bit
-		{0x40, 0, 0, 0, 1},         // reserved bit
-		{0x80, 0, 0, 0, 1},         // reserved bit
-		{0x03, 0, 0, 0, 1},         // invalid role
-		{0x10, 0, 0, 0, 1},         // duplex carrier mismatch
-		{0x01, 0, 0, 0, 1},         // open split carrier match
+		{},                 // empty
+		{0, 0, 0, 0},       // short
+		{0, 0, 0, 0, 0, 0}, // long
+		{0, 0, 0, 0, 0},    // zero flow id
+		{0x20, 0, 0, 0, 1}, // reserved bit
+		{0x40, 0, 0, 0, 1}, // reserved bit
+		{0x80, 0, 0, 0, 1}, // reserved bit
+		{0x03, 0, 0, 0, 1}, // invalid role
+		{0x10, 0, 0, 0, 1}, // duplex carrier mismatch
+		{0x01, 0, 0, 0, 1}, // open split carrier match
 	}
 	for _, frame := range invalids {
 		if _, err := DecodeFlowHeader(frame); err == nil {

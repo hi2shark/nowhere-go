@@ -1,7 +1,7 @@
 package wire
 
 import (
-	"errors"
+	"fmt"
 	"io"
 )
 
@@ -28,6 +28,15 @@ const setupResultMax = 7
 // IsReady reports whether the result indicates a successful setup.
 func (r SetupResult) IsReady() bool { return r == SetupResultReady }
 
+// Validate rejects values that are not defined by the one-byte v1 result
+// space.
+func (r SetupResult) Validate() error {
+	if r > setupResultMax {
+		return ErrInvalidSetupResult
+	}
+	return nil
+}
+
 // String returns a stable human label for diagnostics.
 func (r SetupResult) String() string {
 	switch r {
@@ -53,8 +62,11 @@ func (r SetupResult) String() string {
 }
 
 // EncodeSetupResult encodes a setup result as a single byte.
-func EncodeSetupResult(r SetupResult) [SetupResultLen]byte {
-	return [SetupResultLen]byte{byte(r)}
+func EncodeSetupResult(r SetupResult) ([SetupResultLen]byte, error) {
+	if err := r.Validate(); err != nil {
+		return [SetupResultLen]byte{}, err
+	}
+	return [SetupResultLen]byte{byte(r)}, nil
 }
 
 // DecodeSetupResult decodes exactly one byte into a setup result.
@@ -74,10 +86,12 @@ func parseSetupResult(v byte) (SetupResult, error) {
 
 // WriteSetupResult writes a single-byte setup result.
 func WriteSetupResult(w io.Writer, r SetupResult) error {
-	frame := EncodeSetupResult(r)
-	_, err := w.Write(frame[:])
+	frame, err := EncodeSetupResult(r)
 	if err != nil {
-		return errors.New("nowhere: write setup result")
+		return err
+	}
+	if err := WriteFull(w, frame[:]); err != nil {
+		return fmt.Errorf("nowhere: write setup result: %w", err)
 	}
 	return nil
 }

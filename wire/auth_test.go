@@ -3,6 +3,7 @@ package wire
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"testing"
 )
 
@@ -51,7 +52,10 @@ func TestAuthFrameRoundTripAndReplayProtection(t *testing.T) {
 		{"quic", AuthTransportQUIC, "000102030405060708090a0b0c0d0e0f8176b984db64a1e2c811e751d955b635"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			frame := EncodeAuthFrame(creds, tc.transport, exporter, sessionID)
+			frame, err := EncodeAuthFrame(creds, tc.transport, exporter, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if len(frame) != AuthFrameLen {
 				t.Fatalf("frame len %d want %d", len(frame), AuthFrameLen)
 			}
@@ -70,7 +74,10 @@ func TestAuthFrameRoundTripAndReplayProtection(t *testing.T) {
 	}
 
 	// Replay on a different exporter must fail.
-	frame := EncodeAuthFrame(creds, AuthTransportQUIC, exporter, sessionID)
+	frame, err := EncodeAuthFrame(creds, AuthTransportQUIC, exporter, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	other := exporter
 	other[0] ^= 1
 	if _, err := ValidateAuthFrame(frame[:], creds, AuthTransportQUIC, other); err == nil {
@@ -91,7 +98,10 @@ func TestAuthFrameRejectsTruncatedAndTrailing(t *testing.T) {
 	creds, _ := NewCredentials("secret")
 	exporter := TLSExporter{}
 	sessionID := SessionID{}
-	frame := EncodeAuthFrame(creds, AuthTransportTLSTCP, exporter, sessionID)
+	frame, err := EncodeAuthFrame(creds, AuthTransportTLSTCP, exporter, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	short := frame[:AuthFrameLen-1]
 	if _, err := ValidateAuthFrame(short, creds, AuthTransportTLSTCP, exporter); err == nil {
@@ -110,7 +120,10 @@ func TestAuthFrameMutatedFieldsFail(t *testing.T) {
 	for i := range sessionID {
 		sessionID[i] = byte(i)
 	}
-	frame := EncodeAuthFrame(creds, AuthTransportTLSTCP, exporter, sessionID)
+	frame, err := EncodeAuthFrame(creds, AuthTransportTLSTCP, exporter, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	mutatedSession := frame
 	mutatedSession[0] ^= 1
@@ -121,5 +134,18 @@ func TestAuthFrameMutatedFieldsFail(t *testing.T) {
 	mutatedTag[AuthFrameLen-1] ^= 1
 	if _, err := ValidateAuthFrame(mutatedTag[:], creds, AuthTransportTLSTCP, exporter); err == nil {
 		t.Fatal("mutated tag accepted")
+	}
+}
+
+func TestAuthTransportAndCredentialsValidation(t *testing.T) {
+	creds, err := NewCredentials("secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EncodeAuthFrame(creds, AuthTransport(0xff), TLSExporter{}, SessionID{}); !errors.Is(err, ErrInvalidAuthTransport) {
+		t.Fatalf("invalid transport error = %v", err)
+	}
+	if _, err := EncodeAuthFrame(nil, AuthTransportTLSTCP, TLSExporter{}, SessionID{}); !errors.Is(err, ErrMissingCredentials) {
+		t.Fatalf("missing credentials error = %v", err)
 	}
 }

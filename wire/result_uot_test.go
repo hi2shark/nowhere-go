@@ -8,7 +8,10 @@ import (
 func TestSetupResultWireBytes(t *testing.T) {
 	for b := 0; b <= 7; b++ {
 		result := SetupResult(b)
-		encoded := EncodeSetupResult(result)
+		encoded, err := EncodeSetupResult(result)
+		if err != nil {
+			t.Fatalf("encode %d: %v", b, err)
+		}
 		if encoded[0] != byte(b) {
 			t.Fatalf("wire byte %d want %d", encoded[0], b)
 		}
@@ -31,6 +34,9 @@ func TestSetupResultRejects(t *testing.T) {
 	}
 	if _, err := DecodeSetupResult([]byte{8}); err == nil {
 		t.Fatal("unknown value accepted")
+	}
+	if _, err := EncodeSetupResult(SetupResult(8)); err == nil {
+		t.Fatal("unknown value encoded")
 	}
 }
 
@@ -73,6 +79,9 @@ func TestUoTPacketCodec(t *testing.T) {
 	}
 	if _, err := EncodeUDPPacketHeader(UoTPacketMax + 1); err == nil {
 		t.Fatal("oversize header accepted")
+	}
+	if _, err := EncodeUDPPacketHeader(-1); err == nil {
+		t.Fatal("negative header accepted")
 	}
 }
 

@@ -14,7 +14,10 @@ func FuzzValidateAuthFrame(f *testing.F) {
 	for index := range exporter {
 		exporter[index] = byte(index)
 	}
-	frame := EncodeAuthFrame(credentials, AuthTransportTLSTCP, exporter, SessionID{1})
+	frame, err := EncodeAuthFrame(credentials, AuthTransportTLSTCP, exporter, SessionID{1})
+	if err != nil {
+		f.Fatal(err)
+	}
 	f.Add(frame[:])
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, input []byte) {

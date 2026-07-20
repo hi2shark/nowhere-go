@@ -110,15 +110,15 @@ func TestTargetRejectsInvalid(t *testing.T) {
 	// decode rejects
 	rejects := [][]byte{
 		{},
-		{0x02, 1, 2, 3, 4, 0, 80},          // unknown atyp
-		{0x01, 127, 0, 0, 1},               // truncated ipv4
-		{0x01, 127, 0, 0, 1, 0, 0},         // zero port
-		make([]byte, 18),                   // truncated ipv6 (fill 0x04)
-		{0x03},                             // domain no length
-		{0x03, 0, 0, 80},                   // domain zero length
-		{0x03, 3, 'a', 'b', 0, 80},         // truncated domain
-		{0x03, 1, 0xff, 0, 80},             // bad label
-		{0x03, 1, 'a', 0, 0},               // zero port
+		{0x02, 1, 2, 3, 4, 0, 80},  // unknown atyp
+		{0x01, 127, 0, 0, 1},       // truncated ipv4
+		{0x01, 127, 0, 0, 1, 0, 0}, // zero port
+		make([]byte, 18),           // truncated ipv6 (fill 0x04)
+		{0x03},                     // domain no length
+		{0x03, 0, 0, 80},           // domain zero length
+		{0x03, 3, 'a', 'b', 0, 80}, // truncated domain
+		{0x03, 1, 0xff, 0, 80},     // bad label
+		{0x03, 1, 'a', 0, 0},       // zero port
 	}
 	rejects[4][0] = 0x04 // mark as ipv6 atyp
 	for _, raw := range rejects {

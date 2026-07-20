@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -14,7 +15,7 @@ const UoTPacketMax = 0xffff
 
 // EncodeUDPPacketHeader encodes only the two-byte packet length header.
 func EncodeUDPPacketHeader(payloadLen int) ([UoTHeaderLen]byte, error) {
-	if payloadLen > UoTPacketMax {
+	if payloadLen < 0 || payloadLen > UoTPacketMax {
 		return [UoTHeaderLen]byte{}, errors.New("nowhere: udp packet too large")
 	}
 	var out [UoTHeaderLen]byte
@@ -40,12 +41,12 @@ func WriteUDPPacket(w io.Writer, payload []byte) error {
 	}
 	var hdr [UoTHeaderLen]byte
 	binary.BigEndian.PutUint16(hdr[:], uint16(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return errors.New("nowhere: write udp packet header")
+	if err := WriteFull(w, hdr[:]); err != nil {
+		return fmt.Errorf("nowhere: write udp packet header: %w", err)
 	}
 	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
-			return errors.New("nowhere: write udp packet payload")
+		if err := WriteFull(w, payload); err != nil {
+			return fmt.Errorf("nowhere: write udp packet payload: %w", err)
 		}
 	}
 	return nil
@@ -65,12 +66,12 @@ func ReadUDPPacket(r io.Reader) ([]byte, error) {
 	}
 	var second [1]byte
 	if _, err := io.ReadFull(r, second[:]); err != nil {
-		return nil, errors.New("nowhere: truncated udp packet length")
+		return nil, fmt.Errorf("nowhere: truncated udp packet length: %w", err)
 	}
 	payloadLen := int(binary.BigEndian.Uint16([]byte{hdr[0], second[0]}))
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, errors.New("nowhere: truncated udp packet payload")
+		return nil, fmt.Errorf("nowhere: truncated udp packet payload: %w", err)
 	}
 	return payload, nil
 }

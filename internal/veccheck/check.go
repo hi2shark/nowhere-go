@@ -74,7 +74,10 @@ func checkAuth(path string) (int, error) {
 		if got := wire.DeriveAuthKey([]byte(tc.SharedKey)); !bytes.Equal(got[:], wantKey) {
 			return 0, fmt.Errorf("%s: auth_key mismatch\n got %x\nwant %x", tc.ID, got[:], wantKey)
 		}
-		frame := wire.EncodeAuthFrame(creds, transport, exporter, sessionID)
+		frame, err := wire.EncodeAuthFrame(creds, transport, exporter, sessionID)
+		if err != nil {
+			return 0, fmt.Errorf("%s: encode auth: %w", tc.ID, err)
+		}
 		wantFrame, err := vectors.DecodeHex(tc.FrameHex)
 		if err != nil {
 			return 0, fmt.Errorf("%s: frame_hex: %w", tc.ID, err)
@@ -447,7 +450,10 @@ func checkResult(path string) (int, error) {
 				if err != nil {
 					return 0, fmt.Errorf("%s: %w", tc.ID, err)
 				}
-				got := wire.EncodeSetupResult(result)
+				got, err := wire.EncodeSetupResult(result)
+				if err != nil {
+					return 0, fmt.Errorf("%s: encode: %w", tc.ID, err)
+				}
 				want, err := vectors.DecodeHex(tc.FrameHex)
 				if err != nil {
 					return 0, fmt.Errorf("%s: frame_hex: %w", tc.ID, err)
