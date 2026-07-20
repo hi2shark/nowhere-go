@@ -313,9 +313,7 @@ func (c *quicPacketConn) Close() (err error) {
 	c.closeOnce.Do(func() {
 		err = c.session.closePacket()
 		if c.control != nil {
-			if closeErr := c.control.Close(); err == nil {
-				err = closeErr
-			}
+			err = errors.Join(err, c.control.Close())
 		}
 	})
 	return err

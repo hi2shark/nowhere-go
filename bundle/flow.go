@@ -177,9 +177,22 @@ func readSetupResult(r io.Reader) error {
 		return err
 	}
 	if !result.IsReady() {
-		return fmt.Errorf("nowhere: flow rejected: %s", result.String())
+		return &SetupResultError{Code: result}
 	}
 	return nil
+}
+
+// SetupResultError preserves the exact non-READY result code while callers add
+// stage context with %w.
+type SetupResultError struct {
+	Code wire.SetupResult
+}
+
+func (e *SetupResultError) Error() string {
+	if e == nil {
+		return "nowhere: flow rejected"
+	}
+	return fmt.Sprintf("nowhere: flow rejected: %s", e.Code.String())
 }
 
 // splicedConn joins an independent reader and writer into net.Conn.
