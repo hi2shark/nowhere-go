@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	maxPoolSize     = 9
 	defaultPoolSize = 5
 	// DefaultPoolSize is the protocol-aligned TLS/TCP idle carrier target.
 	DefaultPoolSize = defaultPoolSize
+	// MaxPoolSize matches the Rust carrier pool's public upper bound.
+	MaxPoolSize = 256
 
 	// DefaultMaxConcurrentDials caps in-flight physical TCP dials per outbound.
 	// Conservative default for mixed TCP/QUIC bursts (dial+TLS+auth share the slot).
@@ -50,8 +51,6 @@ type TLSDialer interface {
 type TCPOptions struct {
 	Address        string
 	ConnectAddress string
-	Credentials    *wire.Credentials
-	Transport      wire.AuthTransport
 	Dialer         TCPDialer
 	TLSDialer      TLSDialer
 	Observer       diagnostic.Observer
@@ -78,7 +77,7 @@ type Config struct {
 	address            string
 	connectAddress     string
 	credentials        *wire.Credentials
-	transport          wire.AuthTransport
+	alpn               string
 	dialer             TCPDialer
 	tlsDialer          TLSDialer
 	observer           diagnostic.Observer
@@ -95,12 +94,6 @@ type Config struct {
 func NewConfig(options TCPOptions) (*Config, error) {
 	if options.Address == "" {
 		return nil, fmt.Errorf("nowhere: empty TCP carrier address")
-	}
-	if options.Credentials == nil {
-		return nil, fmt.Errorf("nowhere: nil credentials")
-	}
-	if options.Transport != wire.AuthTransportTLSTCP && options.Transport != wire.AuthTransportQUIC {
-		return nil, fmt.Errorf("nowhere: invalid auth transport")
 	}
 	if options.Dialer == nil {
 		return nil, fmt.Errorf("nowhere: nil TCP dialer")
@@ -151,8 +144,7 @@ func NewConfig(options TCPOptions) (*Config, error) {
 	}
 	config := &Config{
 		address: options.Address, connectAddress: options.ConnectAddress,
-		credentials: options.Credentials, transport: options.Transport,
-		dialer: options.Dialer,
+		dialer:    options.Dialer,
 		tlsDialer: options.TLSDialer, observer: options.Observer,
 		maxConcurrentDials: maxDials,
 		warmBackoffInitial: warmInitial,
@@ -164,14 +156,28 @@ func NewConfig(options TCPOptions) (*Config, error) {
 	return config, nil
 }
 
-// WithSessionID returns a copy bound to one transport bundle identity.
-func (c *Config) WithSessionID(sessionID wire.SessionID) *Config {
+// BindSession returns a copy bound to one bundle's credentials, identity, and
+// expected ALPN. Authentication is always domain-separated as TLS/TCP inside
+// this package.
+func (c *Config) BindSession(credentials *wire.Credentials, sessionID wire.SessionID, alpn string) (*Config, error) {
 	if c == nil {
-		return nil
+		return nil, fmt.Errorf("nowhere: nil TCP carrier config")
+	}
+	if credentials == nil {
+		return nil, wire.ErrMissingCredentials
+	}
+	if sessionID == (wire.SessionID{}) {
+		return nil, fmt.Errorf("nowhere: missing session id")
+	}
+	normalizedALPN, err := wire.NormalizeALPN(alpn)
+	if err != nil {
+		return nil, err
 	}
 	clone := *c
+	clone.credentials = credentials
 	clone.sessionID = sessionID
-	return &clone
+	clone.alpn = normalizedALPN
+	return &clone, nil
 }
 
 // MaxConcurrentDials returns the normalized dial concurrency cap.
@@ -220,22 +226,6 @@ func (c *Config) Observer() diagnostic.Observer {
 		return nil
 	}
 	return c.observer
-}
-
-// Credentials returns the connection-independent authentication credentials.
-func (c *Config) Credentials() *wire.Credentials {
-	if c == nil {
-		return nil
-	}
-	return c.credentials
-}
-
-// Transport returns the physical carrier domain separator bound into auth tags.
-func (c *Config) Transport() wire.AuthTransport {
-	if c == nil {
-		return wire.AuthTransportTLSTCP
-	}
-	return c.transport
 }
 
 type observerLogger struct{ observer diagnostic.Observer }

@@ -137,13 +137,13 @@ func (p *TCPPool) borrowOrDial(ctx context.Context, target wire.Target, header w
 
 func (p *TCPPool) prepareFromWarm(conn net.Conn, exporter wire.TLSExporter, ci *carrierInfo, target wire.Target, header wire.FlowHeader) (*PreparedFlowHalf, error) {
 	return &PreparedFlowHalf{
-		pool:      p,
-		cfg:       p.cfg,
-		conn:      conn,
-		exporter:  exporter,
-		ci:        ci,
-		target:    target,
-		header:    header,
+		pool:       p,
+		cfg:        p.cfg,
+		conn:       conn,
+		exporter:   exporter,
+		ci:         ci,
+		target:     target,
+		header:     header,
 		warmBorrow: true,
 	}, nil
 }
@@ -184,6 +184,18 @@ func (p *TCPPool) prepareFresh(ctx context.Context, target wire.Target, header w
 		return nil, err
 	}
 	tlsConn := handshaked.Conn
+	if tlsConn == nil {
+		_ = raw.Close()
+		ci.transition(stateClosed)
+		logOpenTiming(p.cfg, "fresh_failed", header.FlowID, ci.id, stage, network, targetString(target), timing)
+		return nil, errors.New("nowhere: TLS dialer returned nil connection")
+	}
+	if err := handshaked.TLSHandshakeInfo.Validate(p.cfg.alpn); err != nil {
+		_ = tlsConn.Close()
+		ci.transition(stateClosed)
+		logOpenTiming(p.cfg, "fresh_failed", header.FlowID, ci.id, stage, network, targetString(target), timing)
+		return nil, err
+	}
 	exporter := handshaked.Exporter
 
 	auth, err := tcpAuthFrame(p.cfg, exporter)

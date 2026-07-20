@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -55,40 +56,45 @@ type poolSnapshot struct {
 type TCPPool struct {
 	cfg       *Config
 	target    int
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 	dialSlots chan struct{}
 	dialGate  *dialgate.Gate
 	mu        sync.Mutex
 	idle      []*warmConn
 	preparing int
 	closed    bool
+	closeOnce sync.Once
+	closeErr  error
 
 	warmFailCount int
 	nextWarmRetry time.Time
 }
 
-func NewTCPPool(cfg *Config, target int) *TCPPool {
+func NewTCPPool(cfg *Config, target int) (*TCPPool, error) {
 	if cfg == nil || cfg.credentials == nil || cfg.dialer == nil || cfg.tlsDialer == nil {
-		return nil
+		return nil, errors.New("nowhere: incomplete TCP pool config")
 	}
-	if target < 0 {
-		target = 0
-	}
-	if target > maxPoolSize {
-		target = maxPoolSize
+	if target < 0 || target > MaxPoolSize {
+		return nil, fmt.Errorf("nowhere: TCP pool size %d outside 0..%d", target, MaxPoolSize)
 	}
 	maxDials := cfg.maxConcurrentDials
 	if maxDials <= 0 {
 		maxDials = DefaultMaxConcurrentDials
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &TCPPool{
 		cfg:       cfg,
 		target:    target,
+		ctx:       ctx,
+		cancel:    cancel,
 		dialSlots: make(chan struct{}, maxDials),
 		dialGate: dialgate.New(dialgate.Options{
 			Initial: cfg.DialBackoffInitial(),
 			Max:     cfg.DialBackoffMax(),
 		}),
-	}
+	}, nil
 }
 
 func (p *TCPPool) Target() int {
@@ -97,16 +103,17 @@ func (p *TCPPool) Target() int {
 	return p.target
 }
 
-func (p *TCPPool) Resize(target int) {
-	if target < 0 {
-		target = 0
-	}
-	if target > maxPoolSize {
-		target = maxPoolSize
+func (p *TCPPool) Resize(target int) error {
+	if target < 0 || target > MaxPoolSize {
+		return fmt.Errorf("nowhere: TCP pool size %d outside 0..%d", target, MaxPoolSize)
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.closed {
+		p.mu.Unlock()
+		return net.ErrClosed
+	}
 	p.target = target
+	var dropped []*warmConn
 	for len(p.idle) > target {
 		wc := p.idle[len(p.idle)-1]
 		p.idle = p.idle[:len(p.idle)-1]
@@ -115,8 +122,14 @@ func (p *TCPPool) Resize(target int) {
 		}
 		wc.carrier.transition(stateClosed)
 		p.logger().Debugf("[Nowhere] [carrier] pool_resize_drop carrier_id=%d new_target=%d", wc.carrier.id, target)
-		_ = wc.conn.Close()
+		dropped = append(dropped, wc)
 	}
+	p.mu.Unlock()
+	var closeErrors []error
+	for _, wc := range dropped {
+		closeErrors = append(closeErrors, wc.conn.Close())
+	}
+	return errors.Join(closeErrors...)
 }
 
 func (p *TCPPool) snapshotLocked() poolSnapshot {
@@ -179,10 +192,12 @@ func (p *TCPPool) maybeStartPrepare(count int) {
 	if count > room {
 		count = room
 	}
-	p.mu.Unlock()
+	p.preparing += count
 	for i := 0; i < count; i++ {
+		p.wg.Add(1)
 		go p.prepareOne()
 	}
+	p.mu.Unlock()
 }
 
 // Prewarm starts background prepares up to the configured pool target.
@@ -313,29 +328,33 @@ func relayNetwork(kind wire.FlowKind) string {
 	return "tcp"
 }
 
-func (p *TCPPool) Close() {
-	p.mu.Lock()
-	p.closed = true
-	idle := p.idle
-	p.idle = nil
-	p.mu.Unlock()
-	for _, wc := range idle {
-		if wc.expiry != nil {
-			wc.expiry.Stop()
-		}
-		wc.carrier.transition(stateClosed)
-		_ = wc.conn.Close()
+func (p *TCPPool) Close() error {
+	if p == nil {
+		return nil
 	}
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.cancel()
+		idle := p.idle
+		p.idle = nil
+		p.mu.Unlock()
+		p.wg.Wait()
+		var closeErrors []error
+		for _, wc := range idle {
+			if wc.expiry != nil {
+				wc.expiry.Stop()
+			}
+			wc.carrier.transition(stateClosed)
+			closeErrors = append(closeErrors, wc.conn.Close())
+		}
+		p.closeErr = errors.Join(closeErrors...)
+	})
+	return p.closeErr
 }
 
 func (p *TCPPool) prepareOne() {
-	p.mu.Lock()
-	if p.closed || p.preparing+len(p.idle) >= p.target || !p.warmAllowedLocked() {
-		p.mu.Unlock()
-		return
-	}
-	p.preparing++
-	p.mu.Unlock()
+	defer p.wg.Done()
 
 	release, ok := p.tryAcquireDialSlot()
 	if !ok {
@@ -347,7 +366,7 @@ func (p *TCPPool) prepareOne() {
 	}
 	defer release()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
 	conn, exporter, ci, err := prepare(ctx, p.cfg)
 	cancel()
 	if err != nil {
@@ -439,6 +458,9 @@ func writeFullTimed(conn net.Conn, payload []byte) (time.Duration, error) {
 	start := time.Now()
 	for len(payload) > 0 {
 		n, err := conn.Write(payload)
+		if n < 0 || n > len(payload) {
+			return time.Since(start), io.ErrShortWrite
+		}
 		if n > 0 {
 			payload = payload[n:]
 		}
@@ -446,7 +468,7 @@ func writeFullTimed(conn net.Conn, payload []byte) (time.Duration, error) {
 			return time.Since(start), err
 		}
 		if n == 0 {
-			return time.Since(start), io.ErrShortWrite
+			return time.Since(start), io.ErrNoProgress
 		}
 	}
 	return time.Since(start), nil
@@ -556,6 +578,18 @@ func prepare(ctx context.Context, cfg *Config) (net.Conn, wire.TLSExporter, *car
 		return nil, wire.TLSExporter{}, nil, err
 	}
 	tlsConn := handshaked.Conn
+	if tlsConn == nil {
+		_ = raw.Close()
+		ci.transition(stateClosed)
+		logOpenTiming(cfg, "warm_prepare_failed", 0, ci.id, stage, "tcp", target, timing)
+		return nil, wire.TLSExporter{}, nil, errors.New("nowhere: TLS dialer returned nil connection")
+	}
+	if err := handshaked.TLSHandshakeInfo.Validate(cfg.alpn); err != nil {
+		_ = tlsConn.Close()
+		ci.transition(stateClosed)
+		logOpenTiming(cfg, "warm_prepare_failed", 0, ci.id, stage, "tcp", target, timing)
+		return nil, wire.TLSExporter{}, nil, err
+	}
 	exporter := handshaked.Exporter
 	auth, err := tcpAuthFrame(cfg, exporter)
 	if err != nil {
@@ -578,12 +612,15 @@ func prepare(ctx context.Context, cfg *Config) (net.Conn, wire.TLSExporter, *car
 
 // tcpAuthFrame builds the connection-bound auth frame using the credentials,
 // the physical transport and this connection's TLS exporter. The session id is
-// supplied by the bundle via WithSessionID; a zero session id is rejected to
+// supplied by the bundle via BindSession; a zero session id is rejected to
 // avoid authenticating before the bundle has generated one.
 func tcpAuthFrame(cfg *Config, exporter wire.TLSExporter) ([]byte, error) {
 	if cfg.sessionID == (wire.SessionID{}) {
 		return nil, errors.New("nowhere: missing session id for auth frame")
 	}
-	frame := wire.EncodeAuthFrame(cfg.credentials, cfg.transport, exporter, cfg.sessionID)
+	frame, err := wire.EncodeAuthFrame(cfg.credentials, wire.AuthTransportTLSTCP, exporter, cfg.sessionID)
+	if err != nil {
+		return nil, err
+	}
 	return frame[:], nil
 }
