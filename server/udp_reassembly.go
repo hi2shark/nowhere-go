@@ -41,14 +41,34 @@ func (b *byteBudget) release(count int) {
 	b.mu.Unlock()
 }
 
+type byteReservation struct {
+	once   sync.Once
+	budget *byteBudget
+	count  int
+}
+
+func (r *byteReservation) Release() {
+	if r == nil {
+		return
+	}
+	r.once.Do(func() { r.budget.release(r.count) })
+}
+
+func (b *byteBudget) reserveOwned(count int) (wire.ByteReservation, bool) {
+	if !b.reserve(count) {
+		return nil, false
+	}
+	return &byteReservation{budget: b, count: count}, true
+}
+
 // udpReassembler is a server-lifetime wrapper around wire.DatagramReassembler.
 // Keeping queue accounting here lets a completed packet retain its budget until
 // the receiving flow consumes it, while all fragment parsing remains in wire.
 type udpReassembler struct {
-	mu       sync.Mutex
-	inner    *wire.DatagramReassembler
-	budget   *byteBudget
-	closed   bool
+	mu     sync.Mutex
+	inner  *wire.DatagramReassembler
+	budget *byteBudget
+	closed bool
 }
 
 type reassemblyOutcome struct {
@@ -72,7 +92,13 @@ func newUDPReassembler(maxSlots int, ttl time.Duration, budget *byteBudget) *udp
 	if budget.limit > 0 && budget.limit < cfg.MaxBytes {
 		cfg.MaxBytes = budget.limit
 	}
-	return &udpReassembler{inner: wire.NewDatagramReassembler(cfg), budget: budget}
+	inner, err := wire.NewDatagramReassembler(cfg)
+	if err != nil {
+		// cfg is built from a valid protocol default and normalized positive
+		// overrides, so reaching this branch is an internal invariant failure.
+		panic(err)
+	}
+	return &udpReassembler{inner: inner, budget: budget}
 }
 
 func (r *udpReassembler) Push(flowID wire.FlowID, fragment wire.UDPFragment, now time.Time) reassemblyOutcome {
@@ -84,18 +110,17 @@ func (r *udpReassembler) Push(flowID wire.FlowID, fragment wire.UDPFragment, now
 	if r.closed || r.inner == nil {
 		return reassemblyOutcome{Dropped: true}
 	}
-	outcome := r.inner.Push(flowID, fragment, now)
+	outcome := r.inner.PushWithReservation(flowID, fragment, now, r.budget.reserveOwned)
 	if outcome.DropReason != wire.ReassemblyDropNone || !outcome.Done {
 		return reassemblyOutcome{Dropped: outcome.DropReason != wire.ReassemblyDropNone}
 	}
-	payload := outcome.Payload
-	if !r.budget.reserve(len(payload)) {
-		return reassemblyOutcome{Dropped: true}
+	reservation := outcome.Reservation
+	release := func() {}
+	if reservation != nil {
+		release = reservation.Release
 	}
-	var once sync.Once
 	return reassemblyOutcome{
-		Packet: payload, Complete: true,
-		Release: func() { once.Do(func() { r.budget.release(len(payload)) }) },
+		Packet: outcome.Payload, Complete: true, Release: release,
 	}
 }
 

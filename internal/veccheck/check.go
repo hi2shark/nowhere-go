@@ -346,7 +346,10 @@ func checkFragmentCase(tc vectors.DatagramCase, flowID wire.FlowID) error {
 	if len(frames) != len(tc.FramesHex) {
 		return fmt.Errorf("%s: frame count %d want %d", tc.ID, len(frames), len(tc.FramesHex))
 	}
-	reassembler := wire.NewDatagramReassembler(wire.DefaultReassemblyConfig())
+	reassembler, err := wire.NewDatagramReassembler(wire.DefaultReassemblyConfig())
+	if err != nil {
+		return fmt.Errorf("%s: reassembler: %w", tc.ID, err)
+	}
 	for i, got := range frames {
 		want, err := vectors.DecodeHex(tc.FramesHex[i])
 		if err != nil {

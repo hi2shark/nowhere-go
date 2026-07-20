@@ -105,40 +105,63 @@ func EncodeUDPData(flowID FlowID, payload []byte) ([]byte, error) {
 // EncodeUDPDataFragments returns either one minimal DATA frame or the required
 // FRAGMENT frames. A packet that fits in one DATAGRAM must never be fragmented.
 func EncodeUDPDataFragments(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int) ([][]byte, error) {
-	if err := validateFlowID(flowID); err != nil {
+	frames := make([][]byte, 0, 1)
+	err := EncodeUDPDataFragmentsYield(flowID, packetID, payload, maxDatagramSize, func(frame []byte) error {
+		frames = append(frames, frame)
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := validatePacketID(packetID); err != nil {
-		return nil, err
+	return frames, nil
+}
+
+// EncodeUDPDataFragmentsYield lazily encodes a packet and yields one owned
+// frame at a time. Packet ID is required only when the packet actually needs
+// fragmentation.
+func EncodeUDPDataFragmentsYield(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int, yield func([]byte) error) error {
+	if err := validateFlowID(flowID); err != nil {
+		return err
 	}
 	if err := validateUDPPayload(payload); err != nil {
-		return nil, err
+		return err
 	}
 	if maxDatagramSize < UDPHeaderLen {
-		return nil, fmt.Errorf("nowhere: datagram size %d smaller than header %d", maxDatagramSize, UDPHeaderLen)
+		return fmt.Errorf("nowhere: datagram size %d smaller than header %d", maxDatagramSize, UDPHeaderLen)
 	}
 	if len(payload) <= maxDatagramSize-UDPHeaderLen {
 		frame, err := EncodeUDPData(flowID, payload)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return [][]byte{frame}, nil
+		return yield(frame)
 	}
-	return collectUDPFragments(flowID, packetID, payload, maxDatagramSize)
+	if err := validatePacketID(packetID); err != nil {
+		return err
+	}
+	return yieldUDPFragments(flowID, packetID, payload, maxDatagramSize, yield)
 }
 
 // collectUDPFragments is the non-lazy collector used by EncodeUDPDataFragments.
 func collectUDPFragments(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int) ([][]byte, error) {
+	frames := make([][]byte, 0, 2)
+	err := yieldUDPFragments(flowID, packetID, payload, maxDatagramSize, func(frame []byte) error {
+		frames = append(frames, frame)
+		return nil
+	})
+	return frames, err
+}
+
+func yieldUDPFragments(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int, yield func([]byte) error) error {
 	capacity := maxDatagramSize - UDPFragmentHeaderLen
 	if capacity <= 0 {
-		return nil, errors.New("nowhere: no fragment payload capacity")
+		return errors.New("nowhere: no fragment payload capacity")
 	}
 	count := (len(payload) + capacity - 1) / capacity
 	if count < 2 || count > 255 {
-		return nil, fmt.Errorf("nowhere: invalid fragment count %d", count)
+		return fmt.Errorf("nowhere: invalid fragment count %d", count)
 	}
 	totalLen := uint16(len(payload))
-	frames := make([][]byte, 0, count)
 	for i := 0; i < count; i++ {
 		start := i * capacity
 		end := start + capacity
@@ -153,14 +176,16 @@ func collectUDPFragments(flowID FlowID, packetID uint32, payload []byte, maxData
 			Payload:       payload[start:end],
 		})
 		if err != nil {
-			return nil, err
+			return err
 		}
 		frame := make([]byte, UDPFragmentHeaderLen+(end-start))
 		copy(frame[:UDPFragmentHeaderLen], header[:])
 		copy(frame[UDPFragmentHeaderLen:], payload[start:end])
-		frames = append(frames, frame)
+		if err := yield(frame); err != nil {
+			return err
+		}
 	}
-	return frames, nil
+	return nil
 }
 
 // DecodeUDPFrame decodes one complete QUIC DATAGRAM frame.

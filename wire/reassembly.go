@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
@@ -10,10 +11,10 @@ type ReassemblyDropReason int
 
 const (
 	ReassemblyDropNone              ReassemblyDropReason = iota
-	ReassemblyDropMetadataConflict                        // fragment metadata disagrees with the slot
-	ReassemblyDropDuplicateConflict                       // duplicate fragment with different bytes
-	ReassemblyDropByteLimit                               // slot/byte resource limit reached
-	ReassemblyDropInvalidLength                           // declared length inconsistent with payload
+	ReassemblyDropMetadataConflict                       // fragment metadata disagrees with the slot
+	ReassemblyDropDuplicateConflict                      // duplicate fragment with different bytes
+	ReassemblyDropByteLimit                              // slot/byte resource limit reached
+	ReassemblyDropInvalidLength                          // declared length inconsistent with payload
 )
 
 // String returns a stable label for diagnostics.
@@ -48,9 +49,20 @@ func DefaultReassemblyConfig() ReassemblyConfig {
 type ReassemblyOutcome struct {
 	Done           bool
 	Payload        []byte
+	Reservation    ByteReservation
 	EvictedPartial bool
 	DropReason     ReassemblyDropReason
 }
+
+// ByteReservation owns bytes charged to a shared session budget. Release must
+// be idempotent because shutdown and consumer cancellation may race.
+type ByteReservation interface {
+	Release()
+}
+
+// ByteReservationFactory reserves n bytes only when a new reassembly slot is
+// created. A false result rejects the slot without retaining fragment data.
+type ByteReservationFactory func(n int) (ByteReservation, bool)
 
 type reassemblyKey struct {
 	flowID   FlowID
@@ -58,12 +70,13 @@ type reassemblyKey struct {
 }
 
 type reassemblySlot struct {
-	createdAt    time.Time
-	fragmentCnt  uint8
-	totalLen     uint16
-	fragments    [][]byte
-	received     int
-	retained     int
+	createdAt   time.Time
+	fragmentCnt uint8
+	totalLen    uint16
+	fragments   [][]byte
+	received    int
+	retained    int
+	reservation ByteReservation
 }
 
 // DatagramReassembler is a bounded, timeout-aware fragment reassembler. The
@@ -76,17 +89,17 @@ type DatagramReassembler struct {
 }
 
 // NewDatagramReassembler constructs a reassembler with the given config.
-func NewDatagramReassembler(cfg ReassemblyConfig) *DatagramReassembler {
-	if cfg.MaxSlots == 0 {
-		cfg.MaxSlots = 64
+func NewDatagramReassembler(cfg ReassemblyConfig) (*DatagramReassembler, error) {
+	if cfg.MaxSlots <= 0 {
+		return nil, errors.New("nowhere: reassembly MaxSlots must be positive")
 	}
-	if cfg.MaxBytes == 0 {
-		cfg.MaxBytes = 1024 * 1024
+	if cfg.MaxBytes <= 0 {
+		return nil, errors.New("nowhere: reassembly MaxBytes must be positive")
 	}
-	if cfg.TTL == 0 {
-		cfg.TTL = 10 * time.Second
+	if cfg.TTL <= 0 {
+		return nil, errors.New("nowhere: reassembly TTL must be positive")
 	}
-	return &DatagramReassembler{cfg: cfg, slots: make(map[reassemblyKey]*reassemblySlot)}
+	return &DatagramReassembler{cfg: cfg, slots: make(map[reassemblyKey]*reassemblySlot)}, nil
 }
 
 // SlotCount returns the number of in-flight partial packets.
@@ -110,6 +123,7 @@ func (r *DatagramReassembler) RemoveFlow(flowID FlowID) {
 	for key, slot := range r.slots {
 		if key.flowID == flowID {
 			r.bytes -= int(slot.totalLen)
+			releaseReservation(slot.reservation)
 			delete(r.slots, key)
 		}
 	}
@@ -122,6 +136,9 @@ func (r *DatagramReassembler) RemoveFlow(flowID FlowID) {
 func (r *DatagramReassembler) Clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for _, slot := range r.slots {
+		releaseReservation(slot.reservation)
+	}
 	r.slots = make(map[reassemblyKey]*reassemblySlot)
 	r.bytes = 0
 }
@@ -135,6 +152,7 @@ func (r *DatagramReassembler) Expire(now time.Time) bool {
 	for key, slot := range r.slots {
 		if now.Sub(slot.createdAt) > r.cfg.TTL {
 			r.bytes -= int(slot.totalLen)
+			releaseReservation(slot.reservation)
 			delete(r.slots, key)
 			dropped = true
 		}
@@ -148,6 +166,19 @@ func (r *DatagramReassembler) Expire(now time.Time) bool {
 // Push records one fragment. Identical duplicates are ignored; metadata or
 // byte conflicts drop the whole slot.
 func (r *DatagramReassembler) Push(flowID FlowID, fragment UDPFragment, now time.Time) ReassemblyOutcome {
+	fragment.Payload = append([]byte(nil), fragment.Payload...)
+	return r.pushOwned(flowID, fragment, now, nil)
+}
+
+// PushWithReservation takes ownership of fragment.Payload. For a new slot it
+// calls reserve with the declared total packet length. On completion the
+// reservation is transferred to the outcome; callers must release it after the
+// completed payload is consumed or discarded.
+func (r *DatagramReassembler) PushWithReservation(flowID FlowID, fragment UDPFragment, now time.Time, reserve ByteReservationFactory) ReassemblyOutcome {
+	return r.pushOwned(flowID, fragment, now, reserve)
+}
+
+func (r *DatagramReassembler) pushOwned(flowID FlowID, fragment UDPFragment, now time.Time, reserve ByteReservationFactory) ReassemblyOutcome {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -183,7 +214,7 @@ func (r *DatagramReassembler) Push(flowID FlowID, fragment UDPFragment, now time
 			r.removeSlotLocked(key)
 			return ReassemblyOutcome{EvictedPartial: outcome.EvictedPartial, DropReason: ReassemblyDropInvalidLength}
 		}
-		slot.fragments[idx] = append([]byte(nil), fragment.Payload...)
+		slot.fragments[idx] = fragment.Payload
 		slot.received++
 		slot.retained = retained
 		if slot.received < int(slot.fragmentCnt) {
@@ -202,9 +233,10 @@ func (r *DatagramReassembler) Push(flowID FlowID, fragment UDPFragment, now time
 			}
 			payload = append(payload, frag...)
 		}
-		r.removeSlotLocked(key)
+		reservation := r.takeSlotLocked(key)
 		outcome.Done = true
 		outcome.Payload = payload
+		outcome.Reservation = reservation
 		return outcome
 	}
 
@@ -230,6 +262,14 @@ func (r *DatagramReassembler) Push(flowID FlowID, fragment UDPFragment, now time
 	if r.bytes+int(fragment.TotalLen) > r.cfg.MaxBytes {
 		return ReassemblyOutcome{EvictedPartial: outcome.EvictedPartial, DropReason: ReassemblyDropByteLimit}
 	}
+	var reservation ByteReservation
+	if reserve != nil {
+		var ok bool
+		reservation, ok = reserve(int(fragment.TotalLen))
+		if !ok {
+			return ReassemblyOutcome{EvictedPartial: outcome.EvictedPartial, DropReason: ReassemblyDropByteLimit}
+		}
+	}
 	slot := &reassemblySlot{
 		createdAt:   now,
 		fragmentCnt: fragment.FragmentCount,
@@ -237,8 +277,9 @@ func (r *DatagramReassembler) Push(flowID FlowID, fragment UDPFragment, now time
 		fragments:   make([][]byte, fragment.FragmentCount),
 		received:    1,
 		retained:    len(fragment.Payload),
+		reservation: reservation,
 	}
-	slot.fragments[fragment.FragmentIndex] = append([]byte(nil), fragment.Payload...)
+	slot.fragments[fragment.FragmentIndex] = fragment.Payload
 	r.slots[key] = slot
 	r.bytes += int(fragment.TotalLen)
 	return outcome
@@ -250,8 +291,22 @@ func (r *DatagramReassembler) removeSlotLocked(key reassemblyKey) {
 		if r.bytes < 0 {
 			r.bytes = 0
 		}
+		releaseReservation(slot.reservation)
 		delete(r.slots, key)
 	}
+}
+
+func (r *DatagramReassembler) takeSlotLocked(key reassemblyKey) ByteReservation {
+	slot, ok := r.slots[key]
+	if !ok {
+		return nil
+	}
+	r.bytes -= int(slot.totalLen)
+	if r.bytes < 0 {
+		r.bytes = 0
+	}
+	delete(r.slots, key)
+	return slot.reservation
 }
 
 func (r *DatagramReassembler) expireLocked(now time.Time) bool {
@@ -259,6 +314,7 @@ func (r *DatagramReassembler) expireLocked(now time.Time) bool {
 	for key, slot := range r.slots {
 		if now.Sub(slot.createdAt) > r.cfg.TTL {
 			r.bytes -= int(slot.totalLen)
+			releaseReservation(slot.reservation)
 			delete(r.slots, key)
 			dropped = true
 		}
@@ -267,6 +323,12 @@ func (r *DatagramReassembler) expireLocked(now time.Time) bool {
 		r.bytes = 0
 	}
 	return dropped
+}
+
+func releaseReservation(reservation ByteReservation) {
+	if reservation != nil {
+		reservation.Release()
+	}
 }
 
 func equalBytes(a, b []byte) bool {

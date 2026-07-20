@@ -53,7 +53,7 @@ func TestDatagramFragmentFixedHeader(t *testing.T) {
 		t.Fatalf("UDPFragmentHeaderLen %d", UDPFragmentHeaderLen)
 	}
 	// decode + reassemble
-	reassembler := NewDatagramReassembler(DefaultReassemblyConfig())
+	reassembler := mustNewDatagramReassembler(t, DefaultReassemblyConfig())
 	var assembled []byte
 	for i, frame := range frames {
 		if len(frame) > 1200 {
@@ -86,12 +86,12 @@ func TestDatagramRejectsShortReservedUnknownClosePayload(t *testing.T) {
 		{},
 		{0},
 		{0, 0, 0, 0},
-		{0, 0, 0, 0, 0},           // zero flow id
-		{3, 0, 0, 0, 1},           // unknown frame type
-		{0x04, 0, 0, 0, 1},        // reserved bits
-		{0x40, 0, 0, 0, 1},        // reserved high
-		{0x82, 0, 0, 0, 1},        // reserved + close
-		{2, 0, 0, 0, 1, 0},        // close with payload
+		{0, 0, 0, 0, 0},    // zero flow id
+		{3, 0, 0, 0, 1},    // unknown frame type
+		{0x04, 0, 0, 0, 1}, // reserved bits
+		{0x40, 0, 0, 0, 1}, // reserved high
+		{0x82, 0, 0, 0, 1}, // reserved + close
+		{2, 0, 0, 0, 1, 0}, // close with payload
 	}
 	for _, raw := range rejects {
 		if _, err := DecodeUDPFrame(raw); err == nil {
@@ -149,7 +149,7 @@ func TestDatagramFitsInOneFrameNotFragmented(t *testing.T) {
 
 func TestReassemblerRejectsDuplicateConflict(t *testing.T) {
 	now := testNow
-	reassembler := NewDatagramReassembler(DefaultReassemblyConfig())
+	reassembler := mustNewDatagramReassembler(t, DefaultReassemblyConfig())
 	original := UDPFragment{PacketID: 7, FragmentIndex: 0, FragmentCount: 2, TotalLen: 2, Payload: []byte("a")}
 	if outcome := reassembler.Push(1, original, now); outcome.Done || outcome.DropReason != ReassemblyDropNone {
 		t.Fatalf("first push outcome %+v", outcome)
@@ -166,7 +166,7 @@ func TestReassemblerRejectsDuplicateConflict(t *testing.T) {
 
 func TestReassemblerRejectsMetadataConflict(t *testing.T) {
 	now := testNow
-	reassembler := NewDatagramReassembler(DefaultReassemblyConfig())
+	reassembler := mustNewDatagramReassembler(t, DefaultReassemblyConfig())
 	original := UDPFragment{PacketID: 7, FragmentIndex: 0, FragmentCount: 2, TotalLen: 2, Payload: []byte("a")}
 	reassembler.Push(1, original, now)
 	conflict := original
@@ -179,7 +179,7 @@ func TestReassemblerRejectsMetadataConflict(t *testing.T) {
 
 func TestReassemblerIgnoresIdenticalDuplicate(t *testing.T) {
 	now := testNow
-	reassembler := NewDatagramReassembler(DefaultReassemblyConfig())
+	reassembler := mustNewDatagramReassembler(t, DefaultReassemblyConfig())
 	original := UDPFragment{PacketID: 7, FragmentIndex: 0, FragmentCount: 2, TotalLen: 2, Payload: []byte("a")}
 	if outcome := reassembler.Push(1, original, now); outcome.Done {
 		t.Fatal("first push unexpected complete")
@@ -192,7 +192,7 @@ func TestReassemblerIgnoresIdenticalDuplicate(t *testing.T) {
 func TestReassemblerEnforcesByteAndSlotLimits(t *testing.T) {
 	now := testNow
 	cfg := ReassemblyConfig{MaxSlots: 1, MaxBytes: 4, TTL: time.Second}
-	reassembler := NewDatagramReassembler(cfg)
+	reassembler := mustNewDatagramReassembler(t, cfg)
 	first := UDPFragment{PacketID: 1, FragmentIndex: 0, FragmentCount: 2, TotalLen: 4, Payload: []byte("aa")}
 	if outcome := reassembler.Push(1, first, now); outcome.DropReason != ReassemblyDropNone {
 		t.Fatalf("first push %+v", outcome)
@@ -220,3 +220,42 @@ func TestReassemblerEnforcesByteAndSlotLimits(t *testing.T) {
 // testNow is the shared fixed instant used by reassembly tests; per-test
 // callers pass offsets from it when exercising TTL eviction.
 var testNow = time.Unix(1_700_000_000, 0)
+
+func mustNewDatagramReassembler(t *testing.T, cfg ReassemblyConfig) *DatagramReassembler {
+	t.Helper()
+	reassembler, err := NewDatagramReassembler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reassembler
+}
+
+func TestReassemblyDefaultsAndStrictConfig(t *testing.T) {
+	cfg := DefaultReassemblyConfig()
+	if cfg.MaxSlots != 64 || cfg.MaxBytes != 1024*1024 || cfg.TTL != 10*time.Second {
+		t.Fatalf("defaults changed: %+v", cfg)
+	}
+	for _, cfg := range []ReassemblyConfig{
+		{MaxSlots: 0, MaxBytes: 1, TTL: time.Second},
+		{MaxSlots: 1, MaxBytes: 0, TTL: time.Second},
+		{MaxSlots: 1, MaxBytes: 1, TTL: 0},
+		{MaxSlots: -1, MaxBytes: 1, TTL: time.Second},
+	} {
+		if _, err := NewDatagramReassembler(cfg); err == nil {
+			t.Fatalf("invalid config accepted: %+v", cfg)
+		}
+	}
+}
+
+func TestDatagramUnfragmentedAllowsZeroPacketID(t *testing.T) {
+	frames, err := EncodeUDPDataFragments(7, 0, []byte("fits"), 1200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("frame count %d", len(frames))
+	}
+	if _, err := EncodeUDPDataFragments(7, 0, make([]byte, 1200), 1200); err == nil {
+		t.Fatal("fragmented packet accepted zero packet id")
+	}
+}
