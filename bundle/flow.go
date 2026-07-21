@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"time"
 
 	"github.com/hi2shark/nowhere-go/carrier"
@@ -13,6 +14,16 @@ import (
 	"github.com/hi2shark/nowhere-go/carrier/tcptls"
 	"github.com/hi2shark/nowhere-go/wire"
 )
+
+const (
+	// DefaultFlowSetupTimeout bounds waiting for Portal READY/REJECT after FLOW
+	// is sent. It is independent of the 5s auth/handshake timeout.
+	DefaultFlowSetupTimeout = 20 * time.Second
+)
+
+// ErrFlowSetupTimeout reports that Portal did not return READY/REJECT within
+// DefaultFlowSetupTimeout (or a caller-supplied override).
+var ErrFlowSetupTimeout = errors.New("nowhere: flow setup timed out waiting for READY")
 
 // flowSetup holds the metadata for a prepared flow half. In 1.5 the wire bytes
 // are assembled from the header and an optional typed target; there is no
@@ -171,15 +182,43 @@ func (p *quicPreparedStream) LocalAddr() net.Addr {
 // readSetupResult reads the single-byte SetupResult from the selected downlink
 // and returns an error if the server rejected the flow. Nowhere 1.5 collapses
 // the former F2 and UoT setup-result formats into one byte.
+//
+// The wait is bounded by DefaultFlowSetupTimeout so a slow Portal dial cannot
+// reuse the shorter auth/handshake deadline.
 func readSetupResult(r io.Reader) error {
+	return readSetupResultWithTimeout(r, DefaultFlowSetupTimeout)
+}
+
+func readSetupResultWithTimeout(r io.Reader, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = DefaultFlowSetupTimeout
+	}
+	if d, ok := r.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = d.SetReadDeadline(time.Now().Add(timeout))
+		defer func() { _ = d.SetReadDeadline(time.Time{}) }()
+	}
 	result, err := wire.ReadSetupResult(r)
 	if err != nil {
+		if isTimeoutErr(err) {
+			return ErrFlowSetupTimeout
+		}
 		return err
 	}
 	if !result.IsReady() {
 		return &SetupResultError{Code: result}
 	}
 	return nil
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // SetupResultError preserves the exact non-READY result code while callers add

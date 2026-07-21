@@ -29,7 +29,7 @@ func TestQUICUDPUplinkRefreshesAndRetries(t *testing.T) {
 	assertV15Datagrams(t, session.frames)
 }
 
-func TestQUICUDPUplinkSecondTooLargeReturnsUnstableError(t *testing.T) {
+func TestQUICUDPUplinkSecondTooLargeDropsPacketKeepsFlow(t *testing.T) {
 	session := &v15PMTUSession{
 		maxima: []int{20, 18, 20},
 		errors: []error{
@@ -40,8 +40,8 @@ func TestQUICUDPUplinkSecondTooLargeReturnsUnstableError(t *testing.T) {
 	handle := newQSessionHandle(&quicPreparedStream{session: session}, nil, 1, nil)
 	var next atomic.Uint32
 	dropped := []byte("this packet is dropped after the second PMTU error")
-	if written, err := writeQUICUDPPacket(handle, 1, &next, dropped); !errors.Is(err, nquic.ErrDatagramMTUUnstable) || written != 0 {
-		t.Fatalf("second-too-large write = (%d, %v), want (0, ErrDatagramMTUUnstable)", written, err)
+	if written, err := writeQUICUDPPacket(handle, 1, &next, dropped); err != nil || written != 0 {
+		t.Fatalf("second-too-large write = (%d, %v), want (0, nil) silent drop", written, err)
 	}
 	accepted := []byte("next packet survives")
 	if written, err := writeQUICUDPPacket(handle, 1, &next, accepted); err != nil || written != len(accepted) {

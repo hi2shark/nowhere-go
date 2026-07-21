@@ -115,8 +115,9 @@ func (p *TCPPool) Resize(target int) error {
 	p.target = target
 	var dropped []*warmConn
 	for len(p.idle) > target {
-		wc := p.idle[len(p.idle)-1]
-		p.idle = p.idle[:len(p.idle)-1]
+		// Drop oldest idle first so resize matches FIFO borrow order.
+		wc := p.idle[0]
+		p.idle = p.idle[1:]
 		if wc.expiry != nil {
 			wc.expiry.Stop()
 		}

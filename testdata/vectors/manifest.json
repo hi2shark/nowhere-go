@@ -1,7 +1,7 @@
 {
   "protocol": "nowhere-v1",
-  "upstream_version": "1.5.0",
-  "upstream_commit": "c7c4b013234d264c60252a21c35c0316e6076e7c",
+  "upstream_version": "1.5.1",
+  "upstream_commit": "1133040065029678c8b76b2b3fda9efa3260ada9",
   "exporter_version": "nowhere-vector-export/2",
   "sources": {
     "protocol_md": "Nowhere/docs/protocol.md",
@@ -21,7 +21,7 @@
     "result.json"
   ],
   "notes": [
-    "harness/vectors is the authoritative Nowhere 1.5.0 corpus",
+    "harness/vectors is the authoritative Nowhere 1.5.1 corpus",
     "nowhere-go/testdata/vectors is a byte-for-byte module-local copy written by export-rust-vectors.sh",
     "complete wire hex tables must not be maintained by hand",
     "1.5 auth is connection-bound: tag = HMAC-SHA256(auth_key, transport || exporter || session_id)[0:16]",

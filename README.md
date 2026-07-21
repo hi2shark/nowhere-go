@@ -1,6 +1,6 @@
 # Nowhere-Go
 
-Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). This tree targets upstream **v1.5.0** at commit `c7c4b013234d264c60252a21c35c0316e6076e7c`.
+Go implementation of the [Nowhere](https://github.com/NodePassProject/Nowhere) v1 protocol — both **outbound** (client) and **inbound** (server). This tree targets upstream **v1.5.1** at commit `1133040065029678c8b76b2b3fda9efa3260ada9`.
 
 This is a library, not a standalone proxy. Hosts such as [sing-box](https://github.com/SagerNet/sing-box) or [mihomo](https://github.com/MetaCubeX/mihomo) import it and supply platform pieces: TLS material, dialers, QUIC stacks, and routing.
 

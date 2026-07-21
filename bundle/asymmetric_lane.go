@@ -304,6 +304,11 @@ func writeQUICUDPPacket(session *qSessionHandle, flowID wire.FlowID, nextPacketI
 		return packetID
 	}
 	if err := quic.SendUDPData(context.Background(), session.sendDatagramContext, prober, flowID, nextID, payload); err != nil {
+		// Align with Rust Vector: consecutive DatagramTooLarge after shrink+
+		// resend drops only this packet. Keep the UDP flow and QUIC session.
+		if errors.Is(err, quic.ErrDatagramMTUUnstable) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	return len(payload), nil

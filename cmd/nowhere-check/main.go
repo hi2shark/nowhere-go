@@ -18,8 +18,8 @@ import (
 var Version = "dev"
 
 const (
-	UpstreamVersion = "v1.5.0"
-	UpstreamCommit  = "c7c4b013234d264c60252a21c35c0316e6076e7c"
+	UpstreamVersion = "v1.5.1"
+	UpstreamCommit  = "1133040065029678c8b76b2b3fda9efa3260ada9"
 )
 
 func main() {

@@ -98,8 +98,9 @@ func (p *TCPPool) borrowOrDial(ctx context.Context, target wire.Target, header w
 	}
 	var selected *warmConn
 	if len(p.idle) > 0 {
-		wc := p.idle[len(p.idle)-1]
-		p.idle = p.idle[:len(p.idle)-1]
+		// FIFO: oldest idle first (store at tail, borrow from head).
+		wc := p.idle[0]
+		p.idle = p.idle[1:]
 		if wc.expiry != nil {
 			wc.expiry.Stop()
 		}
