@@ -10,11 +10,16 @@ import (
 type ReassemblyDropReason int
 
 const (
-	ReassemblyDropNone              ReassemblyDropReason = iota
-	ReassemblyDropMetadataConflict                       // fragment metadata disagrees with the slot
-	ReassemblyDropDuplicateConflict                      // duplicate fragment with different bytes
-	ReassemblyDropByteLimit                              // slot/byte resource limit reached
-	ReassemblyDropInvalidLength                          // declared length inconsistent with payload
+	// ReassemblyDropNone indicates that no fragment was dropped.
+	ReassemblyDropNone ReassemblyDropReason = iota
+	// ReassemblyDropMetadataConflict indicates fragment metadata disagrees with the slot.
+	ReassemblyDropMetadataConflict
+	// ReassemblyDropDuplicateConflict indicates a duplicate fragment has different bytes.
+	ReassemblyDropDuplicateConflict
+	// ReassemblyDropByteLimit indicates the slot or byte resource limit was reached.
+	ReassemblyDropByteLimit
+	// ReassemblyDropInvalidLength indicates the declared length conflicts with the payload.
+	ReassemblyDropInvalidLength
 )
 
 // String returns a stable label for diagnostics.

@@ -72,6 +72,8 @@ type TCPPool struct {
 	nextWarmRetry time.Time
 }
 
+// NewTCPPool creates a pool from a session-bound Config and validates the idle
+// carrier target. Callers normally let bundle.CarrierBundle create the pool.
 func NewTCPPool(cfg *Config, target int) (*TCPPool, error) {
 	if cfg == nil || cfg.credentials == nil || cfg.dialer == nil || cfg.tlsDialer == nil {
 		return nil, errors.New("nowhere: incomplete TCP pool config")
@@ -97,12 +99,14 @@ func NewTCPPool(cfg *Config, target int) (*TCPPool, error) {
 	}, nil
 }
 
+// Target returns the current idle-carrier target.
 func (p *TCPPool) Target() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.target
 }
 
+// Resize changes the idle-carrier target and closes excess warm carriers.
 func (p *TCPPool) Resize(target int) error {
 	if target < 0 || target > MaxPoolSize {
 		return fmt.Errorf("nowhere: TCP pool size %d outside 0..%d", target, MaxPoolSize)
@@ -329,6 +333,8 @@ func relayNetwork(kind wire.FlowKind) string {
 	return "tcp"
 }
 
+// Close stops background preparation, closes every idle carrier, and returns
+// the joined close error. Repeated calls return the same result.
 func (p *TCPPool) Close() error {
 	if p == nil {
 		return nil

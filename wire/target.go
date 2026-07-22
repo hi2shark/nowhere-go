@@ -18,7 +18,7 @@ const (
 	targetIPv4Len = 1 + 4 + 2
 	targetIPv6Len = 1 + 16 + 2
 	// DomainLenMax is the largest accepted wire hostname length.
-	DomainLenMax   = 253
+	DomainLenMax    = 253
 	targetDomainMin = 1 + 1 + 1 + 2
 	targetMaxLen    = 1 + 1 + DomainLenMax + 2
 )
@@ -27,9 +27,12 @@ const (
 type TargetType uint8
 
 const (
-	TargetTypeIPv4   TargetType = 0x01
+	// TargetTypeIPv4 identifies an IPv4 target.
+	TargetTypeIPv4 TargetType = 0x01
+	// TargetTypeDomain identifies an unresolved ASCII/IDNA hostname.
 	TargetTypeDomain TargetType = 0x03
-	TargetTypeIPv6   TargetType = 0x04
+	// TargetTypeIPv6 identifies an IPv6 target.
+	TargetTypeIPv6 TargetType = 0x04
 )
 
 // Target is a binary destination address carried after an opening flow header.

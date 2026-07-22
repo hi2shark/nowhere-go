@@ -16,6 +16,9 @@ go 1.20
 
 License: **GPL-3.0** (same family as upstream Nowhere).
 
+Project policies: [changelog](CHANGELOG.md) · [contributing](CONTRIBUTING.md) ·
+[security](SECURITY.md)
+
 > **Lockstep upgrade required:** Nowhere 1.5 uses connection-bound TLS exporter authentication and does not accept the 1.4 data plane. Upgrade the Rust Portal and every client together.
 
 ---
@@ -77,12 +80,10 @@ if err != nil {
 }
 
 tcp, err := tcptls.NewConfig(tcptls.TCPOptions{
-	Address:     serverAddr,
-	Credentials: credentials,
-	Transport:   wire.AuthTransportTLSTCP,
-	Dialer:      hostTCPDialer,
-	TLSDialer:   hostTLSDialer,
-	Observer:    hostObserver,
+	Address:   serverAddr,
+	Dialer:    hostTCPDialer,
+	TLSDialer: hostTLSDialer,
+	Observer:  hostObserver,
 })
 if err != nil {
 	return err
@@ -90,11 +91,12 @@ if err != nil {
 
 up, down := wire.CarrierTLSTCP, wire.CarrierQUIC
 b, err := bundle.NewCarrierBundle(bundle.BundleOptions{
-	TCP:      tcp,
-	QUIC:     hostQuicBackend, // required when Up or Down is CarrierQUIC
-	PoolSize: pool,            // meaningful for tcp/tcp; UDP matrices use 0
-	Up:       up,
-	Down:     down,
+	TCP:         tcp,
+	QUIC:        hostQuicBackend, // required when Up or Down is CarrierQUIC
+	Credentials: credentials,     // bundle owns v1.5 carrier authentication
+	PoolSize:    0,               // required when either direction uses QUIC
+	Up:          up,
+	Down:        down,
 })
 if err != nil {
     return err
@@ -107,6 +109,10 @@ if err != nil {
 }
 conn, err := b.OpenTCP(ctx, target)
 ```
+
+See [`bundle/example_test.go`](bundle/example_test.go) for a compile-checked
+`tcp/tcp` constructor example. Host adapters remain responsible for concrete
+dialer, TLS, and QUIC implementations.
 
 Supported `Up`/`Down` pairs: `tcp/tcp`, `udp/udp`, `tcp/udp`, `udp/tcp`. Every logical TCP or UDP flow starts with a typed FLOW envelope; symmetric flows use `DUPLEX`, while mixed-carrier flows use `OPEN` plus `ATTACH`.
 

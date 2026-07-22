@@ -12,14 +12,22 @@ const SetupResultLen = 1
 type SetupResult uint8
 
 const (
-	SetupResultReady            SetupResult = 0
-	SetupResultInvalidRequest   SetupResult = 1
+	// SetupResultReady indicates that the target path is established.
+	SetupResultReady SetupResult = 0
+	// SetupResultInvalidRequest rejects malformed flow metadata.
+	SetupResultInvalidRequest SetupResult = 1
+	// SetupResultMetadataConflict rejects incompatible OPEN and ATTACH halves.
 	SetupResultMetadataConflict SetupResult = 2
-	SetupResultPairTimeout      SetupResult = 3
-	SetupResultFlowLimit        SetupResult = 4
-	SetupResultDialFailed       SetupResult = 5
-	SetupResultSessionReplaced  SetupResult = 6
-	SetupResultInternalError    SetupResult = 7
+	// SetupResultPairTimeout indicates that the matching split half did not arrive.
+	SetupResultPairTimeout SetupResult = 3
+	// SetupResultFlowLimit indicates that a flow or pairing limit was reached.
+	SetupResultFlowLimit SetupResult = 4
+	// SetupResultDialFailed indicates that Portal could not establish the target path.
+	SetupResultDialFailed SetupResult = 5
+	// SetupResultSessionReplaced indicates that a newer QUIC carrier replaced the session.
+	SetupResultSessionReplaced SetupResult = 6
+	// SetupResultInternalError indicates an internal setup failure.
+	SetupResultInternalError SetupResult = 7
 )
 
 // SetupResult values 0..7; used for validation.

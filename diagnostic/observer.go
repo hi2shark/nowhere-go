@@ -13,9 +13,13 @@ import (
 type Level uint8
 
 const (
+	// LevelDebug describes verbose lifecycle information.
 	LevelDebug Level = iota
+	// LevelInfo describes normal lifecycle information.
 	LevelInfo
+	// LevelWarn describes a recoverable or degraded condition.
 	LevelWarn
+	// LevelError describes a failed protocol operation.
 	LevelError
 )
 
@@ -100,11 +104,13 @@ type Observer interface {
 // ObserverFunc adapts a function to Observer.
 type ObserverFunc func(context.Context, Event)
 
+// Observe invokes f with the supplied event.
 func (f ObserverFunc) Observe(ctx context.Context, event Event) { f(ctx, event) }
 
 // NopObserver discards events.
 type NopObserver struct{}
 
+// Observe discards the supplied event.
 func (NopObserver) Observe(context.Context, Event) {}
 
 // Emit invokes observer while isolating host observer panics from protocol goroutines.

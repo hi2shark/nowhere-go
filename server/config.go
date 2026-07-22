@@ -51,35 +51,56 @@ const (
 
 // Timeouts controls bounded server operations. Zero values use protocol defaults.
 type Timeouts struct {
+	// TLSHandshake bounds the host-provided TLS handshake.
 	TLSHandshake time.Duration
-	Auth         time.Duration
-	RequestIdle  time.Duration
-	FlowPair     time.Duration
-	UDPIdle      time.Duration
+	// Auth is the center of the jittered carrier authentication deadline.
+	Auth time.Duration
+	// RequestIdle bounds the first FLOW request after TCP authentication.
+	RequestIdle time.Duration
+	// FlowPair bounds OPEN/ATTACH pairing.
+	FlowPair time.Duration
+	// UDPIdle closes an inactive UDP flow.
+	UDPIdle time.Duration
+	// TCPReadGrace bounds the remaining relay direction after a half-close.
 	TCPReadGrace time.Duration
-	Shutdown     time.Duration
+	// Shutdown bounds shared handler and listener cleanup.
+	Shutdown time.Duration
 }
 
 // Limits controls process and session resource bounds. Zero values use defaults.
 type Limits struct {
-	PendingFlowsPerSession          int
-	UDPFlowsPerSession              int
-	UDPQueueBytes                   int
-	UDPQueuePackets                 int
-	ActiveQUICSessions              int
+	// PendingFlowsPerSession limits unresolved split-flow pairs.
+	PendingFlowsPerSession int
+	// UDPFlowsPerSession limits active and pending UDP flows.
+	UDPFlowsPerSession int
+	// UDPQueueBytes limits queued packets and retained reassembly bytes.
+	UDPQueueBytes int
+	// UDPQueuePackets limits queued datagrams per flow.
+	UDPQueuePackets int
+	// ActiveQUICSessions limits authenticated QUIC sessions.
+	ActiveQUICSessions int
+	// AuthenticatedTCPIdleConnections limits authenticated TCP halves awaiting use.
 	AuthenticatedTCPIdleConnections int
-	MaxUnauthenticatedConnections   int
-	MaxUnauthenticatedPerSource     int
-	MaxConcurrentHandshakes         int
+	// MaxUnauthenticatedConnections is the process-wide pre-auth admission cap.
+	MaxUnauthenticatedConnections int
+	// MaxUnauthenticatedPerSource is the IPv4 /32 or IPv6 /64 pre-auth cap.
+	MaxUnauthenticatedPerSource int
+	// MaxConcurrentHandshakes limits in-flight host TLS handshakes.
+	MaxConcurrentHandshakes int
 }
 
 // ConfigOptions builds an immutable server Config.
 type ConfigOptions struct {
+	// Credentials authenticates every enabled ingress carrier.
 	Credentials *wire.Credentials
-	ALPN        string
-	Networks    []Network
-	Timeouts    Timeouts
-	Limits      Limits
+	// ALPN is the expected carrier ALPN; empty uses wire.DefaultALPN.
+	ALPN string
+	// Networks selects ingress carriers; empty enables TCP and UDP.
+	Networks []Network
+	// Timeouts overrides bounded-operation defaults.
+	Timeouts Timeouts
+	// Limits overrides server resource defaults.
+	Limits Limits
 }
 
 // Config is normalized and immutable after construction.

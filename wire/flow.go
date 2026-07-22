@@ -29,7 +29,9 @@ const (
 type FlowKind uint8
 
 const (
+	// FlowKindTCP identifies a logical TCP flow.
 	FlowKindTCP FlowKind = 0
+	// FlowKindUDP identifies a logical UDP flow.
 	FlowKindUDP FlowKind = 1
 )
 
@@ -37,8 +39,10 @@ const (
 type Carrier uint8
 
 const (
+	// CarrierTLSTCP selects TLS 1.3 over TCP.
 	CarrierTLSTCP Carrier = 0
-	CarrierQUIC   Carrier = 1
+	// CarrierQUIC selects QUIC over UDP.
+	CarrierQUIC Carrier = 1
 )
 
 const (

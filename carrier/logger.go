@@ -10,5 +10,8 @@ type Logger interface {
 // NopLogger discards all log output.
 type NopLogger struct{}
 
+// Debugf discards a debug message.
 func (NopLogger) Debugf(string, ...any) {}
-func (NopLogger) Warnf(string, ...any)  {}
+
+// Warnf discards a warning message.
+func (NopLogger) Warnf(string, ...any) {}

@@ -20,14 +20,19 @@ const (
 	DefaultAuthBackoff = 30 * time.Second
 )
 
-// Classifies dial/establish failures for backoff policy.
+// Class classifies dial and establish failures for backoff policy.
 type Class int
 
 const (
+	// ClassOK indicates a successful attempt.
 	ClassOK Class = iota
+	// ClassRetryable indicates a transient network failure.
 	ClassRetryable
+	// ClassAuth indicates an authentication or protocol failure.
 	ClassAuth
+	// ClassOther indicates a non-transient failure without a more specific class.
 	ClassOther
+	// ClassCanceled indicates cancellation by the local caller.
 	ClassCanceled
 )
 

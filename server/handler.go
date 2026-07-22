@@ -23,8 +23,11 @@ type TLSHandshaker func(context.Context, net.Conn) (wire.HandshakedConn, error)
 
 // HandlerOptions builds a valid Handler and its internal state managers.
 type HandlerOptions struct {
-	Config   *Config
+	// Config is the normalized protocol and resource configuration.
+	Config *Config
+	// Upstream receives authenticated, decoded logical flows.
 	Upstream Upstream
+	// Observer receives structured lifecycle and failure events.
 	Observer diagnostic.Observer
 }
 

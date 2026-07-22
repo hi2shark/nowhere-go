@@ -18,8 +18,10 @@ import (
 var Version = "dev"
 
 const (
+	// UpstreamVersion is the supported Rust Nowhere protocol release.
 	UpstreamVersion = "v1.5.1"
-	UpstreamCommit  = "1133040065029678c8b76b2b3fda9efa3260ada9"
+	// UpstreamCommit is the exact Rust oracle commit used to export vectors.
+	UpstreamCommit = "1133040065029678c8b76b2b3fda9efa3260ada9"
 )
 
 func main() {

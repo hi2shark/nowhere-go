@@ -25,17 +25,29 @@ const (
 
 // BundleOptions builds an immutable carrier bundle.
 type BundleOptions struct {
-	QUIC             carrier.QuicBackend
-	TCP              *tcptls.Config
-	Credentials      *wire.Credentials
-	ALPN             string
-	Observer         diagnostic.Observer
-	PoolSize         int
+	// QUIC is required when either direction selects CarrierQUIC.
+	QUIC carrier.QuicBackend
+	// TCP is required when either direction selects CarrierTLSTCP.
+	TCP *tcptls.Config
+	// Credentials authenticates every physical carrier in the bundle.
+	Credentials *wire.Credentials
+	// ALPN is the expected carrier ALPN; empty uses wire.DefaultALPN.
+	ALPN string
+	// Observer receives structured lifecycle and failure events.
+	Observer diagnostic.Observer
+	// PoolSize is the TLS/TCP idle target for tcp/tcp and must be zero
+	// whenever either direction uses QUIC.
+	PoolSize int
+	// MaxUDPQueueBytes bounds queued and reassembling QUIC DATAGRAM payload.
 	MaxUDPQueueBytes int
+	// MaxPendingCloses bounds reliable, de-duplicated CLOSE delivery.
 	MaxPendingCloses int
-	PrewarmOnStart   bool
-	Up               wire.Carrier
-	Down             wire.Carrier
+	// PrewarmOnStart starts TLS/TCP pool preparation during construction.
+	PrewarmOnStart bool
+	// Up selects the client-to-target physical carrier.
+	Up wire.Carrier
+	// Down selects the target-to-client physical carrier.
+	Down wire.Carrier
 }
 
 type bundleConfig struct {

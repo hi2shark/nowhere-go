@@ -24,11 +24,18 @@ const (
 
 // ServerOptions configures the standalone Portal-like listener orchestrator.
 type ServerOptions struct {
-	Config       *Config
-	TLS          *tls.Config
+	// Config is the normalized protocol and resource configuration.
+	Config *Config
+	// TLS is cloned and restricted to TLS 1.3 plus Config.ALPN. It is used when
+	// TLSHandshake is nil and TCP ingress is enabled.
+	TLS *tls.Config
+	// TLSHandshake optionally supplies host-owned TLS handshaking.
 	TLSHandshake TLSHandshaker
-	Upstream     Upstream
-	Observer     diagnostic.Observer
+	// Upstream receives authenticated, decoded logical flows.
+	Upstream Upstream
+	// Observer receives structured lifecycle and failure events.
+	Observer diagnostic.Observer
+	// QUICListener is required when UDP ingress is enabled.
 	QUICListener QuicListener
 }
 

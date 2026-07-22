@@ -49,11 +49,17 @@ type TLSDialer interface {
 
 // TCPOptions builds an immutable TLS/TCP carrier Config.
 type TCPOptions struct {
-	Address        string
+	// Address is the logical Portal address used by the carrier.
+	Address string
+	// ConnectAddress optionally overrides the physical dial destination while
+	// preserving Address for diagnostics and host TLS policy.
 	ConnectAddress string
-	Dialer         TCPDialer
-	TLSDialer      TLSDialer
-	Observer       diagnostic.Observer
+	// Dialer establishes the raw TCP connection.
+	Dialer TCPDialer
+	// TLSDialer performs the TLS 1.3 handshake and captures exporter state.
+	TLSDialer TLSDialer
+	// Observer receives structured lifecycle and failure events.
+	Observer diagnostic.Observer
 
 	// MaxConcurrentDials limits in-flight physical dials (TCP+TLS+auth) per pool.
 	// Zero uses DefaultMaxConcurrentDials; negative values are rejected.

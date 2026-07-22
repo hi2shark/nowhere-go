@@ -38,9 +38,12 @@ type UDPFragment struct {
 type UDPFrameType uint8
 
 const (
-	UDPFrameTypeData     UDPFrameType = 0
+	// UDPFrameTypeData carries one complete UDP packet.
+	UDPFrameTypeData UDPFrameType = 0
+	// UDPFrameTypeFragment carries one fragment of a larger UDP packet.
 	UDPFrameTypeFragment UDPFrameType = 1
-	UDPFrameTypeClose    UDPFrameType = 2
+	// UDPFrameTypeClose releases a UDP flow.
+	UDPFrameTypeClose UDPFrameType = 2
 )
 
 // UDPFrame is one decoded QUIC DATAGRAM frame.

@@ -60,6 +60,8 @@ func (u *DialUpstream) withTCPReadGrace(grace time.Duration) *DialUpstream {
 	return &clone
 }
 
+// HandleStream dials the TCP target, sends the setup result, and relays bytes
+// until both directions close or the context is canceled.
 func (u *DialUpstream) HandleStream(ctx context.Context, conn net.Conn, _ net.Addr, target wire.Target, readiness FlowReadiness) error {
 	remote, err := u.Dialer.DialContext(ctx, "tcp", targetAddress(target))
 	if err != nil {
@@ -81,6 +83,8 @@ func (u *DialUpstream) HandleStream(ctx context.Context, conn net.Conn, _ net.Ad
 	return nil
 }
 
+// HandlePacket dials the UDP target, sends the setup result, and relays
+// datagrams until the packet flow or context closes.
 func (u *DialUpstream) HandlePacket(ctx context.Context, pc net.PacketConn, _ net.Addr, target wire.Target, readiness FlowReadiness) error {
 	remote, err := u.Dialer.DialContext(ctx, "udp", targetAddress(target))
 	if err != nil {

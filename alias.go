@@ -21,6 +21,8 @@ type TLSExporter = wire.TLSExporter
 type AuthTransport = wire.AuthTransport
 
 const (
+	// AuthTransportTLSTCP identifies a TLS-over-TCP authentication frame.
 	AuthTransportTLSTCP = wire.AuthTransportTLSTCP
-	AuthTransportQUIC   = wire.AuthTransportQUIC
+	// AuthTransportQUIC identifies a QUIC authentication frame.
+	AuthTransportQUIC = wire.AuthTransportQUIC
 )
